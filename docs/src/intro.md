@@ -55,8 +55,8 @@ The shortest path:
 If you're standing up a production deployment:
 
 - [Picking a node](./picking-a-node.md) — local vs. remote vs. HA.
-- [Production deploy](./production-deploy.md) — systemd + Caddy or
-  Docker Compose.
+- [Production deploy](./production-deploy.md) — systemd + Caddy on
+  a single VM.
 - [Security model](./security-model.md) — what's protected and what
   isn't.
 

@@ -1,28 +1,19 @@
 # Quick start
 
-`exfer-walletd init` scaffolds an env file (with a fresh CSPRNG token),
-creates the wallet directory, and prints the remaining steps. The
-daemon then starts with **zero CLI flags** — all configuration comes
-from the env file.
+Two commands and you have a running daemon with a generated auth
+token. Pick the path that matches what you're doing:
 
-The two questions to decide first:
+- **[Local dev](#local-dev)** — files in the current directory, no
+  `sudo`. Use this to try the daemon or build against it locally.
+- **[Production (systemd)](#production-systemd)** — files in `/etc`
+  and `/var/lib`, runs as a dedicated user behind Caddy or nginx.
 
-1. **Where do the env file and wallet directory live?**
-   - In your current directory (`./walletd.env` + `./wallets/`) — for
-     local trying-it-out and dev.
-   - At system paths (`/etc/exfer-walletd/env` + `/var/lib/exfer-walletd`)
-     — for a production install with systemd.
+Both paths use the same `exfer-walletd init` command — it writes an
+env file with a fresh token, creates the wallet directory, and prints
+the next steps. After that the daemon starts with **zero CLI flags**;
+everything comes from the env file.
 
-   `init` looks at `--env-file` and decides which next-steps to print:
-   `/etc /var /usr /opt` → systemd flow, everything else → local flow.
-
-2. **Do I need `sudo`?**
-   Only when writing to system paths. `sudo exfer-walletd init`
-   (defaults) needs root because `/etc` is root-owned. For the local
-   path layout you don't need `sudo` at all. Mixing — `sudo init` with
-   `./walletd.env` — works but the env file ends up owned by root.
-
-## Just trying it (any user, current dir)
+## Local dev
 
 ```bash
 exfer-walletd init \
@@ -88,14 +79,11 @@ The env file is mode `0600` and contains your tokens — don't commit it.
 - **Wallet keys** in `./wallets/<address>.key`, mode `0600`. Back this
   directory up.
 
-## Setting up for production (systemd)
+## Production (systemd)
 
-Walks through the full path: dedicated user, env file in `/etc`,
-systemd unit, Caddy in front for TLS. See
-[Production deploy → Recipe A](./production-deploy.md#recipe-a---systemd--caddy-on-a-single-vm-most-common).
-
-The first step there is the same `init` but with the default paths,
-so the printed next-steps switch automatically to the systemd flow:
+The same `init` with default paths instead of `./`. It needs `sudo`
+because `/etc` is root-owned, and the printed next-steps switch
+automatically to the systemd flow:
 
 ```bash
 sudo exfer-walletd init --node-rpc http://your-node-host:9334
@@ -104,6 +92,9 @@ sudo exfer-walletd init --node-rpc http://your-node-host:9334
 # Next steps (systemd):
 #   1. ...
 ```
+
+For the full path — dedicated user, systemd unit, Caddy in front for
+TLS — see [Production deploy](./production-deploy.md).
 
 ## `init` flag reference
 

@@ -4,7 +4,7 @@
 
 | Layer            | Mechanism                                                                                                  |
 | ---------------- | ---------------------------------------------------------------------------------------------------------- |
-| Token at rest    | Env file `0640 root:exfer-walletd` on systemd; docker `.env` mode `0600`; otherwise your secret store.     |
+| Token at rest    | Env file `0640 root:exfer-walletd` on systemd; otherwise your secret store.                                |
 | Token in transit | Caddy / nginx / your TLS terminator handles the wire; walletd is bound on loopback so the plaintext hop is in-process. |
 | Token compare    | `subtle::ConstantTimeEq` — no timing oracle.                                                               |
 | Bind safety      | Three-tier policy: loopback always OK, private warns, public refused without explicit `--allow-public-bind`. |
@@ -30,9 +30,8 @@ running.
   trait against an HSM or KMS backend and slot it in.
 - **TLS terminates at the proxy.** Between your TLS terminator
   (Caddy/nginx/cloud LB/ingress) and walletd, traffic is plaintext
-  HTTP — either on loopback (recipe A) or on a docker bridge (recipe
-  B). If you don't trust the host or the bridge network, run walletd
-  in its own isolated VM.
+  HTTP on loopback. If you don't trust the host, run walletd in its
+  own isolated VM.
 - **No rate limit, no IP allowlist.** A 32-random-byte token is
   computationally infeasible to brute-force online, but if the
   deployment is reachable from the public internet you still want

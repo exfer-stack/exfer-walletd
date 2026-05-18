@@ -1,0 +1,17 @@
+title: exfer-walletd
+description: Exfer Wallet Daemon — independent wallet service over JSON-RPC
+theme: jekyll-theme-cayman
+show_downloads: true
+github:
+  repository_url: https://github.com/exfer-stack/exfer-walletd
+exclude:
+  - target
+  - tests
+  - Dockerfile
+  - docker
+  - scripts
+  - fly.toml
+  - .dockerignore
+  - .gitignore
+  - Cargo.lock
+  - Cargo.toml

@@ -27,7 +27,11 @@ pub struct Config {
 
     /// Directory holding `.key` wallet files.
     /// One file per managed address; filename is `<address>.key`.
-    #[arg(long, env = "WALLETD_WALLET_DIR", default_value = "/var/lib/exfer-wallets")]
+    #[arg(
+        long,
+        env = "WALLETD_WALLET_DIR",
+        default_value = "/var/lib/exfer-wallets"
+    )]
     pub wallet_dir: PathBuf,
 
     /// Optional bearer token for incoming requests. If unset, the API

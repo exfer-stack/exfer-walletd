@@ -4,13 +4,13 @@
 //! every node method is mirrored as a passthrough, plus two new methods
 //! the node itself cannot offer (because it doesn't hold keys):
 //!
-//! - `generate_address` → creates a new wallet, returns address + pubkey
-//! - `transfer`         → loads wallet, fetches+authenticates UTXOs,
-//!                        builds+signs locally, broadcasts via send_raw_transaction
+//! - `generate_address` — creates a new wallet, returns address + pubkey
+//! - `transfer` — loads wallet, fetches+authenticates UTXOs,
+//!   builds+signs locally, broadcasts via send_raw_transaction
 //!
 //! Plus a non-RPC convenience method:
 //!
-//! - `list_addresses`   → enumerate every managed address
+//! - `list_addresses` — enumerate every managed address
 //!
 //! Authentication: optional bearer token via the `Authorization` header.
 //! See [`crate::config::Config::auth_token`].
@@ -28,7 +28,7 @@ use crate::upstream::ExferNode;
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Arc<dyn WalletStore>,
-    pub node:  Arc<ExferNode>,
+    pub node: Arc<ExferNode>,
 }
 
 // ============================================================================
@@ -39,26 +39,26 @@ pub struct ApiState {
 pub struct RpcRequest {
     #[serde(default)]
     pub jsonrpc: String,
-    pub method:  String,
+    pub method: String,
     #[serde(default)]
-    pub params:  Value,
+    pub params: Value,
     #[serde(default)]
-    pub id:      Value,
+    pub id: Value,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RpcResponse {
     pub jsonrpc: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result:  Option<Value>,
+    pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error:   Option<RpcError>,
-    pub id:      Value,
+    pub error: Option<RpcError>,
+    pub id: Value,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RpcError {
-    pub code:    i32,
+    pub code: i32,
     pub message: String,
 }
 
@@ -66,17 +66,17 @@ impl RpcResponse {
     pub fn ok(id: Value, result: Value) -> Self {
         Self {
             jsonrpc: "2.0",
-            result:  Some(result),
-            error:   None,
+            result: Some(result),
+            error: None,
             id,
         }
     }
     pub fn err(id: Value, err: &Error) -> Self {
         Self {
             jsonrpc: "2.0",
-            result:  None,
-            error:   Some(RpcError {
-                code:    err.rpc_code(),
+            result: None,
+            error: Some(RpcError {
+                code: err.rpc_code(),
                 message: err.to_string(),
             }),
             id,
@@ -90,11 +90,11 @@ impl RpcResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct TransferParams {
-    pub from:           String,
-    pub to:             String,
-    pub amount:         u64,
+    pub from: String,
+    pub to: String,
+    pub amount: u64,
     #[serde(default = "default_fee")]
-    pub fee:            u64,
+    pub fee: u64,
 }
 fn default_fee() -> u64 {
     100_000 // 0.001 EXFER
@@ -123,7 +123,7 @@ pub struct TxHexParam {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum BlockSelector {
-    ByHash { hash:   String },
+    ByHash { hash: String },
     ByHeight { height: u64 },
 }
 
@@ -179,8 +179,8 @@ async fn list_addresses(state: &ApiState) -> Result<Value> {
 }
 
 async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
-    let p: TransferParams =
-        serde_json::from_value(params).map_err(|e| Error::BadEnvelope(format!("transfer params: {e}")))?;
+    let p: TransferParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadEnvelope(format!("transfer params: {e}")))?;
 
     if !is_64_hex(&p.from) {
         return Err(Error::BadAddressLen(p.from.len() / 2));
@@ -203,7 +203,7 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
     )
     .await?;
 
-    Ok(serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))
 }
 
 // ----------------------------------------------------------------------------
@@ -212,7 +212,7 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
 
 async fn get_block_height(state: &ApiState) -> Result<Value> {
     let tip = state.node.get_block_height().await?;
-    Ok(serde_json::to_value(&tip).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&tip).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
@@ -222,42 +222,42 @@ async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
         BlockSelector::ByHeight { height } => state.node.get_block_by_height(height).await?,
         BlockSelector::ByHash { hash } => state.node.get_block_by_hash(&hash).await?,
     };
-    Ok(serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: HashParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_transaction params: {e}")))?;
     let tx = state.node.get_transaction(&p.hash).await?;
-    Ok(serde_json::to_value(&tx).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&tx).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_balance params: {e}")))?;
     let bal = state.node.get_balance(&p.address).await?;
-    Ok(serde_json::to_value(&bal).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&bal).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_address_utxos params: {e}")))?;
     let u = state.node.get_address_utxos(&p.address).await?;
-    Ok(serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: ScriptHexParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_script_utxos params: {e}")))?;
     let u = state.node.get_script_utxos(&p.script_hex).await?;
-    Ok(serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: TxHexParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("send_raw_transaction params: {e}")))?;
     let r = state.node.send_raw_transaction(&p.tx_hex).await?;
-    Ok(serde_json::to_value(&r).map_err(|e| Error::Internal(e.to_string()))?)
+    serde_json::to_value(&r).map_err(|e| Error::Internal(e.to_string()))
 }
 
 // ----------------------------------------------------------------------------

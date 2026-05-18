@@ -23,13 +23,13 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
     let api = ApiState {
         store: Arc::new(store),
-        node:  Arc::new(node),
+        node: Arc::new(node),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let app_state = exfer_walletd::server::AppStateForTests::new(api, auth.map(String::from));
+    let app_state = exfer_walletd::server::build_app_state_for_tests(api, auth.map(String::from));
     let app = exfer_walletd::server::build_router(app_state);
 
     let _server_task = tokio::spawn(async move {
@@ -127,7 +127,12 @@ async fn unknown_method_returns_error_with_code_minus_32601() {
         "params":  {},
         "id":      7
     });
-    let resp = reqwest::Client::new().post(&base).json(&body).send().await.unwrap();
+    let resp = reqwest::Client::new()
+        .post(&base)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["id"], 7);

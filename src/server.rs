@@ -23,21 +23,17 @@ use crate::upstream::ExferNode;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub api:        ApiState,
+    pub api: ApiState,
     pub auth_token: Option<Arc<str>>,
 }
 
 /// Test-only constructor — exposed so integration tests can build an
 /// `AppState` without going through CLI/env config parsing.
 #[doc(hidden)]
-pub struct AppStateForTests;
-
-impl AppStateForTests {
-    pub fn new(api: ApiState, auth_token: Option<String>) -> AppState {
-        AppState {
-            api,
-            auth_token: auth_token.map(Into::into),
-        }
+pub fn build_app_state_for_tests(api: ApiState, auth_token: Option<String>) -> AppState {
+    AppState {
+        api,
+        auth_token: auth_token.map(Into::into),
     }
 }
 
@@ -59,7 +55,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     )?;
     let api = ApiState {
         store: Arc::new(store),
-        node:  Arc::new(node),
+        node: Arc::new(node),
     };
     let app_state = AppState {
         api,
@@ -91,11 +87,7 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
-async fn rpc_handler(
-    State(app):  State<AppState>,
-    headers:     HeaderMap,
-    body:        Bytes,
-) -> Response {
+async fn rpc_handler(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     // ---- Auth ----
     if let Some(expected) = &app.auth_token {
         let supplied = headers

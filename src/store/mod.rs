@@ -103,7 +103,8 @@ impl WalletStore for FsWalletStore {
             return Err(Error::WalletNotFound(address_hex.to_string()));
         }
         // We always save with `save_unencrypted`, so passphrase is None.
-        Wallet::load(&path, None).map_err(|e| Error::Wallet(format!("load {}: {e}", path.display())))
+        Wallet::load(&path, None)
+            .map_err(|e| Error::Wallet(format!("load {}: {e}", path.display())))
     }
 
     fn list(&self) -> Result<Vec<String>> {

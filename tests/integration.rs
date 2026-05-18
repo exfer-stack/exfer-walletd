@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exfer_walletd::api::{dispatch, ApiState, RpcRequest};
+use exfer_walletd::error::Error;
 use exfer_walletd::store::FsWalletStore;
 use exfer_walletd::upstream::ExferNode;
-use exfer_walletd::error::Error;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -22,7 +22,7 @@ fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tem
     let node = ExferNode::new(node_url, Duration::from_secs(5)).unwrap();
     let state = ApiState {
         store: Arc::new(store),
-        node:  Arc::new(node),
+        node: Arc::new(node),
     };
     (state, wallet_dir)
 }
@@ -30,9 +30,9 @@ fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tem
 fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
     RpcRequest {
         jsonrpc: "2.0".into(),
-        method:  method.into(),
+        method: method.into(),
         params,
-        id:      json!(1),
+        id: json!(1),
     }
 }
 

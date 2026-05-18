@@ -28,8 +28,8 @@ use crate::error::{Error, Result};
 ///   surfaced immediately without trying the next node.
 #[derive(Debug, Clone)]
 pub struct ExferNode {
-    nodes:  Vec<String>,
-    http:   reqwest::Client,
+    nodes: Vec<String>,
+    http: reqwest::Client,
     cursor: Arc<AtomicUsize>,
 }
 
@@ -134,7 +134,9 @@ impl ExferNode {
     // ====================================================================
 
     pub async fn get_block_height(&self) -> Result<BlockTip> {
-        let v = self.call("get_block_height", Value::Object(Default::default())).await?;
+        let v = self
+            .call("get_block_height", Value::Object(Default::default()))
+            .await?;
         serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
     }
 
@@ -203,31 +205,31 @@ impl ExferNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockTip {
-    pub height:   u64,
+    pub height: u64,
     pub block_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockSummary {
-    pub hash:              String,
-    pub height:            u64,
-    pub timestamp:         u64,
-    pub tx_count:          u64,
-    pub transactions:      Vec<String>,
-    pub prev_block_id:     String,
+    pub hash: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub tx_count: u64,
+    pub transactions: Vec<String>,
+    pub prev_block_id: String,
     pub difficulty_target: String,
-    pub nonce:             u64,
-    pub state_root:        String,
-    pub tx_root:           String,
+    pub nonce: u64,
+    pub state_root: String,
+    pub tx_root: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxStatus {
-    pub tx_id:        String,
-    pub tx_hex:       String,
-    pub in_mempool:   bool,
+    pub tx_id: String,
+    pub tx_hex: String,
+    pub in_mempool: bool,
     #[serde(default)]
-    pub block_hash:   Option<String>,
+    pub block_hash: Option<String>,
     #[serde(default)]
     pub block_height: Option<u64>,
 }
@@ -240,24 +242,24 @@ pub struct BalanceResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtxoEntry {
-    pub tx_id:        String,
+    pub tx_id: String,
     pub output_index: u32,
-    pub value:        u64,
-    pub height:       u64,
-    pub is_coinbase:  bool,
+    pub value: u64,
+    pub height: u64,
+    pub is_coinbase: bool,
     #[serde(default)]
-    pub script_len:   Option<u32>,
+    pub script_len: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UtxoListResponse {
     #[serde(default)]
-    pub address:    Option<String>,
+    pub address: Option<String>,
     #[serde(default)]
     pub script_hex: Option<String>,
     pub tip_height: u64,
-    pub truncated:  bool,
-    pub utxos:      Vec<UtxoEntry>,
+    pub truncated: bool,
+    pub utxos: Vec<UtxoEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

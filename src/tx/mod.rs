@@ -23,21 +23,21 @@ use crate::upstream::ExferNode;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransferReceipt {
-    pub tx_id:      String,
-    pub size:       usize,
+    pub tx_id: String,
+    pub size: usize,
     pub tip_height: u64,
-    pub submitted:  bool,
+    pub submitted: bool,
 }
 
 /// Build, sign, broadcast a transfer of `amount_exfers` from `wallet` to
 /// `recipient`, paying `fee_exfers` to the miner. Returns the broadcast
 /// receipt.
 pub async fn transfer(
-    wallet:        &Wallet,
-    recipient:     Hash256,
+    wallet: &Wallet,
+    recipient: Hash256,
     amount_exfers: u64,
-    fee_exfers:    u64,
-    node:          &ExferNode,
+    fee_exfers: u64,
+    node: &ExferNode,
 ) -> Result<TransferReceipt> {
     let sender_addr_hex = hex::encode(wallet.address().as_bytes());
 
@@ -70,12 +70,12 @@ pub async fn transfer(
         };
         let utxo_entry = UtxoEntry {
             output: exfer::types::transaction::TxOutput {
-                value:      auth_value,
-                script:     wallet_script.clone(),
-                datum:      None,
+                value: auth_value,
+                script: wallet_script.clone(),
+                datum: None,
                 datum_hash: None,
             },
-            height:      entry.height,
+            height: entry.height,
             is_coinbase: entry.is_coinbase,
         };
         utxo_set
@@ -115,10 +115,10 @@ pub async fn transfer(
     }
 
     Ok(TransferReceipt {
-        tx_id:      our_tx_id_hex,
-        size:       serialized.len(),
+        tx_id: our_tx_id_hex,
+        size: serialized.len(),
         tip_height,
-        submitted:  true,
+        submitted: true,
     })
 }
 

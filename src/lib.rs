@@ -39,18 +39,17 @@
 //!
 //! Modules in dependency order:
 //!
-//! - [`error`]    — crate-wide error enum with JSON-RPC code mapping
-//! - [`config`]   — CLI / env config (clap + env vars)
-//! - [`store`]    — [`WalletStore`](store::WalletStore) trait; ships with
-//!                  [`FsWalletStore`](store::FsWalletStore). Future backends
-//!                  (redb, cloud KMS) drop in here.
+//! - [`error`] — crate-wide error enum with JSON-RPC code mapping
+//! - [`config`] — CLI / env config (clap + env vars)
+//! - [`store`] — [`WalletStore`](store::WalletStore) trait; ships with
+//!   [`FsWalletStore`](store::FsWalletStore). Future backends (redb,
+//!   cloud KMS) drop in here.
 //! - [`upstream`] — async client for the Exfer node JSON-RPC, with
-//!                  round-robin + failover across multiple node URLs.
-//! - [`tx`]       — transfer engine: authenticated UTXO fetch → local
-//!                  Ed25519 sign → broadcast.
-//! - [`api`]      — JSON-RPC dispatch (wrapper-only methods +
-//!                  passthroughs).
-//! - [`server`]   — axum HTTP server, Bearer auth, health endpoint.
+//!   round-robin + failover across multiple node URLs.
+//! - [`tx`] — transfer engine: authenticated UTXO fetch → local Ed25519
+//!   sign → broadcast.
+//! - [`api`] — JSON-RPC dispatch (wrapper-only methods + passthroughs).
+//! - [`server`] — axum HTTP server, Bearer auth, health endpoint.
 
 pub mod api;
 pub mod config;

@@ -87,9 +87,9 @@ impl Error {
             Error::Unauthorized => -32001,
             Error::WalletNotFound(_) => -32010,
             Error::WalletAlreadyExists(_) => -32011,
-            Error::UpstreamUnreachable(_) | Error::UpstreamRpc { .. } | Error::UpstreamUnexpected(_) => {
-                -32020
-            }
+            Error::UpstreamUnreachable(_)
+            | Error::UpstreamRpc { .. }
+            | Error::UpstreamUnexpected(_) => -32020,
             Error::TxBuild(_) | Error::UtxoAuth(_) => -32030,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
         }

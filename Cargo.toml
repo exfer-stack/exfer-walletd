@@ -1,0 +1,42 @@
+[package]
+name        = "exfer-walletd"
+version     = "0.1.0"
+edition     = "2021"
+description = "Exfer Wallet Daemon — independent wallet service that exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes"
+license     = "MIT"
+repository  = "https://github.com/exfer-stack/exfer-walletd"
+homepage    = "https://github.com/exfer-stack/exfer-walletd"
+
+[[bin]]
+name = "exfer-walletd"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse Exfer's wallet + transaction crypto so signing is byte-for-byte
+# identical to the upstream CLI. Pinned to a release tag for
+# reproducible builds; bump as new versions ship.
+exfer = { git = "https://github.com/ahuman-exfer/exfer.git", tag = "v1.10.1" }
+
+axum            = { version = "0.7", features = ["macros"] }
+tokio           = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs"] }
+tower            = "0.5"
+tower-http       = { version = "0.6", features = ["trace", "cors"] }
+reqwest          = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+hex              = "0.4"
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow           = "1"
+thiserror        = "1"
+clap             = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+strip         = true

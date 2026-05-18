@@ -1,0 +1,73 @@
+# fly.io config: combined Exfer node + RPC wrapper, single VM.
+#
+# This is the recommended reference deployment for an exchange or
+# integrator: one machine, one volume, both binaries colocated, wrapper
+# talks to the node over loopback.
+
+app            = "exfer-node-stack"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Wrapper config
+  WALLETD_BIND        = "0.0.0.0:8080"
+  # Wallets live in a subdirectory of the data volume because fly machines
+  # only support one mount per machine. Logical separation is still clear
+  # (different subdir, different perms set by WalletStore::open).
+  WALLETD_WALLET_DIR  = "/data/wallets"
+  EXFER_NODE_RPC      = "http://127.0.0.1:9334"
+  # Node config (consumed by entrypoint.sh) — keep at /data to preserve
+  # existing IBD progress; wallets live alongside in /data/wallets.
+  NODE_DATADIR        = "/data"
+  NODE_RPC_BIND       = "127.0.0.1:9334"
+  NODE_P2P_BIND       = "0.0.0.0:9333"
+
+  RUST_LOG            = "info,tower_http=warn,exfer_walletd=debug"
+
+# Single persistent volume — fly machines support one mount per machine.
+# Chain database lives at /data/chain, wallet keys at /data/wallets.
+[[mounts]]
+  source      = "exfer_data"
+  destination = "/data"
+
+# === Inbound P2P (TCP 9333) — public, no auth needed ===
+[[services]]
+  internal_port = 9333
+  protocol      = "tcp"
+
+  [[services.ports]]
+    port = 9333
+
+  [services.concurrency]
+    type       = "connections"
+    hard_limit = 200
+    soft_limit = 150
+
+# === Wrapper HTTPS (TCP 443 → 8080) — auth via bearer token ===
+[[services]]
+  internal_port = 8080
+  protocol      = "tcp"
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port     = 443
+
+  [[services.ports]]
+    handlers = ["http"]
+    port     = 80
+
+  [services.concurrency]
+    type       = "connections"
+    hard_limit = 200
+    soft_limit = 150
+
+  [[services.tcp_checks]]
+    grace_period  = "30s"
+    interval      = "15s"
+    timeout       = "5s"
+
+[[vm]]
+  size   = "performance-1x"
+  memory = "2gb"

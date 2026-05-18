@@ -34,7 +34,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::inflight::InFlightUtxos;
 use crate::store::FsWalletStore;
-use crate::upstream::ExferNode;
+use crate::upstream::{ExferNode, RetryPolicy};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -113,9 +113,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let store = FsWalletStore::open(&wallet_dir)?;
-    let node = ExferNode::new(
+    let retry = RetryPolicy {
+        attempts: cfg.upstream_attempts,
+        backoff_ms: cfg.upstream_retry_backoff_ms,
+    };
+    let node = ExferNode::with_retry_policy(
         cfg.node_rpc.clone(),
         Duration::from_secs(cfg.upstream_timeout_secs),
+        retry,
     )?;
     let api = ApiState {
         store: Arc::new(store),
@@ -128,11 +133,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
 
     tracing::info!(
-        bind        = %cfg.bind,
-        node_rpc    = %cfg.node_rpc,
-        datadir     = %datadir.display(),
-        wallet_dir  = %wallet_dir.display(),
-        auth        = %tokens.description(),
+        bind         = %cfg.bind,
+        node_rpc     = %cfg.node_rpc,
+        datadir      = %datadir.display(),
+        wallet_dir   = %wallet_dir.display(),
+        auth         = %tokens.description(),
+        attempts     = retry.attempts,
+        backoff_ms   = retry.backoff_ms,
         "exfer-walletd starting",
     );
 

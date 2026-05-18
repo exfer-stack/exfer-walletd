@@ -94,6 +94,22 @@ pub struct Config {
     /// Request timeout for upstream node calls (seconds).
     #[arg(long, env = "WALLETD_UPSTREAM_TIMEOUT_SECS", default_value_t = 30)]
     pub upstream_timeout_secs: u64,
+
+    /// Maximum total attempts per upstream RPC call. `1` disables retry
+    /// (fail-fast on the first transport error). Each attempt rotates
+    /// through every configured node before counting as failed.
+    ///
+    /// Retry is gated on *transport* failures only — connection refused,
+    /// timeouts, 5xx. Application-level errors returned by the node
+    /// (`{"error": {...}}`) are surfaced immediately and never retried.
+    #[arg(long, env = "WALLETD_UPSTREAM_ATTEMPTS", default_value_t = 4)]
+    pub upstream_attempts: u32,
+
+    /// Base backoff in milliseconds between RPC retry attempts. The
+    /// wait grows linearly: `backoff_ms`, `2 * backoff_ms`, … `0`
+    /// disables the sleep between attempts.
+    #[arg(long, env = "WALLETD_UPSTREAM_RETRY_BACKOFF_MS", default_value_t = 500)]
+    pub upstream_retry_backoff_ms: u64,
 }
 
 impl Config {
@@ -149,6 +165,8 @@ mod tests {
             auth_token_read: None,
             auth_token_spend: None,
             upstream_timeout_secs: 30,
+            upstream_attempts: 4,
+            upstream_retry_backoff_ms: 500,
         }
     }
 

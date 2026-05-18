@@ -12,14 +12,22 @@ use std::time::Duration;
 use exfer_walletd::api::{dispatch, ApiState, RpcRequest};
 use exfer_walletd::error::Error;
 use exfer_walletd::store::FsWalletStore;
-use exfer_walletd::upstream::ExferNode;
+use exfer_walletd::upstream::{ExferNode, RetryPolicy};
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tempfile::TempDir) {
+    make_state_with_retry(node_url, wallet_dir, RetryPolicy::none())
+}
+
+fn make_state_with_retry(
+    node_url: String,
+    wallet_dir: tempfile::TempDir,
+    retry: RetryPolicy,
+) -> (ApiState, tempfile::TempDir) {
     let store = FsWalletStore::open(wallet_dir.path()).unwrap();
-    let node = ExferNode::new(node_url, Duration::from_secs(5)).unwrap();
+    let node = ExferNode::with_retry_policy(node_url, Duration::from_secs(5), retry).unwrap();
     let state = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
@@ -244,4 +252,97 @@ async fn ping_returns_ok() {
 
     let result = dispatch(&state, rpc("ping", json!({}))).await.unwrap();
     assert_eq!(result["ok"].as_bool(), Some(true));
+}
+
+// --- retry: transient 5xx then success ------------------------------------
+
+#[tokio::test]
+async fn retry_recovers_from_transient_5xx() {
+    let mock = MockServer::start().await;
+
+    // First two calls fail transport-side; third succeeds.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "height": 7, "block_id": "abcd" },
+            "id": 1
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let retry = RetryPolicy {
+        attempts: 4,
+        backoff_ms: 0,
+    };
+    let (state, _dir) = make_state_with_retry(mock.uri(), tempfile::tempdir().unwrap(), retry);
+    let result = dispatch(&state, rpc("get_block_height", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(result["height"].as_u64().unwrap(), 7);
+}
+
+// --- retry: application errors are NOT retried ----------------------------
+
+#[tokio::test]
+async fn application_errors_are_not_retried() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "error":   { "code": -32602, "message": "Block not found" },
+            "id": 1
+        })))
+        .expect(1) // exactly one HTTP call despite a generous retry budget
+        .mount(&mock)
+        .await;
+
+    let retry = RetryPolicy {
+        attempts: 5,
+        backoff_ms: 0,
+    };
+    let (state, _dir) = make_state_with_retry(mock.uri(), tempfile::tempdir().unwrap(), retry);
+    let err = dispatch(&state, rpc("get_block_height", json!({})))
+        .await
+        .unwrap_err();
+    match err {
+        Error::UpstreamRpc { code, .. } => assert_eq!(code, -32602),
+        other => panic!("expected UpstreamRpc, got {other:?}"),
+    }
+}
+
+// --- retry: gives up after exhausting attempts ----------------------------
+
+#[tokio::test]
+async fn retries_give_up_and_return_transport_error() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(3)
+        .mount(&mock)
+        .await;
+
+    let retry = RetryPolicy {
+        attempts: 3,
+        backoff_ms: 0,
+    };
+    let (state, _dir) = make_state_with_retry(mock.uri(), tempfile::tempdir().unwrap(), retry);
+    let err = dispatch(&state, rpc("get_block_height", json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::UpstreamUnreachable(_)),
+        "expected UpstreamUnreachable, got {err:?}",
+    );
 }

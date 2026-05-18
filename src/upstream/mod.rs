@@ -6,6 +6,14 @@
 //! (e.g. `Block not found`) are surfaced immediately without retrying,
 //! since they're not transport problems.
 //!
+//! On transport failure (connection refused, timeout, 5xx) the client
+//! does a full pass over every configured node before considering the
+//! whole *attempt* failed, then waits a linear backoff and starts another
+//! attempt up to [`RetryPolicy::attempts`] times. This matters most for
+//! `transfer`, which fires 1 + N + 1 sequential calls during UTXO
+//! authentication — without retry the per-call failure probability
+//! compounds and a flaky public RPC becomes unusable.
+//!
 //! All wire types are strongly typed. The rest of the codebase never
 //! touches raw JSON.
 
@@ -18,6 +26,47 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 
+/// Retry behaviour for transport-level RPC failures. Application errors
+/// (`{"error":{"code":...,"message":...}}`) are surfaced immediately and
+/// never retried — they're not transient.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// Maximum number of total attempts per RPC call. `1` disables retry
+    /// entirely. Each attempt rotates through every configured node
+    /// before counting as failed.
+    pub attempts: u32,
+    /// Base backoff in milliseconds. The wait between attempt `k` and
+    /// attempt `k + 1` is `backoff_ms * k`, so backoff grows linearly:
+    /// `backoff_ms`, `2 * backoff_ms`, `3 * backoff_ms`, …
+    pub backoff_ms: u64,
+}
+
+impl RetryPolicy {
+    /// No retry — every call gets exactly one attempt across all nodes.
+    /// The pre-retry-aware default for [`ExferNode::new`] and the
+    /// recommended setting for tests.
+    pub const fn none() -> Self {
+        Self {
+            attempts: 1,
+            backoff_ms: 0,
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    /// 4 attempts (= 3 retries after the first failure) with 500ms linear
+    /// backoff. Worst-case extra wall-clock is 500 + 1000 + 1500 = 3s of
+    /// sleep on top of the regular per-call timeout, in exchange for
+    /// surviving a public RPC at ~80–90% reliability with several
+    /// authenticated-output lookups per transfer.
+    fn default() -> Self {
+        Self {
+            attempts: 4,
+            backoff_ms: 500,
+        }
+    }
+}
+
 /// A client that fans out to one or more upstream Exfer nodes.
 ///
 /// - With a single URL: behaves as a plain JSON-RPC client.
@@ -26,17 +75,34 @@ use crate::error::{Error, Result};
 ///   a transport-level error (connection refused, timeout, 5xx).
 ///   Application errors returned by the node (`{"error": {...}}`) are
 ///   surfaced immediately without trying the next node.
+/// - When the full node sweep fails with only transport errors, the
+///   call sleeps for the configured backoff and tries the whole sweep
+///   again, up to [`RetryPolicy::attempts`] total times.
 #[derive(Debug, Clone)]
 pub struct ExferNode {
     nodes: Vec<String>,
     http: reqwest::Client,
     cursor: Arc<AtomicUsize>,
+    retry: RetryPolicy,
 }
 
 impl ExferNode {
-    /// Build a client. Accepts a comma-separated list of URLs (e.g.
-    /// `"http://node-a:9334,http://node-b:9334"`) or a single URL.
+    /// Build a client with retries disabled. Accepts a comma-separated
+    /// list of URLs (e.g. `"http://node-a:9334,http://node-b:9334"`) or
+    /// a single URL. Use [`ExferNode::with_retry_policy`] to opt into
+    /// retry on transient failures.
     pub fn new(urls: impl AsRef<str>, timeout: Duration) -> Result<Self> {
+        Self::with_retry_policy(urls, timeout, RetryPolicy::none())
+    }
+
+    /// Like [`ExferNode::new`] but with an explicit retry policy. The
+    /// daemon's `main` builds the node this way; tests typically want
+    /// [`RetryPolicy::none`] to fail fast.
+    pub fn with_retry_policy(
+        urls: impl AsRef<str>,
+        timeout: Duration,
+        retry: RetryPolicy,
+    ) -> Result<Self> {
         let nodes: Vec<String> = urls
             .as_ref()
             .split(',')
@@ -55,7 +121,13 @@ impl ExferNode {
             nodes,
             http,
             cursor: Arc::new(AtomicUsize::new(0)),
+            retry,
         })
+    }
+
+    /// Inspect the retry policy this client was built with.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        self.retry
     }
 
     /// The configured upstream URLs, in original order. Useful for
@@ -74,18 +146,36 @@ impl ExferNode {
         let n = self.nodes.len();
         // Rotate the starting node so load distributes across nodes.
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let attempts = self.retry.attempts.max(1);
 
         let mut last_transport_err: Option<Error> = None;
-        for offset in 0..n {
-            let idx = (start + offset) % n;
-            let url = &self.nodes[idx];
-            match self.call_one(url, &body).await {
-                Ok(v) => return Ok(v),
-                Err(e @ Error::UpstreamUnreachable(_)) => {
-                    tracing::warn!(node = %url, error = %e, "upstream unreachable, trying next");
-                    last_transport_err = Some(e);
+        for attempt in 0..attempts {
+            for offset in 0..n {
+                let idx = (start + offset) % n;
+                let url = &self.nodes[idx];
+                match self.call_one(url, &body).await {
+                    Ok(v) => return Ok(v),
+                    Err(e @ Error::UpstreamUnreachable(_)) => {
+                        tracing::warn!(
+                            node    = %url,
+                            attempt = attempt + 1,
+                            of      = attempts,
+                            error   = %e,
+                            "upstream unreachable, trying next"
+                        );
+                        last_transport_err = Some(e);
+                    }
+                    Err(other) => return Err(other),
                 }
-                Err(other) => return Err(other),
+            }
+            // Whole node sweep failed with only transport errors.
+            // Sleep linear backoff, then try the sweep again — unless
+            // this was the last attempt.
+            if attempt + 1 < attempts {
+                let wait_ms = self.retry.backoff_ms.saturating_mul((attempt + 1) as u64);
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
             }
         }
         Err(last_transport_err.unwrap_or_else(|| Error::Internal("no nodes tried".into())))
@@ -100,20 +190,26 @@ impl ExferNode {
             .await
             .map_err(|e| Error::UpstreamUnreachable(format!("{url}: {e}")))?;
         let status = resp.status();
+        // Check the status BEFORE decoding the body: a 5xx with an empty
+        // or non-JSON body (common from load balancers and proxies) must
+        // still be classified as a retryable transport failure, not as
+        // a permanent malformed-response error.
+        if status.is_server_error() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Error::UpstreamUnreachable(format!(
+                "{url}: http {status}: {body_text}"
+            )));
+        }
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(Error::UpstreamUnexpected(format!(
+                "{url}: http {status}: {body_text}"
+            )));
+        }
         let payload: Value = resp
             .json()
             .await
             .map_err(|e| Error::UpstreamUnexpected(format!("{url}: decode: {e}")))?;
-        if status.is_server_error() {
-            return Err(Error::UpstreamUnreachable(format!(
-                "{url}: http {status}: {payload}"
-            )));
-        }
-        if !status.is_success() {
-            return Err(Error::UpstreamUnexpected(format!(
-                "{url}: http {status}: {payload}"
-            )));
-        }
         if let Some(err) = payload.get("error") {
             let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             let message = err

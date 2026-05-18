@@ -13,7 +13,7 @@ Same architectural pattern as
 for Cardano: a separate signing daemon, decoupled from the chain node.
 Keys never leave the daemon's host; the node never sees a private key.
 
-📖 **Docs, API reference, examples** →
+Docs, API reference, examples →
 <https://exfer-stack.github.io/exfer-walletd/>
 
 ## Install

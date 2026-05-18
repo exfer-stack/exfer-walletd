@@ -46,17 +46,20 @@ primary_region = "nrt"
     soft_limit = 150
 
 # === Wrapper HTTPS (TCP 443 → 8080) — auth via bearer token ===
+#
+# Only TLS is exposed. Port 80 is intentionally NOT bound: fly's
+# `force_https` only redirects GET/HEAD requests, so a stray POST to
+# http://… would still have been forwarded to walletd with the Bearer
+# token visible to anyone on the path to fly's edge. Refusing the
+# connection outright is the only way to make that mistake impossible.
 [[services]]
-  internal_port = 8080
-  protocol      = "tcp"
+  internal_port  = 8080
+  protocol       = "tcp"
+  force_https    = true
 
   [[services.ports]]
     handlers = ["tls", "http"]
     port     = 443
-
-  [[services.ports]]
-    handlers = ["http"]
-    port     = 80
 
   [services.concurrency]
     type       = "connections"

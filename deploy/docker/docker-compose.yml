@@ -1,0 +1,48 @@
+# docker-compose for a standalone exfer-walletd container.
+#
+# Assumes an Exfer node is already running somewhere reachable. Adjust
+# EXFER_NODE_RPC accordingly — it can be a host on the docker network, a
+# bare-metal node on the host, a managed RPC provider, or several
+# comma-separated URLs for round-robin + failover.
+#
+# Tokens come from a sibling .env file (mode 0600, NOT committed). See
+# .env.example for the template.
+#
+# Put Caddy / nginx / your load balancer in front for TLS termination.
+# Walletd is published only on 127.0.0.1 so it can never be hit over
+# plaintext from outside the host.
+
+services:
+  exfer-walletd:
+    # Pull a release image. To build from source instead, comment out
+    # the `image:` line and uncomment `build:`.
+    image: ghcr.io/exfer-stack/exfer-walletd:latest
+    # build: ../..
+
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # Override the default entrypoint (which is the fly combined
+    # node+walletd supervisor) and run walletd only.
+    entrypoint: ["/usr/local/bin/exfer-walletd"]
+
+    environment:
+      WALLETD_BIND: "0.0.0.0:8080"
+      WALLETD_WALLET_DIR: "/wallets"
+      EXFER_NODE_RPC: "${EXFER_NODE_RPC:-http://host.docker.internal:9334}"
+      WALLETD_AUTH_TOKEN_READ:  "${WALLETD_AUTH_TOKEN_READ}"
+      WALLETD_AUTH_TOKEN_SPEND: "${WALLETD_AUTH_TOKEN_SPEND}"
+      RUST_LOG: "info,exfer_walletd=info"
+
+    volumes:
+      - walletd_data:/wallets
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  walletd_data:

@@ -9,9 +9,13 @@
 //!
 //! `GET /healthz` is unauthenticated.
 
+use std::fs;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+
+use rand::{rngs::OsRng, RngCore};
 
 use axum::{
     body::Bytes,
@@ -75,8 +79,29 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
+    let datadir = cfg.resolved_datadir();
+    let wallet_dir = cfg.resolved_wallet_dir();
+
+    // Create datadir + wallet dir on first run. Mode 0700 — only the
+    // running user should ever read these.
+    ensure_dir(&datadir, 0o700)?;
+    ensure_dir(&wallet_dir, 0o700)?;
+
+    // Resolve the auth token: explicit override wins, else read or
+    // auto-generate `<datadir>/token`. If the operator opts into the
+    // two-scope model with --auth-token-{read,spend}, we don't touch
+    // the on-disk token at all.
+    let scoped_in_use = cfg.auth_token_read.is_some() || cfg.auth_token_spend.is_some();
+    let effective_legacy = if scoped_in_use {
+        cfg.auth_token.clone()
+    } else if let Some(t) = cfg.auth_token.clone() {
+        Some(t)
+    } else {
+        Some(ensure_token_file(&cfg.token_file())?)
+    };
+
     let tokens = Tokens::from_config(
-        cfg.auth_token.as_deref(),
+        effective_legacy.as_deref(),
         cfg.auth_token_read.as_deref(),
         cfg.auth_token_spend.as_deref(),
     );
@@ -87,7 +112,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     check_bind_is_safe(cfg.bind, &tokens, cfg.allow_public_bind)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let store = FsWalletStore::open(&cfg.wallet_dir)?;
+    let store = FsWalletStore::open(&wallet_dir)?;
     let node = ExferNode::new(
         cfg.node_rpc.clone(),
         Duration::from_secs(cfg.upstream_timeout_secs),
@@ -105,7 +130,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     tracing::info!(
         bind        = %cfg.bind,
         node_rpc    = %cfg.node_rpc,
-        wallet_dir  = %cfg.wallet_dir.display(),
+        datadir     = %datadir.display(),
+        wallet_dir  = %wallet_dir.display(),
         auth        = %tokens.description(),
         "exfer-walletd starting",
     );
@@ -119,6 +145,89 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// Create a directory (and any parents) with the given mode, OR if
+/// it already exists, tighten its mode to match. The doc claims
+/// `<datadir>` is `0700`; without this enforcement, an operator who
+/// pre-creates the dir with `mkdir` (default umask → `0755`) would
+/// silently end up with a world-listable parent for the `token` file
+/// and `wallets/`.
+///
+/// Mode is honored only on Unix.
+fn ensure_dir(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
+    if path.exists() {
+        if !path.is_dir() {
+            anyhow::bail!("{} exists but is not a directory", path.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let current = fs::metadata(path)?.permissions().mode() & 0o777;
+            if current != mode {
+                tracing::warn!(
+                    path = %path.display(),
+                    from = format!("{current:o}"),
+                    to = format!("{mode:o}"),
+                    "tightening directory permissions to match walletd policy",
+                );
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        return Ok(());
+    }
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    b.create(path)?;
+    Ok(())
+}
+
+/// Read the token at `path`, or generate + persist a fresh one and
+/// print it prominently to stderr (so the operator sees it once on
+/// first run).
+fn ensure_token_file(path: &std::path::Path) -> anyhow::Result<String> {
+    if let Ok(s) = fs::read_to_string(path) {
+        let trimmed = s.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(token.as_bytes())?;
+    f.write_all(b"\n")?;
+
+    eprintln!();
+    eprintln!("  ┌─ first run ───────────────────────────────────────────────────────────");
+    eprintln!("  │ generated bearer token (saved to {}):", path.display());
+    eprintln!("  │");
+    eprintln!("  │     {token}");
+    eprintln!("  │");
+    eprintln!("  │ use as:  Authorization: Bearer {token}");
+    eprintln!("  └───────────────────────────────────────────────────────────────────────");
+    eprintln!();
+
+    Ok(token)
 }
 
 async fn shutdown_signal() {
@@ -213,4 +322,61 @@ fn error_response(id: Value, err: &Error) -> Response {
     tracing::warn!(error = %err, "rpc error");
     let status = err.http_status();
     (status, Json(RpcResponse::err(id, err))).into_response()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::ensure_dir;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn creates_missing_dir_with_target_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh");
+        ensure_dir(&path, 0o700).unwrap();
+        assert!(path.is_dir());
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    #[test]
+    fn tightens_existing_dir_with_loose_mode() {
+        // Simulate a user pre-creating --datadir with `mkdir` (default
+        // umask → 0755). walletd must tighten it to 0700 so the token
+        // file and wallets/ aren't world-listable through the parent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preexisting");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode_of(&path), 0o755);
+
+        ensure_dir(&path, 0o700).unwrap();
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    #[test]
+    fn leaves_correctly_moded_dir_alone() {
+        // No-op path: existing dir already at the target mode.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("already-tight");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        ensure_dir(&path, 0o700).unwrap();
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    #[test]
+    fn refuses_when_path_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-dir");
+        fs::write(&path, b"hi").unwrap();
+
+        let err = ensure_dir(&path, 0o700).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "got: {err}");
+    }
 }

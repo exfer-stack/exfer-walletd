@@ -53,15 +53,12 @@
 
 pub mod api;
 pub mod auth;
-pub mod cli;
 pub mod config;
 pub mod error;
 pub mod inflight;
-pub mod init;
 pub mod server;
 pub mod store;
 pub mod tx;
-pub mod uninstall;
 pub mod upstream;
 
 pub use error::{Error, Result};

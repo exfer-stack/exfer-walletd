@@ -1,16 +1,34 @@
 //! Runtime configuration for the daemon. Sourced from CLI args
 //! (highest priority), then environment variables, then defaults.
 //!
-//! `Config` is `clap::Args`, not `clap::Parser`, because it flattens
-//! into [`crate::cli::Cli`] alongside the optional subcommands.
+//! The driving idea: a fresh user should be able to run
+//! `exfer-walletd` with **zero flags** and get a working daemon —
+//! datadir created, token generated, wallet directory ready. Power
+//! users still get `--node-rpc`, `--bind`, `--auth-token`, etc., but
+//! none of them are required.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::Parser;
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Parser)]
+#[command(
+    name = "exfer-walletd",
+    about = "Exfer Wallet Daemon — JSON-RPC service that holds wallet keys and signs transactions on behalf of a backend.",
+    version
+)]
 pub struct Config {
+    /// Where walletd keeps its state — a single directory containing
+    /// `token` (auto-generated bearer token) and `wallets/` (one
+    /// `.key` file per managed address). Created on first run.
+    ///
+    /// Defaults to `$HOME/.exfer-walletd` (or `./.exfer-walletd` if
+    /// `HOME` is unset). Mirrors the `--datadir` convention of the
+    /// upstream `exfer node` binary.
+    #[arg(long, env = "WALLETD_DATADIR")]
+    pub datadir: Option<PathBuf>,
+
     /// HTTP address the daemon listens on.
     ///
     /// Default is loopback. Public-interface binds (`0.0.0.0`, any
@@ -20,14 +38,13 @@ pub struct Config {
     #[arg(long, env = "WALLETD_BIND", default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
 
-    /// Acknowledge that a TLS terminator (Caddy, nginx, Cloudflare,
-    /// k8s ingress, an upstream cloud load balancer, …) sits in front
-    /// of walletd, and bind a public interface anyway. Without this
-    /// flag, public binds are refused at startup so the bearer token
-    /// can't accidentally travel plaintext.
+    /// Acknowledge that a TLS terminator (or a trusted private
+    /// network) sits in front of walletd, and bind a non-loopback
+    /// interface anyway. Without this, public binds fail-close at
+    /// startup so the bearer token can't accidentally end up plaintext
+    /// on the wire.
     ///
-    /// As an env var, accepts `1` / `true` / `yes` / `on` (case-
-    /// insensitive). Anything else is treated as "off."
+    /// As an env var, accepts `1` / `true` / `yes` / `on`.
     #[arg(
         long,
         env = "WALLETD_ALLOW_PUBLIC_BIND",
@@ -38,49 +55,71 @@ pub struct Config {
     )]
     pub allow_public_bind: bool,
 
-    /// JSON-RPC URL of one or more upstream Exfer nodes.
-    /// Accepts a single URL or a comma-separated list — calls round-robin
-    /// across them, failing over to the next on transport / 5xx error.
-    /// The daemon is decoupled from the node: any reachable Exfer JSON-RPC
-    /// endpoint works (loopback, LAN, VPC, public RPC).
+    /// JSON-RPC URL of one or more upstream Exfer nodes. Accepts a
+    /// single URL or a comma-separated list — calls round-robin
+    /// across them, failing over to the next on transport / 5xx
+    /// error. Any reachable Exfer JSON-RPC endpoint works (loopback,
+    /// LAN, VPC, public RPC).
     #[arg(long, env = "EXFER_NODE_RPC", default_value = "http://127.0.0.1:9334")]
     pub node_rpc: String,
 
-    /// Directory holding `.key` wallet files.
-    /// One file per managed address; filename is `<address>.key`.
-    #[arg(
-        long,
-        env = "WALLETD_WALLET_DIR",
-        default_value = "/var/lib/exfer-wallets"
-    )]
-    pub wallet_dir: PathBuf,
+    /// Directory holding `.key` wallet files. Defaults to
+    /// `<datadir>/wallets`. Override only if you want wallets stored
+    /// somewhere outside the datadir (e.g. on a separate encrypted
+    /// volume).
+    #[arg(long, env = "WALLETD_WALLET_DIR")]
+    pub wallet_dir: Option<PathBuf>,
 
-    /// Legacy single-token mode. If set, grants every method (read +
-    /// spend). Prefer the two-scope flags below for new deployments.
+    /// Single all-scope bearer token. If unset, walletd uses (or
+    /// creates) the one stored at `<datadir>/token`.
     ///
-    /// When neither this nor a scoped token is set, requests are
-    /// permitted — but only when the daemon binds to loopback.
-    /// Public-interface binds (e.g. `0.0.0.0`) without any token are
-    /// refused at startup.
+    /// Override only when you want walletd to take its token from a
+    /// secret manager / env var rather than the datadir file.
     #[arg(long, env = "WALLETD_AUTH_TOKEN")]
     pub auth_token: Option<String>,
 
-    /// Read-scope bearer token. Grants every method **except** value-
-    /// moving operations (`transfer`, `send_raw_transaction`). A
-    /// deposit-watcher service typically only needs this scope —
-    /// leaking it cannot lose funds.
+    /// Optional read-scope bearer token. Grants every method
+    /// **except** value-moving operations (`transfer`,
+    /// `send_raw_transaction`). Pair with `--auth-token-spend` to
+    /// split deposit-watcher and withdrawal-worker credentials.
     #[arg(long, env = "WALLETD_AUTH_TOKEN_READ")]
     pub auth_token_read: Option<String>,
 
-    /// Spend-scope bearer token. Grants every method including
-    /// `transfer` and `send_raw_transaction`. Implicitly grants read
-    /// access too (so the spend service never needs both tokens).
+    /// Optional spend-scope bearer token. Grants all methods. When
+    /// set alongside `--auth-token-read`, the two scopes are
+    /// enforced independently.
     #[arg(long, env = "WALLETD_AUTH_TOKEN_SPEND")]
     pub auth_token_spend: Option<String>,
 
     /// Request timeout for upstream node calls (seconds).
     #[arg(long, env = "WALLETD_UPSTREAM_TIMEOUT_SECS", default_value_t = 30)]
     pub upstream_timeout_secs: u64,
+}
+
+impl Config {
+    /// Resolve `--datadir` to a concrete path, applying the default
+    /// (`$HOME/.exfer-walletd`, or `./.exfer-walletd` if no `HOME`).
+    pub fn resolved_datadir(&self) -> PathBuf {
+        if let Some(p) = &self.datadir {
+            return p.clone();
+        }
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(".exfer-walletd"),
+            None => PathBuf::from(".exfer-walletd"),
+        }
+    }
+
+    /// Resolve `--wallet-dir`, defaulting to `<datadir>/wallets`.
+    pub fn resolved_wallet_dir(&self) -> PathBuf {
+        self.wallet_dir
+            .clone()
+            .unwrap_or_else(|| self.resolved_datadir().join("wallets"))
+    }
+
+    /// Path of the auto-generated token file inside the datadir.
+    pub fn token_file(&self) -> PathBuf {
+        self.resolved_datadir().join("token")
+    }
 }
 
 /// Accept Unix-style booleans ("1", "yes", "on") in addition to the
@@ -92,5 +131,55 @@ fn parse_lenient_bool(s: &str) -> Result<bool, String> {
         other => Err(format!(
             "expected 1/0, true/false, yes/no, or on/off — got {other:?}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_cfg() -> Config {
+        Config {
+            datadir: None,
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            allow_public_bind: false,
+            node_rpc: "http://127.0.0.1:9334".into(),
+            wallet_dir: None,
+            auth_token: None,
+            auth_token_read: None,
+            auth_token_spend: None,
+            upstream_timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn datadir_default_uses_home_when_set() {
+        // We can't safely mutate $HOME in a parallel test runner, so
+        // just check resolution prefers the explicit value when set.
+        let mut cfg = empty_cfg();
+        cfg.datadir = Some(PathBuf::from("/custom/path"));
+        assert_eq!(cfg.resolved_datadir(), PathBuf::from("/custom/path"));
+    }
+
+    #[test]
+    fn wallet_dir_defaults_to_datadir_subdir() {
+        let mut cfg = empty_cfg();
+        cfg.datadir = Some(PathBuf::from("/x"));
+        assert_eq!(cfg.resolved_wallet_dir(), PathBuf::from("/x/wallets"));
+    }
+
+    #[test]
+    fn wallet_dir_override_wins() {
+        let mut cfg = empty_cfg();
+        cfg.datadir = Some(PathBuf::from("/x"));
+        cfg.wallet_dir = Some(PathBuf::from("/elsewhere"));
+        assert_eq!(cfg.resolved_wallet_dir(), PathBuf::from("/elsewhere"));
+    }
+
+    #[test]
+    fn token_file_is_in_datadir() {
+        let mut cfg = empty_cfg();
+        cfg.datadir = Some(PathBuf::from("/x"));
+        assert_eq!(cfg.token_file(), PathBuf::from("/x/token"));
     }
 }

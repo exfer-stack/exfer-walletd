@@ -1,38 +1,38 @@
 # FAQ & troubleshooting
 
-## "The env vars I loaded with `set -a; . ./walletd.env; set +a` disappeared"
+## "Where's my token?"
 
-That command exports them into the **current shell** only. Each new
-terminal / `tmux` pane / SSH session starts with a clean environment.
+```bash
+cat ~/.exfer-walletd/token
+```
 
-Options:
+That file is auto-generated on first run, mode `0600`, owned by
+whichever user ran walletd. Override location with `--datadir`.
 
-- Re-source the env file in each new shell: `set -a; . ./walletd.env; set +a`.
-- For local dev only, add the source line to `~/.bashrc` or `~/.zshrc`
-  — but remember `.env` may contain tokens, so don't commit any
-  shell-rc that sources it from a world-readable path.
-- For production, use systemd's `EnvironmentFile=` — which is what
-  our shipped systemd unit does. No shell sourcing needed; the
-  daemon receives the env vars directly.
+## "I deleted the token file by mistake"
 
-## `init` printed the wrong "Next steps" for my path
+Restart walletd. It generates and prints a fresh one. Any client
+using the old token starts getting `401` immediately — update them.
 
-If `--env-file` points to a system path (`/etc`, `/var`, `/usr`,
-`/opt`), `init` prints the systemd-flow next-steps. Anywhere else
-(your home dir, a relative path) you get the simpler local-dev
-flow. If the heuristic guessed wrong, just ignore the printed steps
-— the env file content is correct either way.
+## "The daemon won't bind 0.0.0.0:8080"
 
-## "Tokens (also stored in the env file): TOKEN ..." is printed to my terminal
+By design. See [Tokens and scopes → Bind safety](./tokens-and-scopes.md#bind-safety).
+Either bind loopback (default), bind a private/internal IP, or set
+`--allow-public-bind` to acknowledge that a TLS terminator is in front
+of walletd.
 
-That's `init` showing you the freshly-generated token once so you
-can copy it into your client app. The output goes to **stderr** so
-it's not captured by `command-sub $()` pipelines, but it does land
-in terminal scrollback. If that's a concern, either:
+## "My backend on a different server can't reach walletd"
 
-- Use `--print` mode — env contents go to stdout, you redirect or
-  pipe to a vault tool.
-- Generate tokens out-of-band and write your own env file.
+Walletd defaults to `127.0.0.1:8080` (loopback only). Bind a
+private/internal IP:
+
+```bash
+exfer-walletd --bind 10.0.1.5:8080
+```
+
+Then on the backend host, `curl http://10.0.1.5:8080/healthz` should
+return `ok`. If it doesn't, check firewall / security group / cloud
+network ACLs.
 
 ## "I'm seeing `-32020 upstream node unreachable` intermittently"
 
@@ -40,7 +40,7 @@ The walletd → upstream hop has no retry within a single URL. If
 you're talking to a flaky public RPC, add a second URL:
 
 ```bash
-EXFER_NODE_RPC=http://primary:9334,http://backup:9334
+EXFER_NODE_RPC=http://primary:9334,http://backup:9334 exfer-walletd
 ```
 
 Walletd fails over to the next URL on transport errors. Application-
@@ -91,40 +91,30 @@ confirms.
 This is why walletd has the in-flight tracker — to bridge that gap
 locally without depending on a mempool-aware UTXO endpoint upstream.
 
-## "Can I run two walletd processes against the same wallet directory?"
+## "Can I run two walletd processes against the same datadir?"
 
 Technically yes — the on-disk format tolerates concurrent readers,
 and key generation uses `O_CREAT | O_EXCL` so two `generate_address`
 calls can't collide.
 
 But: the in-flight UTXO tracker is per-process. Two walletds against
-the same wallet directory can race onto the same outpoint. Don't.
+the same datadir can race onto the same outpoint. Don't.
 
-## "`exfer-walletd` exits immediately after `init`"
+## "Balances look wrong / `get_block_height` is way behind"
 
-`init` only writes the env file and creates the wallet directory.
-It does **not** start the daemon. Run `exfer-walletd` (with env
-loaded) to actually start the server.
+Almost always: your upstream node isn't fully synced yet. Walletd
+returns whatever the node has locally — if the node is at height 50k
+and the chain is at 580k, balances reflect the 50k view. Wait for the
+node to catch up, then retry.
 
-## "The daemon won't bind 0.0.0.0:8080"
-
-By design. See [Tokens and scopes → Bind safety](./tokens-and-scopes.md#bind-safety).
-Either bind loopback (default), or set
-`WALLETD_ALLOW_PUBLIC_BIND=1` to acknowledge that a TLS terminator
-is in front of walletd.
+`generate_address` is always safe to call (no chain dependency).
 
 ## How do I see what walletd is doing?
 
-Daemon logs go to stdout/stderr by default; systemd captures them.
+Daemon logs go to stdout/stderr. Bump verbosity with `RUST_LOG`:
 
 ```bash
-sudo journalctl -u exfer-walletd -f
-```
-
-Bump verbosity by changing `RUST_LOG` in the env file:
-
-```
-RUST_LOG=debug,exfer_walletd=trace
+RUST_LOG=debug,exfer_walletd=trace exfer-walletd
 ```
 
 Spend-scope requests always emit a structured audit line at `INFO`

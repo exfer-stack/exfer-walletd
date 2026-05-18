@@ -8,7 +8,7 @@ wallet keypairs and exposes higher-level RPC methods
 (`generate_address`, `transfer`, `balance`, …) on top of one or more
 [Exfer](https://exfer.org/) nodes.
 
-Same architectural pattern as
+Same pattern as
 [`cardano-wallet`](https://github.com/cardano-foundation/cardano-wallet)
 for Cardano: a separate signing daemon, decoupled from the chain node.
 Keys never leave the daemon's host; the node never sees a private key.
@@ -27,45 +27,43 @@ cargo build --release
 # Binary at target/release/exfer-walletd
 ```
 
-## Quick start
-
-Fastest path from zero to a running daemon — works against either a
-local Exfer node on loopback or any reachable Exfer JSON-RPC URL
-(LAN, VPC, public RPC provider).
+## Run
 
 ```bash
-# 1. Scaffold env file + wallet dir + fresh read/spend tokens.
-#    Omit --node-rpc to default to http://127.0.0.1:9334, or point it
-#    at any reachable Exfer JSON-RPC endpoint.
-sudo exfer-walletd init --node-rpc http://your-node-host:9334
-
-# 2. Start (reads /etc/exfer-walletd/env)
-sudo exfer-walletd
+exfer-walletd
 ```
 
-For local dev without `sudo`, write the env file under your home dir:
+First launch:
+
+- creates `~/.exfer-walletd/` (mode `0700`),
+- generates a 32-byte bearer token at `~/.exfer-walletd/token`
+  (mode `0600`) and prints it once,
+- starts serving JSON-RPC on `127.0.0.1:8080`,
+- talks to an Exfer node at `http://127.0.0.1:9334` by default.
+
+Override with `--node-rpc`, `--bind`, `--datadir` (each one has a
+matching env var). All flags are optional.
 
 ```bash
-exfer-walletd init \
-    --env-file   ./walletd.env \
-    --wallet-dir ./wallets \
-    --node-rpc   http://127.0.0.1:9334    # or a remote URL
-set -a; . ./walletd.env; set +a
-exfer-walletd
+# point at a different node
+exfer-walletd --node-rpc https://exfer-rpc.example.com
+
+# expose on a private/internal IP so other servers can reach it
+exfer-walletd --bind 10.0.1.5:8080
 ```
 
 ## Call it
 
 ```bash
+TOKEN=$(cat ~/.exfer-walletd/token)
 curl -s http://127.0.0.1:8080/ -H 'content-type: application/json' \
-     -H "Authorization: Bearer $WALLETD_AUTH_TOKEN" \
+     -H "Authorization: Bearer $TOKEN" \
      -d '{"jsonrpc":"2.0","method":"generate_address","id":1}'
 # → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…"},"id":1}
 ```
 
-Full method list, error codes, deployment topologies (systemd + Caddy,
-docker-compose), security notes, example clients — all on the docs
-site: <https://exfer-stack.github.io/exfer-walletd/>
+Full method list, error codes, security notes, example clients —
+all on the docs site: <https://exfer-stack.github.io/exfer-walletd/>
 
 ## License
 

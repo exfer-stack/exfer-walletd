@@ -6,14 +6,14 @@ already run.
 
 ## Same host (most common)
 
-Default. `init` records `EXFER_NODE_RPC=http://127.0.0.1:9334`.
-Nothing more to do — start the node first, then walletd.
+Default. Walletd uses `http://127.0.0.1:9334`. Start the node first,
+then walletd — no flags needed.
 
 ```bash
 # Terminal 1 — an Exfer node with RPC enabled
-exfer node --datadir ./chain --rpc-bind 127.0.0.1:9334
+exfer node --datadir ~/.exfer --rpc-bind 127.0.0.1:9334
 
-# Terminal 2 — walletd (after `init`)
+# Terminal 2 — walletd
 exfer-walletd
 ```
 
@@ -22,12 +22,11 @@ loopback never leaves the kernel, no NIC, no wire.
 
 ## Different host (LAN, VPC, public RPC)
 
-Pass `--node-rpc` to `init`, or edit `EXFER_NODE_RPC` in the env file.
-Walletd treats the upstream like any other HTTP service — no auth,
-just a URL.
+Pass `--node-rpc` (or set `EXFER_NODE_RPC`). Walletd treats the
+upstream like any other HTTP service — no auth, just a URL.
 
 ```bash
-exfer-walletd init --node-rpc https://exfer-rpc.example.com
+exfer-walletd --node-rpc https://exfer-rpc.example.com
 ```
 
 Caveats when the upstream isn't yours:
@@ -38,11 +37,6 @@ Caveats when the upstream isn't yours:
 - If the upstream is on the public internet, prefer HTTPS for the
   upstream URL too. Walletd uses `rustls` for outbound HTTPS, no
   extra config needed.
-- The community node at `http://82.221.100.201:9334` is unauthenticated
-  and convenient for testing, but it has the usual public-RPC issues
-  (occasional unavailability, rate-limit, no SLA). Don't depend on it
-  in production.
-
 ## Multiple nodes (round-robin + failover)
 
 Comma-separate the URLs. Walletd rotates the starting node per call
@@ -51,7 +45,7 @@ errors (`Block not found`) are surfaced immediately without trying
 the next node.
 
 ```bash
-exfer-walletd init --node-rpc \
+exfer-walletd --node-rpc \
   'http://node-a:9334,http://node-b:9334,https://public-rpc.example.com'
 ```
 
@@ -72,10 +66,10 @@ Failover does **not** trigger on:
 
 Either:
 
-- Run one with the upstream Exfer CLI (`exfer node --datadir ... --rpc-bind 127.0.0.1:9334`).
+- Run one with the upstream Exfer CLI (`exfer node --datadir ~/.exfer --rpc-bind 127.0.0.1:9334`).
   This is the right choice for production — you control the trust path.
-- Or use a public RPC provider as a stop-gap. You can switch by
-  editing one line in the env file later.
+- Or use a public RPC provider as a stop-gap. You can switch any time
+  by restarting walletd with a different `--node-rpc`.
 
 ## Latency matters
 

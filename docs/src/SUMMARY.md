@@ -16,7 +16,6 @@
 
 # Operating
 
-- [Production deploy](./production-deploy.md)
 - [Security model](./security-model.md)
 - [Backup, upgrade, rotate](./operations.md)
 - [FAQ & troubleshooting](./faq.md)

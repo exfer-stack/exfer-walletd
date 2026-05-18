@@ -5,27 +5,47 @@ except `GET /healthz`. Comparison is **constant-time**
 ([`subtle::ConstantTimeEq`](https://docs.rs/subtle)) so a timing
 oracle can't peel the token byte by byte.
 
-## Modes
+## Default: one auto-generated token
 
-| Env var                       | Scope  | Methods                                                    |
-| ----------------------------- | ------ | ---------------------------------------------------------- |
-| `WALLETD_AUTH_TOKEN`          | all    | Everything (read + spend). Single-token mode.              |
-| `WALLETD_AUTH_TOKEN_READ`     | read   | Every method **except** `transfer` / `send_raw_transaction`. |
-| `WALLETD_AUTH_TOKEN_SPEND`    | spend  | All methods. Spend implies read.                            |
-
-Use whichever fits:
-
-- **Single-token (default)**: one backend service uses walletd.
-  Simplest, one secret to manage. This is what `init` generates.
-- **Two-token (`--scoped`)**: deposit-watcher and withdrawal-worker
-  are separate services. A leaked read token can't move funds.
-
-You can also generate tokens by hand:
+First run creates `<datadir>/token` (default `~/.exfer-walletd/token`,
+mode `0600`) with a 32-byte CSPRNG hex string. That single token
+grants every method.
 
 ```bash
-openssl rand -hex 32
-# → 64-char hex CSPRNG string
+TOKEN=$(cat ~/.exfer-walletd/token)
+curl -H "Authorization: Bearer $TOKEN" ...
 ```
+
+Subsequent runs read the file silently. To override (e.g. take the
+token from a secret manager instead):
+
+```bash
+exfer-walletd --auth-token "$(vault read -field=token secret/walletd)"
+# or via env
+WALLETD_AUTH_TOKEN=... exfer-walletd
+```
+
+## Optional: split read / spend
+
+If a deposit-watcher and a withdrawal-worker are separate services,
+issue them separate tokens so a leaked read token can't move funds:
+
+```bash
+exfer-walletd \
+    --auth-token-read  "$(openssl rand -hex 32)" \
+    --auth-token-spend "$(openssl rand -hex 32)"
+```
+
+(Or set `WALLETD_AUTH_TOKEN_READ` / `WALLETD_AUTH_TOKEN_SPEND`.)
+
+When either scoped token is set, walletd ignores the on-disk
+`<datadir>/token` and enforces the two-scope model:
+
+| Env var                       | Scope  | Methods                                                      |
+| ----------------------------- | ------ | ------------------------------------------------------------ |
+| `WALLETD_AUTH_TOKEN_READ`     | read   | Every method **except** `transfer` / `send_raw_transaction`. |
+| `WALLETD_AUTH_TOKEN_SPEND`    | spend  | All methods. Spend implies read.                              |
+| `WALLETD_AUTH_TOKEN`          | all    | Single-token mode (also the auto-generated file's behaviour). |
 
 ## Sending the token
 
@@ -78,22 +98,23 @@ as plaintext.
 The opt-in flag is your assertion that "a TLS terminator is in front
 of me." If you forget to set it, walletd refuses to start — fail-closed.
 
-The default `--bind` is `127.0.0.1:8080`. Put Caddy in front and you
-never need the flag.
+The default `--bind` is `127.0.0.1:8080`. For cross-host calls, bind a
+private/internal IP — no opt-in needed.
 
 ## Rotating tokens
 
-Tokens are stateless — just change them.
+Single-token (auto-generated) mode — just delete the file and restart:
 
 ```bash
-sudo sed -i "s|WALLETD_AUTH_TOKEN=.*|WALLETD_AUTH_TOKEN=$(openssl rand -hex 32)|" \
-    /etc/exfer-walletd/env
-sudo systemctl restart exfer-walletd
+rm ~/.exfer-walletd/token
+exfer-walletd      # generates + prints a fresh one
 ```
 
-Then update your client application. Any in-flight request
-authenticated with the old token will fail after the restart and
-need to retry with the new one.
+Two-token mode — change the env values / CLI flags and restart.
+
+Either way: any in-flight request authenticated with the old token
+will fail after the restart and need to retry with the new one. Plan
+the window.
 
 ## Next
 

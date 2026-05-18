@@ -44,7 +44,6 @@ exfer-walletd --version
 # exfer-walletd 0.3.x
 
 exfer-walletd --help
-exfer-walletd init --help
 ```
 
 Next: [Quick start →](./quick-start.md)

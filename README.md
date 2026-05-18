@@ -20,34 +20,52 @@ Docs, API reference, examples →
 
 Pre-built binaries (Linux / macOS / Windows) on the
 [Releases](https://github.com/exfer-stack/exfer-walletd/releases) page.
-Or build from source:
+Or build from source (Rust 1.75+):
 
 ```bash
 cargo build --release
+# Binary at target/release/exfer-walletd
 ```
 
-## Run
+## Quick start
+
+Fastest path from zero to a running daemon — works against either a
+local Exfer node on loopback or any reachable Exfer JSON-RPC URL
+(LAN, VPC, public RPC provider).
 
 ```bash
-exfer-walletd \
-    --bind        0.0.0.0:8080 \
-    --node-rpc    http://127.0.0.1:9334 \
-    --wallet-dir  /var/lib/exfer-wallets \
-    --auth-token  "$(openssl rand -hex 32)"
+# 1. Scaffold env file + wallet dir + fresh read/spend tokens.
+#    Omit --node-rpc to default to http://127.0.0.1:9334, or point it
+#    at any reachable Exfer JSON-RPC endpoint.
+sudo exfer-walletd init --node-rpc http://your-node-host:9334
+
+# 2. Start (reads /etc/exfer-walletd/env)
+sudo exfer-walletd
+```
+
+For local dev without `sudo`, write the env file under your home dir:
+
+```bash
+exfer-walletd init \
+    --env-file   ./walletd.env \
+    --wallet-dir ./wallets \
+    --node-rpc   http://127.0.0.1:9334    # or a remote URL
+set -a; . ./walletd.env; set +a
+exfer-walletd
 ```
 
 ## Call it
 
 ```bash
-curl -s http://localhost:8080/ -H 'content-type: application/json' \
-     -H "Authorization: Bearer $TOKEN" \
+curl -s http://127.0.0.1:8080/ -H 'content-type: application/json' \
+     -H "Authorization: Bearer $WALLETD_AUTH_TOKEN_READ" \
      -d '{"jsonrpc":"2.0","method":"generate_address","id":1}'
 # → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…"},"id":1}
 ```
 
-Full method list, error codes, deployment topologies, security notes,
-example clients — all on the docs site:
-<https://exfer-stack.github.io/exfer-walletd/>
+Full method list, error codes, deployment topologies (systemd + Caddy,
+docker-compose), security notes, example clients — all on the docs
+site: <https://exfer-stack.github.io/exfer-walletd/>
 
 ## License
 

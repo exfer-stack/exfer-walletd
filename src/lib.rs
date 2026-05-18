@@ -27,7 +27,7 @@
 //!                       exfer-walletd
 //!                              │
 //!                              │  one or more node URLs
-//!                              │  (loopback, LAN, internet, fly internal)
+//!                              │  (loopback, LAN, VPC, public RPC)
 //!                              ▼
 //!                ┌─── exfer node(s) ───┐
 //! ```
@@ -53,8 +53,11 @@
 
 pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod error;
+pub mod inflight;
+pub mod init;
 pub mod server;
 pub mod store;
 pub mod tx;

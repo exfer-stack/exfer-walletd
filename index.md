@@ -19,20 +19,22 @@ The Exfer node's own JSON-RPC is intentionally read-only + broadcast.
 It can't sign for you because nodes never hold keys. `exfer-walletd`
 closes that gap: it manages a pool of Ed25519 keypairs, builds and
 signs transactions locally, and broadcasts the signed bytes through
-whatever node(s) you point it at.
+whatever node(s) you point it at — your own node on loopback, a node
+on your LAN/VPC, or a third-party public RPC endpoint.
 
 ---
 
 ## Contents
 
 1. [Install](#install)
-2. [Quick start (local dev)](#quick-start-local-dev)
-3. [Tokens and scopes](#tokens-and-scopes)
-4. [RPC reference](#rpc-reference)
-5. [Errors](#errors)
-6. [Production deploy](#production-deploy) — systemd + Caddy, docker-compose, fly.io
-7. [Security model](#security-model) — what's protected, what isn't
-8. [Backup, upgrade, key rotation](#operations)
+2. [Quick start](#quick-start) — `init` to a running daemon in two commands
+3. [Picking a node](#picking-a-node) — local vs. remote vs. multiple
+4. [Tokens and scopes](#tokens-and-scopes)
+5. [RPC reference](#rpc-reference)
+6. [Errors](#errors)
+7. [Production deploy](#production-deploy) — systemd + Caddy, docker-compose
+8. [Security model](#security-model) — what's protected, what isn't
+9. [Backup, upgrade, key rotation](#operations)
 
 ---
 
@@ -60,31 +62,116 @@ cargo build --release
 
 ---
 
-## Quick start (local dev)
+## Quick start
 
-Run on loopback with no auth — useful for trying it out from your
-laptop. The daemon refuses to bind a non-loopback address without a
-token, so this mode is safe by construction.
+`exfer-walletd init` scaffolds an env file (read + spend tokens, bind,
+wallet dir, upstream node) and creates the wallet directory. The
+daemon then starts with zero CLI flags — all config comes from the env
+file. This is the recommended path for both first-time tries and
+production.
+
+### Local dev (no sudo)
+
+Useful for trying it from your laptop without touching `/etc` or
+`/var/lib`. The daemon refuses to bind a non-loopback interface
+without an explicit opt-in, so loopback dev is safe by construction.
+
+```bash
+exfer-walletd init \
+    --env-file   ./walletd.env \
+    --wallet-dir ./wallets \
+    --node-rpc   http://127.0.0.1:9334   # see "Picking a node" below
+
+# Load the generated tokens + config into the current shell
+set -a; . ./walletd.env; set +a
+
+exfer-walletd
+# starting walletd on 127.0.0.1:8080, upstream http://127.0.0.1:9334
+
+# In another terminal — ping is read-scope
+curl -s http://127.0.0.1:8080/ -H 'content-type: application/json' \
+     -H "Authorization: Bearer $WALLETD_AUTH_TOKEN_READ" \
+     -d '{"jsonrpc":"2.0","method":"ping","id":1}'
+# → {"jsonrpc":"2.0","result":{"ok":true},"id":1}
+```
+
+The env file is mode `0600` and contains your tokens — don't commit it.
+
+### System-wide (systemd)
+
+See [Production deploy → Recipe A](#recipe-a--systemd--caddy-on-a-single-vm-most-common)
+for the full systemd walkthrough. The first step there is the same
+`init`, but writing to `/etc/exfer-walletd/env` and `/var/lib/exfer-walletd`.
+
+### `init` flag reference
+
+| Flag             | Default                      | What it sets in the env file                              |
+| ---------------- | ---------------------------- | --------------------------------------------------------- |
+| `--env-file`     | `/etc/exfer-walletd/env`     | Path of the generated env file (`0600`)                   |
+| `--wallet-dir`   | `/var/lib/exfer-walletd`     | `WALLETD_WALLET_DIR` (also `mkdir -p ... -m 0700`)        |
+| `--bind`         | `127.0.0.1:8080`             | `WALLETD_BIND`                                            |
+| `--node-rpc`     | `http://127.0.0.1:9334`      | `EXFER_NODE_RPC` (single URL or comma-separated list)     |
+| `--print`        | off                          | Print env body to stdout instead of writing a file        |
+| `--force`        | off                          | Overwrite an existing env file (otherwise refuses)        |
+
+`init` is idempotent: a pre-existing env file is left alone so a
+re-run can't silently rotate tokens that are in use. Pass `--force` to
+deliberately regenerate.
+
+---
+
+## Picking a node
+
+`exfer-walletd` is decoupled from any specific node. Anything that
+speaks the Exfer JSON-RPC will do. Choose based on what you already
+run:
+
+### You run your own node on the same host
+
+Default. `init` records `EXFER_NODE_RPC=http://127.0.0.1:9334`.
+Nothing more to do — start the node first, then walletd.
 
 ```bash
 # Terminal 1 — an Exfer node with RPC enabled
 exfer node --datadir ./chain --rpc-bind 127.0.0.1:9334
 
-# Terminal 2 — walletd
-mkdir -p ./wallets
-exfer-walletd \
-    --bind        127.0.0.1:8080 \
-    --node-rpc    http://127.0.0.1:9334 \
-    --wallet-dir  ./wallets
-
-# Terminal 3 — try it
-curl -s http://127.0.0.1:8080/ -H 'content-type: application/json' \
-     -d '{"jsonrpc":"2.0","method":"ping","id":1}'
-# → {"jsonrpc":"2.0","result":{"ok":true},"id":1}
+# Terminal 2 — walletd (after `init`)
+exfer-walletd
 ```
 
-For anything beyond local dev, set tokens (next section) and put a TLS
-terminator in front (see [Production deploy](#production-deploy)).
+### You're pointing at someone else's node (LAN, VPC, public RPC)
+
+Pass `--node-rpc` to `init`, or edit `EXFER_NODE_RPC` in the env file
+afterwards. Walletd treats the upstream like any other HTTP service —
+no auth, just a URL.
+
+```bash
+exfer-walletd init --node-rpc https://exfer-rpc.example.com
+```
+
+Caveats when the upstream isn't yours:
+
+- The upstream sees every broadcast you submit (signed bytes only — no
+  keys, no plaintext). Treat the choice of RPC provider like any other
+  trust decision.
+- If the upstream is on the public internet, prefer HTTPS for the
+  upstream URL too. Walletd uses `rustls` for outbound HTTPS, no extra
+  config needed.
+
+### You want fail-over across several nodes
+
+Comma-separate the URLs. Walletd round-robins and fails over to the
+next on transport / 5xx error.
+
+```bash
+exfer-walletd init --node-rpc 'http://node-a:9334,http://node-b:9334,https://public-rpc.example.com'
+```
+
+### You don't have a node yet
+
+Run one with the upstream Exfer CLI (`exfer node …`), or skip ahead
+and use a public RPC provider for now — you can switch by editing one
+line in the env file later.
 
 ---
 
@@ -100,11 +187,12 @@ scope:
 | `WALLETD_AUTH_TOKEN`          | all    | single-token mode — grants every method (read + spend)      |
 
 Why two: a deposit-watcher service that polls balances only needs the
-read token. A withdrawal worker that moves funds needs spend. Splitting
-them limits blast radius if one set of credentials leaks.
+read token. A withdrawal worker that moves funds needs spend.
+Splitting them limits blast radius if one set of credentials leaks.
 
-Generate them with anything CSPRNG. 32 random bytes hex-encoded is
-plenty:
+`exfer-walletd init` generates fresh 32-byte tokens for both scopes
+and records them in the env file. If you ever need to mint one by
+hand:
 
 ```bash
 openssl rand -hex 32   # → 64-char hex string
@@ -114,10 +202,23 @@ Send them in `Authorization: Bearer <token>`. Comparison is constant-
 time (`subtle::ConstantTimeEq`) so a timing oracle can't peel the
 token byte by byte.
 
-**Bind safety**: at startup, walletd refuses to bind a non-loopback
-address (`0.0.0.0`, a LAN IP, the public IP) unless at least one token
-is configured. You can't accidentally publish an open wallet by
-forgetting `--auth-token`.
+**Bind safety**: walletd enforces a three-tier policy at startup:
+
+| Bind address | Policy |
+|---|---|
+| Loopback (`127.0.0.1`, `::1`) | Always allowed. No wire to encrypt. |
+| Private (RFC1918 `10.x / 172.16-31 / 192.168.x`, IPv6 ULA `fc00::/7`, link-local) | Allowed. Warns if no token is set — LAN clients could call walletd anonymously. |
+| Public (`0.0.0.0`, `::`, any globally-routable IP) | **Refused** unless `--allow-public-bind` (or `WALLETD_ALLOW_PUBLIC_BIND=1`) is set. Token is required regardless. |
+
+The reason public binds require an explicit opt-in: walletd doesn't
+terminate TLS itself. Without a TLS terminator in front (Caddy,
+nginx, Cloudflare, k8s ingress, a cloud load balancer), the bearer
+token rides the public-internet wire as plaintext. The opt-in flag is
+your assertion that "a TLS terminator is in front of me." If you
+forget to set it, walletd refuses to start — fail-closed.
+
+The default `--bind` is `127.0.0.1:8080`. Put Caddy in front and you
+never need the flag.
 
 ---
 
@@ -280,6 +381,7 @@ console.log("address:", address);
 | `-32011` | 200  | Wallet already exists at that address                          |
 | `-32020` | 200  | Upstream node unreachable or returned RPC error                |
 | `-32030` | 200  | Transaction build / UTXO authentication failure                |
+| `-32031` | 200  | Insufficient balance for `amount + fee` (body shows totals)    |
 | `-32603` | 200  | Internal error                                                 |
 
 Per JSON-RPC convention, errors usually return HTTP 200 with the error
@@ -291,12 +393,13 @@ without reading the body.
 
 ## Production deploy
 
-Three recipes. Pick the one that matches your environment.
+Two recipes. Pick the one that matches your environment.
 
 ### Recipe A — systemd + Caddy on a single VM (most common)
 
-A single host running both the Exfer node and walletd, with Caddy
-terminating TLS and reverse-proxying to walletd on loopback.
+A single host running walletd (with the Exfer node either on the same
+host or somewhere reachable), Caddy terminating TLS and reverse-
+proxying to walletd on loopback.
 
 Files in [`deploy/systemd/`](https://github.com/exfer-stack/exfer-walletd/tree/main/deploy/systemd)
 and [`deploy/caddy/`](https://github.com/exfer-stack/exfer-walletd/tree/main/deploy/caddy)
@@ -308,30 +411,31 @@ curl -L -o /tmp/exfer-walletd \
      https://github.com/exfer-stack/exfer-walletd/releases/latest/download/exfer-walletd-linux-x86_64
 sudo install -m 0755 /tmp/exfer-walletd /usr/local/bin/
 
-# 2. Dedicated user + data dir
-sudo useradd --system --home /var/lib/exfer-walletd --shell /usr/sbin/nologin exfer-walletd
-sudo install -d -o exfer-walletd -g exfer-walletd -m 0700 /var/lib/exfer-walletd
+# 2. Scaffold env file + wallet dir + fresh tokens in one shot.
+#    --node-rpc accepts loopback, a host on your VPC, or a public RPC URL.
+#    Omit it to default to http://127.0.0.1:9334.
+sudo exfer-walletd init --node-rpc http://your-node-host:9334
 
-# 3. Env file (mode 0600; tokens never appear in command line)
-sudo install -d -m 0750 /etc/exfer-walletd
-sudo tee /etc/exfer-walletd/env >/dev/null <<EOF
-WALLETD_BIND=127.0.0.1:8080
-WALLETD_WALLET_DIR=/var/lib/exfer-walletd
-EXFER_NODE_RPC=http://127.0.0.1:9334
-WALLETD_AUTH_TOKEN_READ=$(openssl rand -hex 32)
-WALLETD_AUTH_TOKEN_SPEND=$(openssl rand -hex 32)
-RUST_LOG=info,exfer_walletd=info
-EOF
+# 3. Create the runtime user and tighten ownership. (`init` prints
+#    these same four commands on success, in case you forget.)
+sudo useradd --system --home /var/lib/exfer-walletd --shell /usr/sbin/nologin exfer-walletd
+sudo chown -R exfer-walletd:exfer-walletd /var/lib/exfer-walletd
 sudo chown root:exfer-walletd /etc/exfer-walletd/env
 sudo chmod 0640 /etc/exfer-walletd/env
 
-# 4. Install the systemd unit
+# 4. Install the systemd unit and start
 sudo curl -L -o /etc/systemd/system/exfer-walletd.service \
      https://raw.githubusercontent.com/exfer-stack/exfer-walletd/main/deploy/systemd/exfer-walletd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now exfer-walletd
 sudo systemctl status exfer-walletd
 ```
+
+`init` is idempotent — re-running it on a host that already has an env
+file errors out, so you can't accidentally rotate tokens that are in
+use. Pass `--force` to deliberately regenerate. `--print` writes the
+env contents to stdout instead of a file (useful when secrets live in
+a vault and you don't want a host file at all).
 
 Now in front of it put Caddy (or nginx) for TLS. With Caddy you get
 automatic LetsEncrypt for free:
@@ -350,12 +454,24 @@ plaintext wire.
 > **Read the tokens out of the env file** to give to your client
 > application: `sudo cat /etc/exfer-walletd/env`. Do not paste them
 > into shell history; copy them into your application's secret store
-> (Vault, AWS Secrets Manager, 1Password, fly secrets, …).
+> (Vault, AWS Secrets Manager, 1Password, your platform's secret
+> store, …).
 
 ### Recipe B — docker-compose (walletd in a container, node elsewhere)
 
 Useful when the Exfer node already runs separately (a bare-metal node,
 a managed RPC provider, or a different container).
+
+Generate tokens into a sibling `.env` (mode 0600, **not committed**):
+
+```bash
+cat >.env <<EOF
+WALLETD_AUTH_TOKEN_READ=$(openssl rand -hex 32)
+WALLETD_AUTH_TOKEN_SPEND=$(openssl rand -hex 32)
+EXFER_NODE_RPC=http://your-node-host:9334
+EOF
+chmod 600 .env
+```
 
 `docker-compose.yml`:
 
@@ -367,58 +483,37 @@ services:
     ports:
       - "127.0.0.1:8080:8080"     # bind loopback; put Caddy/nginx in front
     environment:
+      # Inside the container we bind 0.0.0.0 so the published port works,
+      # but the published port is on 127.0.0.1 on the host. The
+      # ALLOW_PUBLIC_BIND flag acknowledges that arrangement — without
+      # it, walletd refuses to bind 0.0.0.0 at startup.
       WALLETD_BIND: "0.0.0.0:8080"
+      WALLETD_ALLOW_PUBLIC_BIND: "1"
       WALLETD_WALLET_DIR: "/wallets"
-      EXFER_NODE_RPC: "http://exfer-node-host:9334"
+      EXFER_NODE_RPC: "${EXFER_NODE_RPC}"
       WALLETD_AUTH_TOKEN_READ:  "${WALLETD_AUTH_TOKEN_READ}"
       WALLETD_AUTH_TOKEN_SPEND: "${WALLETD_AUTH_TOKEN_SPEND}"
     volumes:
       - walletd_data:/wallets
     entrypoint: ["/usr/local/bin/exfer-walletd"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   walletd_data:
 ```
 
-Generate tokens into a sibling `.env` (mode 0600, **not committed**):
-
 ```bash
-cat >.env <<EOF
-WALLETD_AUTH_TOKEN_READ=$(openssl rand -hex 32)
-WALLETD_AUTH_TOKEN_SPEND=$(openssl rand -hex 32)
-EOF
-chmod 600 .env
-
 docker compose up -d
 ```
 
-The image entrypoint defaults to the combined node+walletd supervisor
-(used for the fly deploy); we override it to run walletd only.
-
-### Recipe C — fly.io single-machine (node + walletd in one VM)
-
-The repo includes a turnkey `fly.toml` + `Dockerfile` that runs both
-the Exfer node and walletd inside one fly machine on a single
-persistent volume. Cheapest topology if you don't already have a node.
-
-```bash
-fly launch --no-deploy --copy-config --name your-app
-fly volume create exfer_data --region nrt --size 50
-
-# Tokens stored as fly secrets — encrypted in transit and at rest
-fly secrets set \
-    WALLETD_AUTH_TOKEN_READ=$(openssl rand -hex 32) \
-    WALLETD_AUTH_TOKEN_SPEND=$(openssl rand -hex 32)
-
-fly deploy
-```
-
-Walletd is exposed at `https://your-app.fly.dev/`. Port 80 is
-deliberately not bound (see [Security model](#security-model)).
-
-The first deploy will block on initial block download — the node has
-to replay the chain. Expect several hours; subsequent restarts are
-fast because the volume preserves chain state.
+The image entrypoint defaults to a combined node + walletd supervisor;
+we override it to run walletd only and talk to a node elsewhere
+(loopback on the host via `host.docker.internal`, a sibling container,
+or a public RPC URL — whatever `EXFER_NODE_RPC` points at).
 
 ---
 
@@ -428,13 +523,13 @@ fast because the volume preserves chain state.
 
 | Layer            | Mechanism                                                                                                  |
 | ---------------- | ---------------------------------------------------------------------------------------------------------- |
-| Token at rest    | Env file `0640 root:exfer-walletd` on systemd; fly secrets store encrypted; docker `.env` mode `0600`      |
-| Token in transit | Caddy/nginx/fly proxy terminates TLS; walletd bound on loopback so the plaintext hop is in-process         |
+| Token at rest    | Env file `0640 root:exfer-walletd` on systemd; docker `.env` mode `0600`; otherwise your secrets store     |
+| Token in transit | Caddy / nginx / your TLS terminator handles the wire; walletd is bound on loopback so the plaintext hop is in-process |
 | Token compare    | `subtle::ConstantTimeEq` — no timing oracle                                                                |
-| Bind safety      | Startup refuses non-loopback bind without a token — can't publish an open wallet by accident               |
+| Bind safety      | Three-tier policy: loopback always OK, private warns, public refused without explicit `--allow-public-bind` |
 | Path traversal   | Wallet filename = 64-hex address, validated before any FS op                                               |
 | Audit trail      | Every spend-scope request emits a structured log line: method, client IP, request id, outcome              |
-| Wallet keys      | Files `0600`, dir `0700`, owned by the daemon user. Backing volume should be encrypted (LUKS, fly volume)  |
+| Wallet keys      | Files `0600`, dir `0700`, owned by the daemon user. Encrypt the backing volume (LUKS, dm-crypt, cloud volume encryption) |
 | Private keys     | Never transmitted. Signing happens in-process; only the signed transaction bytes go to the upstream node   |
 
 ### What's *not* protected (by design)
@@ -451,10 +546,11 @@ running.
   no quorum, no MPC. If you need finer-grained authority, implement
   the [`WalletStore`](https://github.com/exfer-stack/exfer-walletd/blob/main/src/store/mod.rs)
   trait against an HSM or KMS backend and slot it in.
-- **TLS terminates at the proxy.** Between Caddy/nginx/fly-proxy and
-  walletd, traffic is plaintext HTTP on loopback (recipe A & C) or on
-  a docker bridge (recipe B). If you don't trust the host or the
-  bridge network, run walletd in its own isolated VM.
+- **TLS terminates at the proxy.** Between your TLS terminator
+  (Caddy/nginx/cloud LB/ingress) and walletd, traffic is plaintext
+  HTTP — either on loopback (recipe A) or on a docker bridge (recipe
+  B). If you don't trust the host or the bridge network, run walletd
+  in its own isolated VM.
 - **No rate limit, no IP allowlist.** A 32-random-byte token is
   computationally infeasible to brute-force online, but if the
   deployment is reachable from the public internet you still want
@@ -462,21 +558,23 @@ running.
   protection.
 - **Upstream node RPC is unauthenticated.** Walletd → node uses plain
   HTTP and assumes the node's RPC port is reachable only over a
-  trusted hop (loopback, VPC). Don't expose the node's RPC port to
-  the public internet.
+  trusted hop (loopback, VPC, or HTTPS to a public provider). Don't
+  expose your own node's RPC port to the public internet without a
+  proxy in front.
 
 ### Common misconfigurations to avoid
 
 - **Don't pass `--auth-token=…` on the command line.** It shows up in
-  `ps aux` for anyone on the host. Use the env file or env vars.
+  `ps aux` for anyone on the host. Use the env file (what `init`
+  generates) or env vars.
 - **Don't run walletd as root** unless you genuinely need to bind a
   privileged port (and you should be reverse-proxying anyway).
 - **Don't put the wallet directory on shared storage** (NFS, S3-FUSE).
   Mode bits don't translate; concurrent writers will corrupt keys.
-- **Don't expose port 80 plaintext to the public internet.** fly's
-  `force_https` only redirects GET/HEAD; a stray POST would leak the
-  token before the redirect happens. Either close port 80 entirely or
-  have your reverse proxy refuse non-TLS connections.
+- **Don't expose port 80 plaintext to the public internet.** Some
+  cloud proxies' "force HTTPS" toggles only redirect GET/HEAD; a stray
+  POST will leak the token before the redirect happens. Close port 80
+  at the proxy or have your reverse proxy refuse non-TLS connections.
 
 ---
 
@@ -499,8 +597,8 @@ gpg --symmetric --cipher-algo AES256 wallets-$(date +%F).tar.gz
 ```
 
 If you can't stop the daemon, snapshot the underlying volume (LVM,
-ZFS, fly volume snapshot). Atomic copies of `.key` files are fine —
-walletd writes them with `O_CREAT | O_EXCL` and never modifies
+ZFS, your cloud volume snapshot). Atomic copies of `.key` files are
+fine — walletd writes them with `O_CREAT | O_EXCL` and never modifies
 in-place.
 
 ### Upgrade
@@ -533,6 +631,19 @@ sudo systemctl restart exfer-walletd
 Then update your client application to use the new token. Plan the
 window: any in-flight request authenticated with the old token will
 fail after the restart and need to retry with the new one.
+
+### Point at a different node
+
+The upstream node URL lives in `EXFER_NODE_RPC`. Edit, restart, done
+— wallets and tokens are unaffected.
+
+```bash
+sudo sed -i "s|^EXFER_NODE_RPC=.*|EXFER_NODE_RPC=http://new-node-host:9334|" \
+    /etc/exfer-walletd/env
+sudo systemctl restart exfer-walletd
+```
+
+Comma-separate URLs for round-robin + failover across several nodes.
 
 ---
 

@@ -1,27 +1,48 @@
-//! Runtime configuration. Sourced from CLI args (highest priority),
-//! then environment variables, then defaults.
+//! Runtime configuration for the daemon. Sourced from CLI args
+//! (highest priority), then environment variables, then defaults.
+//!
+//! `Config` is `clap::Args`, not `clap::Parser`, because it flattens
+//! into [`crate::cli::Cli`] alongside the optional subcommands.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::Args;
 
-#[derive(Debug, Clone, Parser)]
-#[command(
-    name = "exfer-walletd",
-    about = "Exfer Wallet Daemon — independent service that manages wallets and exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes (local or remote)",
-    version
-)]
+#[derive(Debug, Clone, Args)]
 pub struct Config {
     /// HTTP address the daemon listens on.
-    #[arg(long, env = "WALLETD_BIND", default_value = "0.0.0.0:8080")]
+    ///
+    /// Default is loopback. Public-interface binds (`0.0.0.0`, any
+    /// globally-routable IP) require `--allow-public-bind` because
+    /// walletd does not terminate TLS itself — the bearer token would
+    /// otherwise travel plaintext on the wire.
+    #[arg(long, env = "WALLETD_BIND", default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
+
+    /// Acknowledge that a TLS terminator (Caddy, nginx, Cloudflare,
+    /// k8s ingress, an upstream cloud load balancer, …) sits in front
+    /// of walletd, and bind a public interface anyway. Without this
+    /// flag, public binds are refused at startup so the bearer token
+    /// can't accidentally travel plaintext.
+    ///
+    /// As an env var, accepts `1` / `true` / `yes` / `on` (case-
+    /// insensitive). Anything else is treated as "off."
+    #[arg(
+        long,
+        env = "WALLETD_ALLOW_PUBLIC_BIND",
+        value_parser = parse_lenient_bool,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub allow_public_bind: bool,
 
     /// JSON-RPC URL of one or more upstream Exfer nodes.
     /// Accepts a single URL or a comma-separated list — calls round-robin
     /// across them, failing over to the next on transport / 5xx error.
     /// The daemon is decoupled from the node: any reachable Exfer JSON-RPC
-    /// endpoint works (loopback, LAN, internet, fly internal network).
+    /// endpoint works (loopback, LAN, VPC, public RPC).
     #[arg(long, env = "EXFER_NODE_RPC", default_value = "http://127.0.0.1:9334")]
     pub node_rpc: String,
 
@@ -34,9 +55,8 @@ pub struct Config {
     )]
     pub wallet_dir: PathBuf,
 
-    /// Legacy single-scope bearer token. If set, treated as the
-    /// **spend** token (full access). Prefer the two-scope flags below
-    /// for new deployments.
+    /// Legacy single-token mode. If set, grants every method (read +
+    /// spend). Prefer the two-scope flags below for new deployments.
     ///
     /// When neither this nor a scoped token is set, requests are
     /// permitted — but only when the daemon binds to loopback.
@@ -63,10 +83,14 @@ pub struct Config {
     pub upstream_timeout_secs: u64,
 }
 
-impl Config {
-    /// Load from CLI args + environment. Falls back to defaults for any
-    /// unset value.
-    pub fn from_env() -> Self {
-        Self::parse()
+/// Accept Unix-style booleans ("1", "yes", "on") in addition to the
+/// Rust-style "true"/"false" that clap's default parser expects.
+fn parse_lenient_bool(s: &str) -> Result<bool, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        other => Err(format!(
+            "expected 1/0, true/false, yes/no, or on/off — got {other:?}"
+        )),
     }
 }

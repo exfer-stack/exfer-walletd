@@ -23,12 +23,19 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
 
-    # Override the default entrypoint (which is the fly combined
-    # node+walletd supervisor) and run walletd only.
+    # The default image entrypoint supervises both node + walletd in
+    # one container; we override it here so this compose service runs
+    # walletd only and talks to a node elsewhere.
     entrypoint: ["/usr/local/bin/exfer-walletd"]
 
     environment:
+      # Bind 0.0.0.0 inside the container — the published port is bound
+      # to 127.0.0.1 on the host (see `ports:` above), and a TLS-
+      # terminating reverse proxy (Caddy/nginx) goes in front of that.
+      # WALLETD_ALLOW_PUBLIC_BIND acknowledges that arrangement;
+      # walletd would refuse a 0.0.0.0 bind otherwise.
       WALLETD_BIND: "0.0.0.0:8080"
+      WALLETD_ALLOW_PUBLIC_BIND: "1"
       WALLETD_WALLET_DIR: "/wallets"
       EXFER_NODE_RPC: "${EXFER_NODE_RPC:-http://host.docker.internal:9334}"
       WALLETD_AUTH_TOKEN_READ:  "${WALLETD_AUTH_TOKEN_READ}"

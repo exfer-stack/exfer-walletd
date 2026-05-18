@@ -23,6 +23,7 @@ fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tem
     let state = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
+        inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
     };
     (state, wallet_dir)
 }

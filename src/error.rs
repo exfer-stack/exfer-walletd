@@ -60,6 +60,16 @@ pub enum Error {
     #[error("UTXO authentication failed: {0}")]
     UtxoAuth(String),
 
+    #[error(
+        "insufficient balance: need {needed} exfers (amount + fee), \
+         wallet has {available} across {utxo_count} UTXOs"
+    )]
+    InsufficientBalance {
+        needed: u64,
+        available: u64,
+        utxo_count: usize,
+    },
+
     // ---- auth ----------------------------------------------------------
     #[error("authentication required")]
     Unauthorized,
@@ -91,6 +101,7 @@ impl Error {
             | Error::UpstreamRpc { .. }
             | Error::UpstreamUnexpected(_) => -32020,
             Error::TxBuild(_) | Error::UtxoAuth(_) => -32030,
+            Error::InsufficientBalance { .. } => -32031,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
         }
     }

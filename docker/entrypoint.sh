@@ -3,8 +3,8 @@
 #
 # Two processes inside one VM keeps localhost communication trivial and
 # matches what an exchange's single-server deployment looks like. If
-# either process exits, we exit too so fly's machine supervisor can
-# restart the whole thing cleanly.
+# either process exits, we exit too so the container supervisor
+# (docker, kubernetes, systemd, …) can restart the whole thing cleanly.
 #
 # bash (not /bin/sh) because we rely on `wait -n` to react to whichever
 # child exits first — Ubuntu's /bin/sh is dash and lacks that flag.
@@ -27,7 +27,7 @@ exfer node \
     --repair-perms &
 NODE_PID=$!
 
-# Forward signals to children so SIGTERM from fly stops both cleanly.
+# Forward signals to children so an outside SIGTERM stops both cleanly.
 trap 'echo "[entrypoint] forwarding TERM"; kill -TERM "${NODE_PID}" "${WALLETD_PID}" 2>/dev/null || true' TERM INT
 
 # Give the node a moment to bind its RPC port. If it exits early we'll

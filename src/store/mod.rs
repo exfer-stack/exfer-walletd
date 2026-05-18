@@ -16,7 +16,7 @@
 //!
 //! The filename is the 64-hex address. Files are unencrypted (server-side,
 //! no passphrase prompt possible) but written with mode 0600. Protect the
-//! disk at rest with LUKS / fly volume encryption / equivalent.
+//! disk at rest with LUKS / dm-crypt / cloud volume encryption / equivalent.
 
 use std::path::{Path, PathBuf};
 

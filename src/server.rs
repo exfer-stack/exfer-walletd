@@ -28,6 +28,7 @@ use crate::api::{dispatch, ApiState, RpcRequest, RpcResponse};
 use crate::auth::{check_bind_is_safe, Scope, Tokens};
 use crate::config::Config;
 use crate::error::Error;
+use crate::inflight::InFlightUtxos;
 use crate::store::FsWalletStore;
 use crate::upstream::ExferNode;
 
@@ -80,8 +81,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cfg.auth_token_spend.as_deref(),
     );
 
-    // Fail closed: public bind without any token is forbidden.
-    check_bind_is_safe(cfg.bind, &tokens).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Fail closed: refuse public binds without a token, and refuse
+    // public binds *with* a token unless --allow-public-bind is set
+    // (the operator must acknowledge that TLS termination is in front).
+    check_bind_is_safe(cfg.bind, &tokens, cfg.allow_public_bind)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let store = FsWalletStore::open(&cfg.wallet_dir)?;
     let node = ExferNode::new(
@@ -91,6 +95,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
+        inflight: Arc::new(InFlightUtxos::new()),
     };
     let app_state = AppState {
         api,

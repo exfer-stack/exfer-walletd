@@ -1,25 +1,45 @@
 //! Transfer engine.
 //!
-//! Reproduces the spend path used by `exfer wallet send --rpc`:
+//! Reproduces the spend path used by `exfer wallet send --rpc`, with two
+//! refinements over the most-literal port:
 //!
-//! 1. List the sender's UTXOs via `get_address_utxos` on the upstream node.
-//! 2. For each UTXO, fetch the funding transaction with `get_transaction`
-//!    and authenticate the output (v1.4.2 Fix 1) — verify the strict
-//!    deserialization, the txid match, and the locking-script byte
-//!    equality. This makes us robust against a malicious RPC understating
-//!    `value` or forging scripts.
-//! 3. Build the spending transaction locally with `Wallet::build_transaction`,
-//!    which signs each input with the wallet's Ed25519 private key.
-//! 4. Serialize and broadcast the bytes via `send_raw_transaction`.
+//! 1. **Lazy UTXO selection.** The upstream returns every UTXO the
+//!    sender owns. Authenticating all of them is `O(N)` round-trips —
+//!    catastrophic on a hot wallet with thousands of deposits. We sort
+//!    largest-value-first, walk until we have enough to cover
+//!    `amount + fee`, and authenticate only that subset.
+//!
+//! 2. **Parallel authentication.** The selected UTXOs' parent-tx
+//!    fetches are independent; we fan them out with bounded
+//!    concurrency so wall-clock time is `~RTT` instead of `k × RTT`.
+//!
+//! Flow:
+//!
+//! ```text
+//!   list UTXOs ──► sort by value desc
+//!              ──► greedy-pick until value ≥ amount + fee
+//!              ──► authenticate selected (concurrently, cap 8)
+//!              ──► build & sign tx (local)
+//!              ──► send_raw_transaction
+//!              ──► self-check: node's tx_id == computed tx_id
+//! ```
 
 use exfer::chain::state::{UtxoEntry, UtxoSet};
 use exfer::types::transaction::OutPoint;
 use exfer::types::Hash256;
 use exfer::wallet::auth::authenticate_tx_hex;
 use exfer::wallet::wallet::Wallet;
+use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{Error, Result};
+use crate::inflight::{ClaimGuard, InFlightUtxos};
 use crate::upstream::ExferNode;
+
+/// How many `get_transaction` calls we'll have in flight at once during
+/// UTXO authentication. Picked to be large enough that wall-clock
+/// scales sub-linearly with input count, small enough to be friendly
+/// to a shared / community upstream.
+const AUTH_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransferReceipt {
@@ -29,61 +49,127 @@ pub struct TransferReceipt {
     pub submitted: bool,
 }
 
-/// Build, sign, broadcast a transfer of `amount_exfers` from `wallet` to
-/// `recipient`, paying `fee_exfers` to the miner. Returns the broadcast
-/// receipt.
 pub async fn transfer(
     wallet: &Wallet,
     recipient: Hash256,
     amount_exfers: u64,
     fee_exfers: u64,
     node: &ExferNode,
+    inflight: &InFlightUtxos,
 ) -> Result<TransferReceipt> {
     let sender_addr_hex = hex::encode(wallet.address().as_bytes());
 
-    // ---- Step 1: list candidate UTXOs from the node ----
+    // 1. List candidate UTXOs.
     let utxos = node.get_address_utxos(&sender_addr_hex).await?;
     let tip_height = utxos.tip_height;
     let current_height = tip_height.saturating_add(1);
 
-    // ---- Step 2: authenticate each UTXO ----
-    let wallet_script = wallet.address().as_bytes().to_vec();
-    let mut utxo_set = UtxoSet::new();
+    let needed = amount_exfers
+        .checked_add(fee_exfers)
+        .ok_or_else(|| Error::TxBuild("amount + fee overflows u64".into()))?;
 
+    // 2. Greedy selection, largest-first, skipping outpoints already
+    //    claimed by another in-flight transfer. The pending set is
+    //    snapshotted once; the claim happens after we've finalised
+    //    which outpoints we want, and lives under the same set's
+    //    Mutex so concurrent callers see each other's claims.
+    let pending: std::collections::HashSet<OutPoint> = inflight.pending().into_iter().collect();
+
+    let mut candidates: Vec<(OutPoint, &crate::upstream::UtxoEntry)> = Vec::with_capacity(utxos.utxos.len());
     for entry in &utxos.utxos {
         let tx_id_bytes = decode_hash(&entry.tx_id)?;
-        let tx_id = Hash256(tx_id_bytes);
-
-        // Fetch the funding transaction.
-        let funding = node.get_transaction(&entry.tx_id).await?;
-        let raw = hex::decode(&funding.tx_hex)
-            .map_err(|e| Error::UtxoAuth(format!("funding tx_hex not hex: {e}")))?;
-
-        // Authenticate: strict deserialize, txid match, script equality.
-        let (auth_value, _auth_script) =
-            authenticate_tx_hex(&raw, tx_id, entry.output_index, Some(&wallet_script))
-                .map_err(|e| Error::UtxoAuth(e.to_string()))?;
-
-        let outpoint = OutPoint {
-            tx_id,
+        let op = OutPoint {
+            tx_id: Hash256(tx_id_bytes),
             output_index: entry.output_index,
         };
-        let utxo_entry = UtxoEntry {
-            output: exfer::types::transaction::TxOutput {
-                value: auth_value,
-                script: wallet_script.clone(),
-                datum: None,
-                datum_hash: None,
-            },
-            height: entry.height,
-            is_coinbase: entry.is_coinbase,
-        };
+        candidates.push((op, entry));
+    }
+    candidates.sort_by(|a, b| b.1.value.cmp(&a.1.value));
+
+    let mut selected: Vec<(OutPoint, &crate::upstream::UtxoEntry)> = Vec::new();
+    let mut selected_outpoints: Vec<OutPoint> = Vec::new();
+    let mut accumulated: u64 = 0;
+    let mut available_total: u64 = 0;
+    for (op, entry) in &candidates {
+        available_total = available_total.saturating_add(entry.value);
+        if pending.contains(op) {
+            continue;
+        }
+        if accumulated >= needed {
+            continue;
+        }
+        selected.push((*op, *entry));
+        selected_outpoints.push(*op);
+        accumulated = accumulated.saturating_add(entry.value);
+    }
+
+    if accumulated < needed {
+        return Err(Error::InsufficientBalance {
+            needed,
+            available: available_total,
+            utxo_count: candidates.len(),
+        });
+    }
+
+    // RAII guard — claims now, releases on `?` early return; we'll
+    // `commit()` it after a successful broadcast.
+    let guard = ClaimGuard::new(inflight, selected_outpoints);
+
+    let wallet_script = std::sync::Arc::new(wallet.address().as_bytes().to_vec());
+
+    // 3. Authenticate selected UTXOs in parallel. Each future owns its
+    //    inputs ('static) so buffer_unordered is Send-bound on tokio's
+    //    multi-thread executor.
+    let owned: Vec<crate::upstream::UtxoEntry> = selected.iter().map(|(_, e)| (*e).clone()).collect();
+    let authed: Vec<(OutPoint, UtxoEntry)> = stream::iter(owned)
+        .map(|entry| {
+            let wallet_script = wallet_script.clone();
+            async move {
+                let tx_id_bytes = decode_hash(&entry.tx_id)?;
+                let tx_id = Hash256(tx_id_bytes);
+
+                let funding = node.get_transaction(&entry.tx_id).await?;
+                let raw = hex::decode(&funding.tx_hex)
+                    .map_err(|e| Error::UtxoAuth(format!("funding tx_hex not hex: {e}")))?;
+
+                let (auth_value, _auth_script) = authenticate_tx_hex(
+                    &raw,
+                    tx_id,
+                    entry.output_index,
+                    Some(wallet_script.as_ref()),
+                )
+                .map_err(|e| Error::UtxoAuth(e.to_string()))?;
+
+                Ok::<_, Error>((
+                    OutPoint {
+                        tx_id,
+                        output_index: entry.output_index,
+                    },
+                    UtxoEntry {
+                        output: exfer::types::transaction::TxOutput {
+                            value: auth_value,
+                            script: (*wallet_script).clone(),
+                            datum: None,
+                            datum_hash: None,
+                        },
+                        height: entry.height,
+                        is_coinbase: entry.is_coinbase,
+                    },
+                ))
+            }
+        })
+        .buffer_unordered(AUTH_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    let mut utxo_set = UtxoSet::new();
+    for (outpoint, entry) in authed {
         utxo_set
-            .insert(outpoint, utxo_entry)
+            .insert(outpoint, entry)
             .map_err(|e| Error::Internal(format!("utxo insert: {e:?}")))?;
     }
 
-    // ---- Step 3: build + sign locally ----
+    // 4. Build + sign locally.
     let tx = wallet
         .build_transaction(
             recipient,
@@ -101,11 +187,10 @@ pub async fn transfer(
         .serialize()
         .map_err(|e| Error::TxSerialize(format!("{e:?}")))?;
 
-    // ---- Step 4: broadcast ----
+    // 5. Broadcast.
     let tx_hex = hex::encode(&serialized);
     let sent = node.send_raw_transaction(&tx_hex).await?;
 
-    // Self-check: the node's reported tx_id should match what we computed.
     let our_tx_id_hex = hex::encode(tx_id.as_bytes());
     if sent.tx_id != our_tx_id_hex {
         return Err(Error::UpstreamUnexpected(format!(
@@ -113,6 +198,11 @@ pub async fn transfer(
             sent.tx_id
         )));
     }
+
+    // Broadcast succeeded — keep the in-flight claim so a follow-up
+    // transfer can't pick the same UTXOs before the upstream's
+    // confirmed listing catches up. TTL evicts the entry eventually.
+    guard.commit();
 
     Ok(TransferReceipt {
         tx_id: our_tx_id_hex,

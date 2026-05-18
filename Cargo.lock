@@ -512,13 +512,15 @@ dependencies = [
 
 [[package]]
 name = "exfer-walletd"
-version = "0.2.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "exfer",
+ "futures",
  "hex",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",

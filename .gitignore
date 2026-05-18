@@ -2,3 +2,8 @@ target/
 **/*.rs.bk
 .DS_Store
 *.log
+
+# Local-only deploy + ops scripts; not part of the public repo.
+/fly.toml
+/scripts/deploy.sh
+/tests/e2e_live.sh

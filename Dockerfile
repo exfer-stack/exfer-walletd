@@ -23,7 +23,7 @@ RUN cargo build --release \
 
 # ----------------------------------------------------------------------------
 # Stage 2: minimal runtime with both binaries.
-# Ubuntu 24.04 ships GLIBC 2.39 which the upstream `exfer` binary requires.
+# Ubuntu 24.04 ships GLIBC 2.39, which the upstream `exfer` binary needs.
 # ----------------------------------------------------------------------------
 
 FROM ubuntu:24.04 AS runtime
@@ -33,8 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl tini bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Pull the upstream exfer node binary. Track latest for now; pin once we
-# have a release version we trust.
+# Pull the upstream exfer node binary.
 RUN curl -L -o /usr/local/bin/exfer \
         https://github.com/ahuman-exfer/exfer/releases/latest/download/exfer-linux-x86_64 \
  && chmod +x /usr/local/bin/exfer
@@ -43,9 +42,9 @@ RUN curl -L -o /usr/local/bin/exfer \
 COPY --from=build /usr/local/bin/exfer-walletd /usr/local/bin/exfer-walletd
 
 # Optional combined-deployment supervisor — runs both `exfer node` and
-# `exfer-walletd` in one container, sharing localhost. For
-# walletd-only deployments (talking to a remote node), override
-# ENTRYPOINT to /usr/local/bin/exfer-walletd directly.
+# `exfer-walletd` in one container, sharing localhost. For walletd-only
+# deployments (talking to a remote node), override ENTRYPOINT to
+# /usr/local/bin/exfer-walletd directly.
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

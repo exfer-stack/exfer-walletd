@@ -10,7 +10,6 @@ exclude:
   - Dockerfile
   - docker
   - scripts
-  - fly.toml
   - .dockerignore
   - .gitignore
   - Cargo.lock

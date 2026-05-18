@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
 use crate::tx::TransferReceipt;
 use crate::upstream::ExferNode;
@@ -29,6 +30,7 @@ use crate::upstream::ExferNode;
 pub struct ApiState {
     pub store: Arc<dyn WalletStore>,
     pub node: Arc<ExferNode>,
+    pub inflight: Arc<InFlightUtxos>,
 }
 
 // ============================================================================
@@ -200,6 +202,7 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
         p.amount,
         p.fee,
         &state.node,
+        &state.inflight,
     )
     .await?;
 

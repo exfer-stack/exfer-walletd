@@ -190,12 +190,8 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
     let p: TransferParams = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("transfer params: {e}")))?;
 
-    if !is_64_hex(&p.from) {
-        return Err(Error::BadAddressLen(p.from.len() / 2));
-    }
-    if !is_64_hex(&p.to) {
-        return Err(Error::BadAddressLen(p.to.len() / 2));
-    }
+    ensure_64_hex(&p.from)?;
+    ensure_64_hex(&p.to)?;
 
     // Wallet load is sync FS I/O — run on a blocking worker so we
     // don't tie up a tokio runtime thread under concurrent transfers.
@@ -235,7 +231,10 @@ async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
         .map_err(|e| Error::BadEnvelope(format!("get_block params: {e}")))?;
     let blk = match sel {
         BlockSelector::ByHeight { height } => state.node.get_block_by_height(height).await?,
-        BlockSelector::ByHash { hash } => state.node.get_block_by_hash(&hash).await?,
+        BlockSelector::ByHash { hash } => {
+            ensure_64_hex(&hash)?;
+            state.node.get_block_by_hash(&hash).await?
+        }
     };
     serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -243,6 +242,7 @@ async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: HashParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_transaction params: {e}")))?;
+    ensure_64_hex(&p.hash)?;
     let tx = state.node.get_transaction(&p.hash).await?;
     serde_json::to_value(&tx).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -250,6 +250,7 @@ async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_balance params: {e}")))?;
+    ensure_64_hex(&p.address)?;
     let bal = state.node.get_balance(&p.address).await?;
     serde_json::to_value(&bal).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -257,6 +258,7 @@ async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_address_utxos params: {e}")))?;
+    ensure_64_hex(&p.address)?;
     let u = state.node.get_address_utxos(&p.address).await?;
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -264,6 +266,7 @@ async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: ScriptHexParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_script_utxos params: {e}")))?;
+    ensure_hex(&p.script_hex)?;
     let u = state.node.get_script_utxos(&p.script_hex).await?;
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -271,6 +274,7 @@ async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
 async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: TxHexParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("send_raw_transaction params: {e}")))?;
+    ensure_hex(&p.tx_hex)?;
     let r = state.node.send_raw_transaction(&p.tx_hex).await?;
     serde_json::to_value(&r).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -279,6 +283,28 @@ async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> 
 // Helpers
 // ----------------------------------------------------------------------------
 
-fn is_64_hex(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+/// Validate a 32-byte hash hex string (address or block/tx hash).
+/// Length mismatch → `BadAddressLen` (`-32602`); right length but
+/// non-hex chars → `BadHex` (`-32602`).
+fn ensure_64_hex(s: &str) -> Result<()> {
+    if s.len() != 64 {
+        return Err(Error::BadAddressLen(s.len() / 2));
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::BadHex(format!("non-hex character in {s:?}")));
+    }
+    Ok(())
+}
+
+/// Validate a variable-length hex string (script, raw tx). Must be
+/// even-length and all hex digits. Empty is allowed — the upstream
+/// will reject empty payloads with a more specific error.
+fn ensure_hex(s: &str) -> Result<()> {
+    if s.len() % 2 != 0 {
+        return Err(Error::BadHex(format!("odd-length hex ({} chars)", s.len())));
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::BadHex("non-hex character".to_string()));
+    }
+    Ok(())
 }

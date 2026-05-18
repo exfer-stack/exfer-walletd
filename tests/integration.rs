@@ -346,3 +346,159 @@ async fn retries_give_up_and_return_transport_error() {
         "expected UpstreamUnreachable, got {err:?}",
     );
 }
+
+// --- read-path hex validation ---------------------------------------------
+//
+// Without wrapper-level validation, walletd would forward garbage like
+// `"address": "not_hex"` to the upstream and surface whatever it sent back —
+// in the worst case a misleading `balance: 0` for a typo'd address. Reject
+// at the boundary so callers can never confuse "wallet empty" with "address
+// malformed".
+
+#[tokio::test]
+async fn get_balance_rejects_non_hex_address() {
+    let mock = MockServer::start().await;
+    // Mock must NOT be called — validation should short-circuit.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc("get_balance", json!({"address": "not_hex_at_all"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::BadAddressLen(_)),
+        "expected BadAddressLen, got {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn get_balance_rejects_64_char_non_hex_address() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    // Right length, wrong alphabet — must be caught by the hex-char check.
+    let err = dispatch(
+        &state,
+        rpc("get_balance", json!({"address": "z".repeat(64)})),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+}
+
+#[tokio::test]
+async fn get_address_utxos_rejects_bad_address() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc("get_address_utxos", json!({"address": "deadbeef"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::BadAddressLen(_)),
+        "expected BadAddressLen, got {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn get_transaction_rejects_bad_hash() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc("get_transaction", json!({"hash": "deadbeef"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::BadAddressLen(_)),
+        "expected BadAddressLen, got {err:?}",
+    );
+}
+
+#[tokio::test]
+async fn get_block_by_hash_rejects_bad_hash() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(&state, rpc("get_block", json!({"hash": "zz".repeat(32)})))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+}
+
+#[tokio::test]
+async fn get_script_utxos_rejects_odd_length_hex() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc("get_script_utxos", json!({"script_hex": "abc"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+}
+
+#[tokio::test]
+async fn send_raw_transaction_rejects_non_hex() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc("send_raw_transaction", json!({"tx_hex": "not hex!"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+}

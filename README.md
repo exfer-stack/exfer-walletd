@@ -29,34 +29,28 @@ cargo build --release
 
 ## Run
 
-```bash
-exfer-walletd
-```
-
-First launch:
-
-- creates `~/.exfer-walletd/` (mode `0700`),
-- generates a 32-byte bearer token at `~/.exfer-walletd/token`
-  (mode `0600`) and prints it once,
-- starts serving JSON-RPC on `127.0.0.1:8080`,
-- talks to an Exfer node at `http://127.0.0.1:9334` by default.
-
-Override with `--node-rpc`, `--bind`, `--datadir` (each one has a
-matching env var). All flags are optional.
+For most deployments — node, walletd, and backend on different hosts:
 
 ```bash
-# point at a different node
-exfer-walletd --node-rpc https://exfer-rpc.example.com
-
-# expose on a private/internal IP so other servers can reach it
-exfer-walletd --bind 10.0.1.5:8080
+exfer-walletd \
+    --node-rpc http://<your-node-host>:<port> \
+    --bind     <walletd-host-internal-ip>:8080
 ```
+
+On first run, walletd creates `~/.exfer-walletd/` (mode `0700`),
+generates a 32-byte bearer token at `~/.exfer-walletd/token`
+(mode `0600`) and prints it once, then starts serving JSON-RPC.
+
+**Dev shortcut**: if node, walletd, and the caller are all on one
+host, every flag has a sensible default and `exfer-walletd` with no
+args just works (defaults: `--bind 127.0.0.1:8080`, `--node-rpc
+http://127.0.0.1:9334`).
 
 ## Call it
 
 ```bash
 TOKEN=$(cat ~/.exfer-walletd/token)
-curl -s http://127.0.0.1:8080/ -H 'content-type: application/json' \
+curl -s http://<walletd-host>:8080/ -H 'content-type: application/json' \
      -H "Authorization: Bearer $TOKEN" \
      -d '{"jsonrpc":"2.0","method":"generate_address","id":1}'
 # → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…"},"id":1}

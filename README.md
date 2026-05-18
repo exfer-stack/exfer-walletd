@@ -58,7 +58,7 @@ exfer-walletd
 
 ```bash
 curl -s http://127.0.0.1:8080/ -H 'content-type: application/json' \
-     -H "Authorization: Bearer $WALLETD_AUTH_TOKEN_READ" \
+     -H "Authorization: Bearer $WALLETD_AUTH_TOKEN" \
      -d '{"jsonrpc":"2.0","method":"generate_address","id":1}'
 # → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…"},"id":1}
 ```

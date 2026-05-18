@@ -60,14 +60,21 @@ pub enum Error {
     #[error("UTXO authentication failed: {0}")]
     UtxoAuth(String),
 
-    #[error(
-        "insufficient balance: need {needed} exfers (amount + fee), \
-         wallet has {available} across {utxo_count} UTXOs"
-    )]
+    #[error("{}", insufficient_balance_message(*needed, *available, *utxo_count, *in_flight_value, *in_flight_count))]
     InsufficientBalance {
+        /// `amount + fee` — what the transfer asked for.
         needed: u64,
+        /// Sum of UTXOs walletd could actually use (post in-flight filter).
         available: u64,
+        /// Count of UTXOs that fed `available`.
         utxo_count: usize,
+        /// Sum of UTXOs that exist on chain but are claimed by other
+        /// in-flight transfers from this daemon. Non-zero means
+        /// "wallet has more on chain than `available` suggests — it's
+        /// just temporarily reserved."
+        in_flight_value: u64,
+        /// Count of in-flight outpoints that fed `in_flight_value`.
+        in_flight_count: usize,
     },
 
     // ---- auth ----------------------------------------------------------
@@ -117,4 +124,28 @@ impl Error {
             _ => StatusCode::OK,
         }
     }
+}
+
+/// Build the human-readable `InsufficientBalance` message. Split out of
+/// the `#[error(...)]` attribute so we can branch on whether in-flight
+/// UTXOs contributed to the shortfall.
+fn insufficient_balance_message(
+    needed: u64,
+    available: u64,
+    utxo_count: usize,
+    in_flight_value: u64,
+    in_flight_count: usize,
+) -> String {
+    let mut s = format!(
+        "insufficient balance: need {needed} exfers (amount + fee), \
+         wallet has {available} spendable across {utxo_count} UTXO(s)"
+    );
+    if in_flight_count > 0 {
+        s.push_str(&format!(
+            " ({in_flight_count} more UTXO(s) worth {in_flight_value} exfers reserved \
+             by pending transfers from this daemon; retry once they confirm or use a \
+             different sending wallet)"
+        ));
+    }
+    s
 }

@@ -106,7 +106,43 @@ pub fn run(args: InitArgs) -> anyhow::Result<()> {
         }
     }
     eprintln!();
-    eprintln!("Next steps:");
+
+    if is_system_path(&args.env_file) {
+        print_systemd_next_steps(&args);
+    } else {
+        print_local_dev_next_steps(&args);
+    }
+    Ok(())
+}
+
+/// True iff `path` looks like a system / root-owned location. We use
+/// this to decide whether the `init` post-run hints walk the operator
+/// through a systemd install or just show "load env + start daemon."
+fn is_system_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.starts_with("/etc/")
+        || s.starts_with("/var/")
+        || s.starts_with("/usr/")
+        || s.starts_with("/opt/")
+}
+
+fn print_local_dev_next_steps(args: &InitArgs) {
+    eprintln!("Next steps (local dev):");
+    eprintln!("  1. Load the env into your shell:");
+    eprintln!("       set -a; . {}; set +a", args.env_file.display());
+    eprintln!("  2. Start the daemon:");
+    eprintln!("       exfer-walletd");
+    eprintln!();
+    eprintln!(
+        "  If your Exfer node isn't at {}, edit EXFER_NODE_RPC in",
+        args.node_rpc
+    );
+    eprintln!("  {} before starting.", args.env_file.display());
+    eprintln!();
+}
+
+fn print_systemd_next_steps(args: &InitArgs) {
+    eprintln!("Next steps (systemd):");
     eprintln!("  1. If your Exfer node isn't on loopback, edit");
     eprintln!("     {} and set EXFER_NODE_RPC.", args.env_file.display());
     eprintln!("  2. Install the systemd unit:");
@@ -130,8 +166,6 @@ pub fn run(args: InitArgs) -> anyhow::Result<()> {
     eprintln!("     sudo systemctl daemon-reload");
     eprintln!("     sudo systemctl enable --now exfer-walletd");
     eprintln!();
-
-    Ok(())
 }
 
 fn random_hex_token() -> String {

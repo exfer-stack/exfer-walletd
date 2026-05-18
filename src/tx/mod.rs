@@ -90,12 +90,18 @@ pub async fn transfer(
     let mut selected: Vec<(OutPoint, &crate::upstream::UtxoEntry)> = Vec::new();
     let mut selected_outpoints: Vec<OutPoint> = Vec::new();
     let mut accumulated: u64 = 0;
-    let mut available_total: u64 = 0;
+    let mut spendable_total: u64 = 0;
+    let mut spendable_count: usize = 0;
+    let mut in_flight_value: u64 = 0;
+    let mut in_flight_count: usize = 0;
     for (op, entry) in &candidates {
-        available_total = available_total.saturating_add(entry.value);
         if pending.contains(op) {
+            in_flight_value = in_flight_value.saturating_add(entry.value);
+            in_flight_count += 1;
             continue;
         }
+        spendable_total = spendable_total.saturating_add(entry.value);
+        spendable_count += 1;
         if accumulated >= needed {
             continue;
         }
@@ -107,8 +113,10 @@ pub async fn transfer(
     if accumulated < needed {
         return Err(Error::InsufficientBalance {
             needed,
-            available: available_total,
-            utxo_count: candidates.len(),
+            available: spendable_total,
+            utxo_count: spendable_count,
+            in_flight_value,
+            in_flight_count,
         });
     }
 

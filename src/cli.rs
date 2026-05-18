@@ -7,11 +7,15 @@
 //! - **`init`** — one-shot scaffolder. Generates fresh tokens, writes
 //!   the env file, creates the wallet directory. Idempotent: refuses
 //!   to clobber an existing env file unless `--force` is set.
+//! - **`uninstall`** — reverse of `init`. Dry-run by default; `--yes`
+//!   executes. See [`crate::uninstall`] for the safety rails around
+//!   wallet-directory deletion.
 
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use crate::init::InitArgs;
+use crate::uninstall::UninstallArgs;
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +37,11 @@ pub enum Command {
     /// Scaffold a fresh deployment: generate tokens, write the env
     /// file, create the wallet directory.
     Init(InitArgs),
+
+    /// Reverse `init`. Dry-run by default; `--yes` executes. Wallet
+    /// directory is preserved unless `--wallets` (plus
+    /// `--i-understand-this-deletes-keys` if it contains keys) is set.
+    Uninstall(UninstallArgs),
 }
 
 impl Cli {

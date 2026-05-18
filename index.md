@@ -34,7 +34,7 @@ on your LAN/VPC, or a third-party public RPC endpoint.
 6. [Errors](#errors)
 7. [Production deploy](#production-deploy) — systemd + Caddy, docker-compose
 8. [Security model](#security-model) — what's protected, what isn't
-9. [Backup, upgrade, key rotation](#operations)
+9. [Backup, upgrade, key rotation, uninstall](#operations)
 
 ---
 
@@ -631,6 +631,40 @@ sudo systemctl restart exfer-walletd
 Then update your client application to use the new token. Plan the
 window: any in-flight request authenticated with the old token will
 fail after the restart and need to retry with the new one.
+
+### Uninstall
+
+`exfer-walletd uninstall` reverses `init`. Dry-run by default — it
+prints the plan and exits without touching anything until you pass
+`--yes`. The wallet directory is preserved by default; losing
+`.key` files loses every penny those addresses hold.
+
+```bash
+# 1. See what would happen — no changes made.
+sudo exfer-walletd uninstall --systemd
+#   uninstall plan:
+#     1. systemctl stop exfer-walletd  (ignore failure if inactive)
+#     2. systemctl disable exfer-walletd
+#     3. rm /etc/systemd/system/exfer-walletd.service
+#     4. systemctl daemon-reload
+#     5. rm /etc/exfer-walletd/env  (env file with tokens)
+#   Dry run. Re-run with --yes to execute.
+
+# 2. Execute. Wallet directory still untouched.
+sudo exfer-walletd uninstall --systemd --yes
+
+# 3. ONLY when you really want the keys gone (and have backups elsewhere):
+sudo exfer-walletd uninstall \
+    --systemd --wallets --i-understand-this-deletes-keys --yes
+```
+
+If the wallet directory contains key files, walletd refuses
+`--wallets` unless you also pass `--i-understand-this-deletes-keys`
+— the long flag exists precisely so that habit + `--yes` can't
+accidentally destroy a treasury. The runtime user, the binary in
+`/usr/local/bin`, and any reverse-proxy block in your Caddyfile /
+nginx config are *not* touched; uninstall prints the exact commands
+to clean them up by hand at the end.
 
 ### Point at a different node
 

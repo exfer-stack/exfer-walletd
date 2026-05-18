@@ -75,7 +75,8 @@ pub async fn transfer(
     //    Mutex so concurrent callers see each other's claims.
     let pending: std::collections::HashSet<OutPoint> = inflight.pending().into_iter().collect();
 
-    let mut candidates: Vec<(OutPoint, &crate::upstream::UtxoEntry)> = Vec::with_capacity(utxos.utxos.len());
+    let mut candidates: Vec<(OutPoint, &crate::upstream::UtxoEntry)> =
+        Vec::with_capacity(utxos.utxos.len());
     for entry in &utxos.utxos {
         let tx_id_bytes = decode_hash(&entry.tx_id)?;
         let op = OutPoint {
@@ -84,7 +85,7 @@ pub async fn transfer(
         };
         candidates.push((op, entry));
     }
-    candidates.sort_by(|a, b| b.1.value.cmp(&a.1.value));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1.value));
 
     let mut selected: Vec<(OutPoint, &crate::upstream::UtxoEntry)> = Vec::new();
     let mut selected_outpoints: Vec<OutPoint> = Vec::new();
@@ -120,7 +121,8 @@ pub async fn transfer(
     // 3. Authenticate selected UTXOs in parallel. Each future owns its
     //    inputs ('static) so buffer_unordered is Send-bound on tokio's
     //    multi-thread executor.
-    let owned: Vec<crate::upstream::UtxoEntry> = selected.iter().map(|(_, e)| (*e).clone()).collect();
+    let owned: Vec<crate::upstream::UtxoEntry> =
+        selected.iter().map(|(_, e)| (*e).clone()).collect();
     let authed: Vec<(OutPoint, UtxoEntry)> = stream::iter(owned)
         .map(|entry| {
             let wallet_script = wallet_script.clone();

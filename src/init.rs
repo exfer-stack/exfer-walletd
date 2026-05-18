@@ -81,10 +81,18 @@ pub fn run(args: InitArgs) -> anyhow::Result<()> {
     eprintln!("     sudo curl -L -o /etc/systemd/system/exfer-walletd.service \\");
     eprintln!("       https://raw.githubusercontent.com/exfer-stack/exfer-walletd/main/deploy/systemd/exfer-walletd.service");
     eprintln!("  3. Create the runtime user (if you don't have one):");
-    eprintln!("     sudo useradd --system --home {} --shell /usr/sbin/nologin exfer-walletd",
-        args.wallet_dir.display());
-    eprintln!("     sudo chown -R exfer-walletd:exfer-walletd {}", args.wallet_dir.display());
-    eprintln!("     sudo chown root:exfer-walletd {}", args.env_file.display());
+    eprintln!(
+        "     sudo useradd --system --home {} --shell /usr/sbin/nologin exfer-walletd",
+        args.wallet_dir.display()
+    );
+    eprintln!(
+        "     sudo chown -R exfer-walletd:exfer-walletd {}",
+        args.wallet_dir.display()
+    );
+    eprintln!(
+        "     sudo chown root:exfer-walletd {}",
+        args.env_file.display()
+    );
     eprintln!("     sudo chmod 0640 {}", args.env_file.display());
     eprintln!("  4. Start:");
     eprintln!("     sudo systemctl daemon-reload");

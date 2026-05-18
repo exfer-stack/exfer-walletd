@@ -100,7 +100,11 @@ impl Action {
                 if *entry_count == 0 {
                     format!("rmdir {}  (empty)", path.display())
                 } else {
-                    let noun = if *entry_count == 1 { "entry" } else { "entries" };
+                    let noun = if *entry_count == 1 {
+                        "entry"
+                    } else {
+                        "entries"
+                    };
                     format!(
                         "rm -rf {}  ({} {} — DESTROYS KEYS)",
                         path.display(),
@@ -138,7 +142,9 @@ pub fn run(args: UninstallArgs) -> anyhow::Result<()> {
     let plan = build_plan(&args, wallet_entries);
 
     if plan.is_empty() {
-        eprintln!("Nothing to do. (env file, unit file, and wallet dir are all absent or out of scope.)");
+        eprintln!(
+            "Nothing to do. (env file, unit file, and wallet dir are all absent or out of scope.)"
+        );
         return Ok(());
     }
 
@@ -270,7 +276,9 @@ fn print_followups(args: &UninstallArgs) {
 }
 
 fn dir_is_empty(p: &Path) -> bool {
-    fs::read_dir(p).map(|mut it| it.next().is_none()).unwrap_or(false)
+    fs::read_dir(p)
+        .map(|mut it| it.next().is_none())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -296,7 +304,10 @@ mod tests {
     fn dry_run_does_not_remove_env_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut args = args_with(dir.path());
-        File::create(&args.env_file).unwrap().write_all(b"x").unwrap();
+        File::create(&args.env_file)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         args.yes = false;
         run(args).unwrap();
         assert!(dir.path().join("env").exists());
@@ -306,7 +317,10 @@ mod tests {
     fn yes_removes_env_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut args = args_with(dir.path());
-        File::create(&args.env_file).unwrap().write_all(b"x").unwrap();
+        File::create(&args.env_file)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         args.yes = true;
         run(args).unwrap();
         assert!(!dir.path().join("env").exists());
@@ -336,7 +350,10 @@ mod tests {
         // i_understand_this_deletes_keys deliberately false
         let err = run(args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("--i-understand-this-deletes-keys"), "msg was: {msg}");
+        assert!(
+            msg.contains("--i-understand-this-deletes-keys"),
+            "msg was: {msg}"
+        );
         assert!(dir.path().join("wallets/aa.key").exists());
     }
 
@@ -378,12 +395,19 @@ mod tests {
         let plan = build_plan(&args, None);
         assert!(plan.iter().any(|a| matches!(a, Action::SystemctlStop(_))));
         assert!(!plan.iter().any(|a| matches!(a, Action::RemoveUnitFile(_))));
-        assert!(!plan.iter().any(|a| matches!(a, Action::SystemctlDaemonReload)));
+        assert!(!plan
+            .iter()
+            .any(|a| matches!(a, Action::SystemctlDaemonReload)));
 
         // With unit file present, plan includes its removal + reload.
-        File::create(&args.unit_file).unwrap().write_all(b"[Unit]").unwrap();
+        File::create(&args.unit_file)
+            .unwrap()
+            .write_all(b"[Unit]")
+            .unwrap();
         let plan = build_plan(&args, None);
         assert!(plan.iter().any(|a| matches!(a, Action::RemoveUnitFile(_))));
-        assert!(plan.iter().any(|a| matches!(a, Action::SystemctlDaemonReload)));
+        assert!(plan
+            .iter()
+            .any(|a| matches!(a, Action::SystemctlDaemonReload)));
     }
 }

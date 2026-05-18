@@ -29,7 +29,7 @@
 //!   rejects the retry as double-spend. Surfaces correctly to the
 //!   client as -32020 with the mempool error in the message.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,46 @@ impl InFlightUtxos {
     /// True iff nothing is currently in-flight.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Atomic "snapshot pending set, run caller's selection, claim the
+    /// chosen outpoints." All three happen under one Mutex acquisition,
+    /// so two concurrent transfers from the same wallet can't both
+    /// race onto the same outpoint between snapshot and claim.
+    ///
+    /// `select` receives the live in-flight set and decides which
+    /// outpoints to claim. On `Ok`, walletd inserts the returned
+    /// outpoints into the in-flight set and gives the caller a
+    /// `ClaimGuard` that releases them on drop unless `commit()` is
+    /// called.
+    ///
+    /// On `Err`, no outpoints are claimed — the caller's error path
+    /// surfaces unchanged.
+    pub fn select_and_claim<F, T, E>(
+        &self,
+        select: F,
+    ) -> std::result::Result<(ClaimGuard<'_>, T), E>
+    where
+        F: FnOnce(&HashSet<OutPoint>) -> std::result::Result<(Vec<OutPoint>, T), E>,
+    {
+        let mut g = self.pending.lock().unwrap();
+        let now = Instant::now();
+        g.retain(|_, exp| now < *exp);
+        let snapshot: HashSet<OutPoint> = g.keys().copied().collect();
+        let (claimed, value) = select(&snapshot)?;
+        let exp = now + TTL;
+        for op in &claimed {
+            g.insert(*op, exp);
+        }
+        drop(g);
+        Ok((
+            ClaimGuard {
+                inflight: self,
+                outpoints: claimed,
+                committed: false,
+            },
+            value,
+        ))
     }
 }
 
@@ -196,5 +236,60 @@ mod tests {
             g.commit();
         }
         assert_eq!(f.len(), 1);
+    }
+
+    #[test]
+    fn select_and_claim_atomically_excludes_concurrent_picks() {
+        // Two consecutive select_and_claim calls from the same wallet
+        // mustn't both pick outpoint A. The first commits its claim; the
+        // second's selection sees A in `pending` and skips it.
+        let f = InFlightUtxos::new();
+        let a = op(0xaa, 0);
+        let b = op(0xbb, 0);
+
+        // First "transfer" picks A.
+        let (g1, picked1) = f
+            .select_and_claim::<_, _, ()>(|pending| {
+                assert!(pending.is_empty());
+                Ok((vec![a], a))
+            })
+            .unwrap();
+        assert_eq!(picked1, a);
+        g1.commit();
+
+        // Second "transfer" — A must be visible as pending.
+        let (g2, picked2) = f
+            .select_and_claim::<_, _, ()>(|pending| {
+                assert!(pending.contains(&a), "first claim must be visible");
+                Ok((vec![b], b))
+            })
+            .unwrap();
+        assert_eq!(picked2, b);
+        g2.commit();
+
+        assert_eq!(f.len(), 2);
+    }
+
+    #[test]
+    fn select_and_claim_err_path_claims_nothing() {
+        let f = InFlightUtxos::new();
+        let res: std::result::Result<(ClaimGuard, ()), &'static str> =
+            f.select_and_claim(|_pending| Err("nope"));
+        assert!(matches!(res, Err("nope")));
+        assert_eq!(f.len(), 0);
+    }
+
+    #[test]
+    fn select_and_claim_guard_releases_on_drop() {
+        let f = InFlightUtxos::new();
+        let a = op(0xaa, 0);
+        {
+            let (_guard, _v) = f
+                .select_and_claim::<_, _, ()>(|_p| Ok((vec![a], ())))
+                .unwrap();
+            assert_eq!(f.len(), 1);
+            // drop without commit
+        }
+        assert_eq!(f.len(), 0);
     }
 }

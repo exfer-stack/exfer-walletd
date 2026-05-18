@@ -166,7 +166,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
 // ----------------------------------------------------------------------------
 
 async fn generate_address(state: &ApiState) -> Result<Value> {
-    let (wallet, addr_hex) = state.store.create()?;
+    let store = state.store.clone();
+    let (wallet, addr_hex) = tokio::task::spawn_blocking(move || store.create())
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     let pubkey_hex = hex::encode(wallet.pubkey());
     tracing::info!(address = %addr_hex, "generated new address");
     Ok(serde_json::json!({
@@ -176,7 +179,10 @@ async fn generate_address(state: &ApiState) -> Result<Value> {
 }
 
 async fn list_addresses(state: &ApiState) -> Result<Value> {
-    let addrs = state.store.list()?;
+    let store = state.store.clone();
+    let addrs = tokio::task::spawn_blocking(move || store.list())
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     Ok(serde_json::json!({ "addresses": addrs }))
 }
 
@@ -191,7 +197,13 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
         return Err(Error::BadAddressLen(p.to.len() / 2));
     }
 
-    let wallet = state.store.load(&p.from)?;
+    // Wallet load is sync FS I/O — run on a blocking worker so we
+    // don't tie up a tokio runtime thread under concurrent transfers.
+    let store = state.store.clone();
+    let from = p.from.clone();
+    let wallet = tokio::task::spawn_blocking(move || store.load(&from))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     let to_bytes = hex::decode(&p.to).map_err(|e| Error::BadHex(e.to_string()))?;
     let mut to_arr = [0u8; 32];
     to_arr.copy_from_slice(&to_bytes);

@@ -32,7 +32,7 @@ use exfer::wallet::wallet::Wallet;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{Error, Result};
-use crate::inflight::{ClaimGuard, InFlightUtxos};
+use crate::inflight::InFlightUtxos;
 use crate::upstream::ExferNode;
 
 /// How many `get_transaction` calls we'll have in flight at once during
@@ -69,13 +69,12 @@ pub async fn transfer(
         .ok_or_else(|| Error::TxBuild("amount + fee overflows u64".into()))?;
 
     // 2. Greedy selection, largest-first, skipping outpoints already
-    //    claimed by another in-flight transfer. The pending set is
-    //    snapshotted once; the claim happens after we've finalised
-    //    which outpoints we want, and lives under the same set's
-    //    Mutex so concurrent callers see each other's claims.
-    let pending: std::collections::HashSet<OutPoint> = inflight.pending().into_iter().collect();
-
-    let mut candidates: Vec<(OutPoint, &crate::upstream::UtxoEntry)> =
+    //    claimed by another in-flight transfer. The whole snapshot →
+    //    select → claim sequence runs under a single Mutex acquisition
+    //    inside InFlightUtxos::select_and_claim, so two concurrent
+    //    transfers from the same wallet can never both pick the same
+    //    outpoint.
+    let mut candidates: Vec<(OutPoint, crate::upstream::UtxoEntry)> =
         Vec::with_capacity(utxos.utxos.len());
     for entry in &utxos.utxos {
         let tx_id_bytes = decode_hash(&entry.tx_id)?;
@@ -83,54 +82,56 @@ pub async fn transfer(
             tx_id: Hash256(tx_id_bytes),
             output_index: entry.output_index,
         };
-        candidates.push((op, entry));
+        candidates.push((op, entry.clone()));
     }
     candidates.sort_by_key(|c| std::cmp::Reverse(c.1.value));
 
-    let mut selected: Vec<(OutPoint, &crate::upstream::UtxoEntry)> = Vec::new();
-    let mut selected_outpoints: Vec<OutPoint> = Vec::new();
-    let mut accumulated: u64 = 0;
-    let mut spendable_total: u64 = 0;
-    let mut spendable_count: usize = 0;
-    let mut in_flight_value: u64 = 0;
-    let mut in_flight_count: usize = 0;
-    for (op, entry) in &candidates {
-        if pending.contains(op) {
-            in_flight_value = in_flight_value.saturating_add(entry.value);
-            in_flight_count += 1;
-            continue;
+    let (guard, selected): (
+        crate::inflight::ClaimGuard<'_>,
+        Vec<(OutPoint, crate::upstream::UtxoEntry)>,
+    ) = inflight.select_and_claim(|pending| {
+        let mut chosen: Vec<(OutPoint, crate::upstream::UtxoEntry)> = Vec::new();
+        let mut chosen_outpoints: Vec<OutPoint> = Vec::new();
+        let mut accumulated: u64 = 0;
+        let mut spendable_total: u64 = 0;
+        let mut spendable_count: usize = 0;
+        let mut in_flight_value: u64 = 0;
+        let mut in_flight_count: usize = 0;
+        for (op, entry) in &candidates {
+            if pending.contains(op) {
+                in_flight_value = in_flight_value.saturating_add(entry.value);
+                in_flight_count += 1;
+                continue;
+            }
+            spendable_total = spendable_total.saturating_add(entry.value);
+            spendable_count += 1;
+            if accumulated >= needed {
+                continue;
+            }
+            chosen.push((*op, entry.clone()));
+            chosen_outpoints.push(*op);
+            accumulated = accumulated.saturating_add(entry.value);
         }
-        spendable_total = spendable_total.saturating_add(entry.value);
-        spendable_count += 1;
-        if accumulated >= needed {
-            continue;
+
+        if accumulated < needed {
+            return Err(Error::InsufficientBalance {
+                needed,
+                available: spendable_total,
+                utxo_count: spendable_count,
+                in_flight_value,
+                in_flight_count,
+            });
         }
-        selected.push((*op, *entry));
-        selected_outpoints.push(*op);
-        accumulated = accumulated.saturating_add(entry.value);
-    }
 
-    if accumulated < needed {
-        return Err(Error::InsufficientBalance {
-            needed,
-            available: spendable_total,
-            utxo_count: spendable_count,
-            in_flight_value,
-            in_flight_count,
-        });
-    }
-
-    // RAII guard — claims now, releases on `?` early return; we'll
-    // `commit()` it after a successful broadcast.
-    let guard = ClaimGuard::new(inflight, selected_outpoints);
+        Ok((chosen_outpoints, chosen))
+    })?;
 
     let wallet_script = std::sync::Arc::new(wallet.address().as_bytes().to_vec());
 
     // 3. Authenticate selected UTXOs in parallel. Each future owns its
     //    inputs ('static) so buffer_unordered is Send-bound on tokio's
     //    multi-thread executor.
-    let owned: Vec<crate::upstream::UtxoEntry> =
-        selected.iter().map(|(_, e)| (*e).clone()).collect();
+    let owned: Vec<crate::upstream::UtxoEntry> = selected.into_iter().map(|(_, e)| e).collect();
     let authed: Vec<(OutPoint, UtxoEntry)> = stream::iter(owned)
         .map(|entry| {
             let wallet_script = wallet_script.clone();

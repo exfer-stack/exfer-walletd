@@ -655,6 +655,9 @@ async fn get_transaction_returns_decoded_inputs_outputs_and_fee() {
     assert_eq!(result["total_in"], 10_000);
     assert_eq!(result["total_out"], 9_500);
     assert_eq!(result["fee"], 500);
+
+    // Size = serialized byte count (tx_hex.len() / 2).
+    assert_eq!(result["size"], (child_hex.len() / 2) as u64);
 }
 
 #[tokio::test]
@@ -911,4 +914,156 @@ async fn sign_message_unknown_address_returns_wallet_not_found() {
         matches!(err, Error::WalletNotFound(_)),
         "expected WalletNotFound, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn witness_decoded_inline_with_pubkey_signature_and_size() {
+    // Build a transaction that carries a Phase-1 P2PKH witness:
+    // witness.witness = pubkey(32) || signature(64) = 96 bytes.
+    // The decoder must surface witness.pubkey + witness.signature
+    // verbatim from tx_hex, and derive `address` by hashing the pubkey
+    // (no parent fetch needed).
+    let pubkey = [0xab_u8; 32];
+    let signature = [0xcd_u8; 64];
+    let expected_address =
+        hex::encode(exfer::types::transaction::TxOutput::pubkey_hash_from_key(&pubkey).as_bytes());
+
+    let mut witness_blob = Vec::with_capacity(96);
+    witness_blob.extend_from_slice(&pubkey);
+    witness_blob.extend_from_slice(&signature);
+
+    let tx = Transaction {
+        inputs: vec![TxInput {
+            prev_tx_id: Hash256([0xee; 32]),
+            output_index: 0,
+        }],
+        outputs: vec![p2pkh(1_000, 0xff)],
+        witnesses: vec![TxWitness {
+            witness: witness_blob,
+            redeemer: None,
+        }],
+    };
+    let tx_hex = hex::encode(tx.serialize().unwrap());
+    let tx_id_hex = hex::encode(tx.tx_id().unwrap().as_bytes());
+
+    let mock = MockServer::start().await;
+
+    // get_transaction(tx_id) returns the tx itself.
+    let id_for_match = tx_id_hex.clone();
+    let hex_for_resp = tx_hex.clone();
+    let tx_id_resp = tx_id_hex.clone();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method": "get_transaction",
+            "params": { "hash": id_for_match }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tx_id":        tx_id_resp,
+                "tx_hex":       hex_for_resp,
+                "in_mempool":   true,
+                "block_hash":   null,
+                "block_height": null,
+            },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    // Parent lookup deliberately fails — we want to prove the address
+    // survives WITHOUT a parent fetch (the perf win).
+    let parent_hex = hex::encode([0xee_u8; 32]);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method": "get_transaction",
+            "params": { "hash": parent_hex }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "error":   { "code": -32004, "message": "tx not found" },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(&state, rpc("get_transaction", json!({ "hash": tx_id_hex })))
+        .await
+        .unwrap();
+
+    let inp = &result["inputs"][0];
+
+    // Witness fields surfaced verbatim from tx_hex.
+    let witness = &inp["witness"];
+    assert_eq!(witness["pubkey"], hex::encode(pubkey));
+    assert_eq!(witness["signature"], hex::encode(signature));
+    assert!(witness.get("witness_hex").is_none());
+
+    // Address derived from witness pubkey — even though the parent
+    // fetch returned -32004. This is the perf-survives-degradation
+    // guarantee.
+    assert_eq!(inp["address"], expected_address);
+
+    // Value still missing (parent unreachable), so fee + total_in too.
+    assert!(inp.get("value").is_none() || inp["value"].is_null());
+    assert!(result.get("fee").is_none() || result["fee"].is_null());
+
+    // Size is always populated.
+    assert_eq!(result["size"], (tx_hex.len() / 2) as u64);
+}
+
+#[tokio::test]
+async fn non_phase1_witness_falls_back_to_witness_hex() {
+    // Some weird future witness blob that isn't 96 bytes — surface as
+    // raw `witness_hex` instead of guessing at pubkey/signature.
+    let weird = vec![0x77u8; 10];
+    let tx = Transaction {
+        inputs: vec![TxInput {
+            prev_tx_id: Hash256([0x00; 32]),
+            output_index: 0,
+        }],
+        outputs: vec![p2pkh(500, 0xee)],
+        witnesses: vec![TxWitness {
+            witness: weird.clone(),
+            redeemer: None,
+        }],
+    };
+    let tx_hex = hex::encode(tx.serialize().unwrap());
+    let tx_id_hex = hex::encode(tx.tx_id().unwrap().as_bytes());
+
+    let mock = MockServer::start().await;
+    let id_for_match = tx_id_hex.clone();
+    let hex_for_resp = tx_hex.clone();
+    let tx_id_resp = tx_id_hex.clone();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tx_id":        tx_id_resp,
+                "tx_hex":       hex_for_resp,
+                "in_mempool":   true,
+                "block_hash":   null,
+                "block_height": null,
+            },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+    // Parent fetch will hit the same catch-all mock and return our
+    // tx pretending to be its own parent — that's fine, we only care
+    // about the witness path here. The mismatched parent_id check
+    // would normally matter but Phase-1 witness handling doesn't
+    // depend on it.
+    let _ = id_for_match;
+
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(&state, rpc("get_transaction", json!({ "hash": tx_id_hex })))
+        .await
+        .unwrap();
+
+    let witness = &result["inputs"][0]["witness"];
+    assert!(witness.get("pubkey").is_none());
+    assert!(witness.get("signature").is_none());
+    assert_eq!(witness["witness_hex"], hex::encode(&weird));
 }

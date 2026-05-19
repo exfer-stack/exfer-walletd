@@ -428,18 +428,27 @@ or mempool entries; `in_mempool` distinguishes.
   block_height: u64   | null, // null if in_mempool
 
   // Decoded view — added so callers don't have to parse tx_hex.
-  // Outputs are decoded inline (no extra upstream calls). Inputs need
-  // a parent-tx fetch per outpoint to recover the spending address +
-  // value; walletd does that in parallel (cap 8). Per-parent failures
-  // degrade gracefully — `address`/`value` come back missing for that
-  // input and `fee` / `total_in` are omitted from the response.
+  //
+  // Outputs and witnesses decode inline from tx_hex (zero upstream
+  // calls). Phase-1 P2PKH `inputs[].address` is derived from
+  // `witness.pubkey` for the same reason — no parent fetch required.
+  // Values are still pulled from parent transactions in parallel
+  // (cap 8); per-parent failures degrade gracefully — `value` and
+  // `fee` / `total_in` go missing for that input, but `address` and
+  // `witness` survive because they come from tx_hex alone.
   inputs: [
     {
       prev_tx_id:    hex64,
       output_index:  u32,
       address?:      hex64,   // present for standard P2PKH inputs
-      script_hex?:   hex,     // present for non-P2PKH inputs
+      script_hex?:   hex,     // present for non-P2PKH inputs (parent script)
       value?:        u64,     // exfers
+      witness?: {
+        pubkey?:       hex64, // Phase-1: first 32 bytes of witness blob
+        signature?:    hex128,// Phase-1: last 64 bytes
+        witness_hex?:  hex,   // non-Phase-1 fallback (coinbase, future types)
+        redeemer_hex?: hex,   // Phase-1: always absent
+      },
     },
     ...
   ],
@@ -454,6 +463,7 @@ or mempool entries; `in_mempool` distinguishes.
   total_out:  u64,            // sum of outputs[].value — always present
   total_in?:  u64,            // omitted if any input failed to resolve
   fee?:       u64,            // total_in - total_out; omitted with total_in
+  size:       u64,            // serialized byte length == tx_hex.len() / 2
 }
 ```
 
@@ -479,7 +489,11 @@ curl -s $URL -H "Authorization: Bearer $TOKEN" \
         "prev_tx_id":   "fcbe0c52689b9d4b8e7c0411e2b1cf76d0bf2bbf25ad8cb2c3b62905ee2c1f00",
         "output_index": 1,
         "address":      "658f0a295fefbaa4f94a020e45aa82938ec34946a05733906ef2fc5300b2ba5f",
-        "value":        100000000
+        "value":        100000000,
+        "witness": {
+          "pubkey":    "e1020a2d703030dd093dcb0fba90dd0b67460b2170ff0e29e69c9fcc541adc45",
+          "signature": "8f4ad5…64-byte-sig-as-128-hex…"
+        }
       }
     ],
     "outputs": [
@@ -488,7 +502,8 @@ curl -s $URL -H "Authorization: Bearer $TOKEN" \
     ],
     "total_in":  100000000,
     "total_out":  99900000,
-    "fee":           100000
+    "fee":           100000,
+    "size":             362
   },
   "id": 1
 }

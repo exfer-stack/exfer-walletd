@@ -13,12 +13,18 @@
 //! come back `null` and `fee` becomes `null`, but the rest of the
 //! response is still returned.
 
-use exfer::types::transaction::Transaction;
+use exfer::types::transaction::{Transaction, TxOutput, TxWitness};
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::upstream::ExferNode;
+
+/// Phase 1 P2PKH witness layout. The witness blob is exactly
+/// `pubkey(32) || signature(64) = 96` bytes. Anything else (coinbase,
+/// future script types) is surfaced as raw `witness_hex` for the
+/// client to interpret.
+const PHASE1_WITNESS_LEN: usize = 96;
 
 /// Match the `transfer` engine's cap so an aggressive `get_transaction`
 /// can't out-fan-out a healthy spend path on the upstream.
@@ -33,18 +39,44 @@ type ResolvedInput = (Option<String>, Option<String>, u64);
 pub struct DecodedInput {
     pub prev_tx_id: String,
     pub output_index: u32,
-    /// Spending address (hex, 64-char) when the parent tx was reachable
-    /// and the referenced output was a standard 32-byte P2PKH script.
+    /// Spending address (hex, 64-char). For Phase-1 P2PKH this is
+    /// derived from the witness pubkey (no upstream calls); falls back
+    /// to the parent-fetch derived value when the witness layout is
+    /// non-standard.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// Hex-encoded script when the parent was reachable but the
-    /// referenced output's script wasn't 32 bytes (non-P2PKH).
+    /// Hex-encoded script when the referenced output's script wasn't
+    /// 32 bytes (non-P2PKH) and the parent was reachable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script_hex: Option<String>,
     /// Value (exfers) of the consumed output. `None` if parent fetch
     /// failed or the output index was out of bounds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<u64>,
+    /// Decoded witness from `tx_hex` (zero upstream calls). `None` if
+    /// no witness slot was present (rare — chain always carries one
+    /// per input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness: Option<DecodedWitness>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedWitness {
+    /// Phase 1 P2PKH spender pubkey (first 32 bytes of witness).
+    /// Hashing this yields the input's `address`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+    /// Phase 1 P2PKH Ed25519 signature (last 64 bytes of witness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Raw witness bytes when the layout isn't 96-byte Phase-1
+    /// (coinbase, future script types). Present alongside `pubkey` /
+    /// `signature` is never set — exactly one form is populated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_hex: Option<String>,
+    /// Optional redeemer bytes (Phase 1: always absent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeemer_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,12 +102,16 @@ pub struct DecodedTx {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_in: Option<u64>,
     pub total_out: u64,
+    /// Serialized transaction size in bytes (== `tx_hex.len() / 2`).
+    pub size: usize,
 }
 
 /// Decode `tx_hex` and (best-effort) resolve each input's spending
-/// address + value by fetching parent transactions from `node`.
+/// address + value. Phase-1 P2PKH addresses come from the witness
+/// pubkey (zero upstream calls); values still need a parent fetch.
 pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<DecodedTx> {
     let raw = hex::decode(tx_hex).map_err(|e| Error::Internal(format!("tx_hex not hex: {e}")))?;
+    let size = raw.len();
     let (tx, _consumed) = Transaction::deserialize(&raw)
         .map_err(|e| Error::Internal(format!("tx_hex deserialize: {e:?}")))?;
 
@@ -86,8 +122,19 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
         .collect();
     let total_out: u64 = outputs.iter().map(|o| o.value).sum();
 
-    // Outpoints in declared order — we need to preserve order in the
-    // response, and `buffer_unordered` doesn't.
+    // Decode witnesses inline (free — already in tx_hex). For Phase-1
+    // P2PKH, the pubkey is the first 32 bytes of the witness blob;
+    // hashing it gives the spender's address. We prefer this over the
+    // parent-fetch path because: (a) zero upstream cost, (b) survives
+    // parent-fetch failures, (c) is what the chain itself verifies.
+    let witnesses: Vec<Option<DecodedWitness>> = tx.witnesses.iter().map(decode_witness).collect();
+    let witness_addresses: Vec<Option<String>> = witnesses
+        .iter()
+        .map(|w| w.as_ref().and_then(address_from_witness))
+        .collect();
+
+    // Outpoints in declared order — preserve for the response since
+    // `buffer_unordered` doesn't.
     let outpoints: Vec<(usize, String, u32)> = tx
         .inputs
         .iter()
@@ -111,33 +158,44 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
 
     let mut inputs: Vec<DecodedInput> = Vec::with_capacity(outpoints.len());
     let mut total_in: u64 = 0;
-    let mut any_unresolved = false;
-    for ((_, prev_id, out_idx), r) in outpoints.into_iter().zip(resolved) {
-        match r {
-            Some((address, script_hex, value)) => {
+    let mut any_value_missing = false;
+    let count = outpoints.len();
+    for i in 0..count {
+        let (_, ref prev_id, out_idx) = outpoints[i];
+        let witness = witnesses[i].clone();
+        let witness_address = witness_addresses[i].clone();
+        match resolved[i].clone() {
+            Some((parent_addr, parent_script, value)) => {
                 total_in = total_in.saturating_add(value);
                 inputs.push(DecodedInput {
-                    prev_tx_id: prev_id,
+                    prev_tx_id: prev_id.clone(),
                     output_index: out_idx,
-                    address,
-                    script_hex,
+                    // Witness-derived first; parent-derived fills in
+                    // for non-Phase-1 inputs that don't carry a pubkey.
+                    address: witness_address.or(parent_addr),
+                    script_hex: parent_script,
                     value: Some(value),
+                    witness,
                 });
             }
             None => {
-                any_unresolved = true;
+                any_value_missing = true;
                 inputs.push(DecodedInput {
-                    prev_tx_id: prev_id,
+                    prev_tx_id: prev_id.clone(),
                     output_index: out_idx,
-                    address: None,
+                    // Address can still come from the witness even
+                    // when the parent was unreachable — that's the
+                    // whole point of decoding witnesses locally.
+                    address: witness_address,
                     script_hex: None,
                     value: None,
+                    witness,
                 });
             }
         }
     }
 
-    let (total_in, fee) = if any_unresolved {
+    let (total_in, fee) = if any_value_missing {
         (None, None)
     } else {
         // Saturating sub keeps us safe in the theoretical case where a
@@ -152,7 +210,38 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
         fee,
         total_in,
         total_out,
+        size,
     })
+}
+
+fn decode_witness(w: &TxWitness) -> Option<DecodedWitness> {
+    if w.witness.is_empty() && w.redeemer.is_none() {
+        return None;
+    }
+    let redeemer_hex = w.redeemer.as_deref().map(hex::encode);
+    if w.witness.len() == PHASE1_WITNESS_LEN {
+        Some(DecodedWitness {
+            pubkey: Some(hex::encode(&w.witness[..32])),
+            signature: Some(hex::encode(&w.witness[32..])),
+            witness_hex: None,
+            redeemer_hex,
+        })
+    } else {
+        Some(DecodedWitness {
+            pubkey: None,
+            signature: None,
+            witness_hex: Some(hex::encode(&w.witness)),
+            redeemer_hex,
+        })
+    }
+}
+
+fn address_from_witness(w: &DecodedWitness) -> Option<String> {
+    let pk_hex = w.pubkey.as_deref()?;
+    let pk_bytes: [u8; 32] = hex::decode(pk_hex).ok()?.try_into().ok()?;
+    Some(hex::encode(
+        TxOutput::pubkey_hash_from_key(&pk_bytes).as_bytes(),
+    ))
 }
 
 async fn resolve_input(

@@ -24,6 +24,11 @@ use crate::upstream::ExferNode;
 /// can't out-fan-out a healthy spend path on the upstream.
 const INPUT_RESOLVE_CONCURRENCY: usize = 8;
 
+/// Per-input resolution result: `(address, script_hex, value)`. `address`
+/// is `Some` for standard P2PKH; `script_hex` is `Some` for non-P2PKH;
+/// exactly one of the two is populated (see [`address_or_script`]).
+type ResolvedInput = (Option<String>, Option<String>, u64);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodedInput {
     pub prev_tx_id: String,
@@ -70,8 +75,7 @@ pub struct DecodedTx {
 /// Decode `tx_hex` and (best-effort) resolve each input's spending
 /// address + value by fetching parent transactions from `node`.
 pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<DecodedTx> {
-    let raw = hex::decode(tx_hex)
-        .map_err(|e| Error::Internal(format!("tx_hex not hex: {e}")))?;
+    let raw = hex::decode(tx_hex).map_err(|e| Error::Internal(format!("tx_hex not hex: {e}")))?;
     let (tx, _consumed) = Transaction::deserialize(&raw)
         .map_err(|e| Error::Internal(format!("tx_hex deserialize: {e:?}")))?;
 
@@ -88,17 +92,10 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
         .inputs
         .iter()
         .enumerate()
-        .map(|(i, inp)| {
-            (
-                i,
-                hex::encode(inp.prev_tx_id.as_bytes()),
-                inp.output_index,
-            )
-        })
+        .map(|(i, inp)| (i, hex::encode(inp.prev_tx_id.as_bytes()), inp.output_index))
         .collect();
 
-    let mut resolved: Vec<Option<(Option<String>, Option<String>, u64)>> =
-        vec![None; outpoints.len()];
+    let mut resolved: Vec<Option<ResolvedInput>> = vec![None; outpoints.len()];
 
     let fetches = stream::iter(outpoints.clone())
         .map(|(i, prev_id, out_idx)| async move {
@@ -107,8 +104,7 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
         })
         .buffer_unordered(INPUT_RESOLVE_CONCURRENCY);
 
-    let collected: Vec<(usize, Option<(Option<String>, Option<String>, u64)>)> =
-        fetches.collect().await;
+    let collected: Vec<(usize, Option<ResolvedInput>)> = fetches.collect().await;
     for (i, r) in collected {
         resolved[i] = r;
     }
@@ -163,7 +159,7 @@ async fn resolve_input(
     node: &ExferNode,
     prev_tx_id: &str,
     output_index: u32,
-) -> Option<(Option<String>, Option<String>, u64)> {
+) -> Option<ResolvedInput> {
     let parent = node.get_transaction(prev_tx_id).await.ok()?;
     let raw = hex::decode(&parent.tx_hex).ok()?;
     let (parent_tx, _consumed) = Transaction::deserialize(&raw).ok()?;
@@ -260,7 +256,10 @@ mod tests {
         let weird = vec![0x11; 17];
         let out = decoded_output(&weird, 5);
         assert!(out.address.is_none());
-        assert_eq!(out.script_hex.as_deref(), Some("1111111111111111111111111111111111"));
+        assert_eq!(
+            out.script_hex.as_deref(),
+            Some("1111111111111111111111111111111111")
+        );
         assert_eq!(out.value, 5);
     }
 }

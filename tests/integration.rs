@@ -637,7 +637,16 @@ async fn get_transaction_returns_decoded_inputs_outputs_and_fee() {
     // Inputs are resolved from the parent fetch.
     let ins = result["inputs"].as_array().unwrap();
     assert_eq!(ins.len(), 1);
-    assert_eq!(ins[0]["prev_tx_id"], parent.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>());
+    assert_eq!(
+        ins[0]["prev_tx_id"],
+        parent
+            .tx_id()
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     assert_eq!(ins[0]["output_index"], 0);
     assert_eq!(ins[0]["address"], "aa".repeat(32));
     assert_eq!(ins[0]["value"], 10_000);
@@ -715,7 +724,10 @@ async fn get_transaction_omits_fee_when_parent_unreachable() {
     // Input is present as a bare outpoint, address/value null.
     let inp = &result["inputs"][0];
     assert_eq!(inp["output_index"], 0);
-    assert!(inp.get("address").is_none(), "expected no address, got {inp:?}");
+    assert!(
+        inp.get("address").is_none(),
+        "expected no address, got {inp:?}"
+    );
     assert!(inp.get("value").is_none());
 
     // Fee + total_in omitted when any input failed to resolve.
@@ -875,7 +887,10 @@ async fn sign_message_then_verify_message_roundtrip() {
     .await
     .unwrap();
     assert_eq!(v_wrong_addr["valid"], false);
-    assert_eq!(v_wrong_addr["address"], address, "still report the real address");
+    assert_eq!(
+        v_wrong_addr["address"], address,
+        "still report the real address"
+    );
 }
 
 #[tokio::test]

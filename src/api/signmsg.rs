@@ -61,7 +61,10 @@ struct SignMessageResult {
     address: String,
 }
 
-pub async fn sign_message(state: &ApiState, params: serde_json::Value) -> Result<serde_json::Value> {
+pub async fn sign_message(
+    state: &ApiState,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
     let p: SignMessageParams = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("sign_message params: {e}")))?;
     ensure_64_hex(&p.address)?;
@@ -122,8 +125,8 @@ pub async fn verify_message(
         .map_err(|e| Error::BadHex(format!("pubkey: {e}")))?
         .try_into()
         .map_err(|v: Vec<u8>| Error::BadAddressLen(v.len()))?;
-    let sig_bytes = hex::decode(&p.signature)
-        .map_err(|e| Error::BadHex(format!("signature: {e}")))?;
+    let sig_bytes =
+        hex::decode(&p.signature).map_err(|e| Error::BadHex(format!("signature: {e}")))?;
     if sig_bytes.len() != SIGNATURE_LENGTH {
         return Err(Error::BadEnvelope(format!(
             "signature: expected {} bytes, got {}",

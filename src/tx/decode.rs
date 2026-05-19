@@ -112,7 +112,7 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
     let mut inputs: Vec<DecodedInput> = Vec::with_capacity(outpoints.len());
     let mut total_in: u64 = 0;
     let mut any_unresolved = false;
-    for ((_, prev_id, out_idx), r) in outpoints.into_iter().zip(resolved.into_iter()) {
+    for ((_, prev_id, out_idx), r) in outpoints.into_iter().zip(resolved) {
         match r {
             Some((address, script_hex, value)) => {
                 total_in = total_in.saturating_add(value);

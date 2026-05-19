@@ -201,17 +201,32 @@ async fn run_loop(
     }
 }
 
-/// Exponential backoff: 5s base → 5, 10, 20, 40, 60 (cap).
+/// Exponential backoff that **only grows** the wait — never shrinks it
+/// below `base`. The cap (`MAX_BACKOFF`) is applied to the *additional*
+/// wait, so an operator who sets `--cache-refresh-secs=300` to be gentle
+/// on a rate-limited public RPC isn't surprised by the refresher firing
+/// every 60s during outages just because `MAX_BACKOFF=60s`.
+///
+/// Real-world bug this fixes: walletd v0.13.0 against `rpc.exfer.dev`
+/// with `--cache-refresh-secs=300` would tick every 60s during the
+/// upstream's rate-limit refusal, burning quota and never letting the
+/// bucket fully refill. The intent of the long refresh interval was
+/// "be gentle"; the broken cap was "be aggressive whenever upstream
+/// hiccups."
 fn backoff_for_attempt(base: Duration, attempt: u32) -> Duration {
     let mult = 1u64
         .checked_shl(attempt.saturating_sub(1))
         .unwrap_or(u64::MAX);
-    let candidate = base.saturating_mul(mult as u32);
-    if candidate > MAX_BACKOFF {
+    let exponential = base.saturating_mul(mult as u32);
+    // The cap applies only when it strictly *lengthens* the wait beyond
+    // `base`. If `base > MAX_BACKOFF` we honor `base`; never wait less
+    // than the configured interval.
+    let candidate = if exponential > MAX_BACKOFF {
         MAX_BACKOFF
     } else {
-        candidate
-    }
+        exponential
+    };
+    candidate.max(base)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -696,6 +711,23 @@ mod tests {
         assert_eq!(backoff_for_attempt(base, 4), Duration::from_secs(40));
         assert_eq!(backoff_for_attempt(base, 5), MAX_BACKOFF);
         assert_eq!(backoff_for_attempt(base, 100), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_never_drops_below_base_interval() {
+        // The bug discovered against rpc.exfer.dev: with --cache-refresh-secs=300
+        // (base=300s) the OLD backoff_for_attempt(base, 1) returned MAX_BACKOFF
+        // (60s), effectively shortening the operator's configured interval from
+        // 300s to 60s every time upstream returned a rate-limit error. Fix: cap
+        // applies only when it *lengthens*; never wait less than `base`.
+        let base = Duration::from_secs(300);
+        for attempt in 1..=10 {
+            let w = backoff_for_attempt(base, attempt);
+            assert!(
+                w >= base,
+                "attempt {attempt}: backoff {w:?} dropped below base {base:?}"
+            );
+        }
     }
 
     #[test]

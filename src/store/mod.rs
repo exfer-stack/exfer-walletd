@@ -18,7 +18,9 @@
 //! no passphrase prompt possible) but written with mode 0600. Protect the
 //! disk at rest with LUKS / dm-crypt / cloud volume encryption / equivalent.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use exfer::wallet::wallet::Wallet;
 
@@ -52,13 +54,22 @@ pub trait WalletStore: Send + Sync + 'static {
 // Filesystem implementation
 // ============================================================================
 
+/// In-memory address index. Updated on `create()` after the disk
+/// write succeeds; rebuilt from disk on `open()`. Avoids a `readdir +
+/// filter` syscall storm every time `list()` is called — significant
+/// at 10k+ managed addresses where the refresher would otherwise scan
+/// the directory every tick.
+type Index = std::sync::Arc<RwLock<BTreeSet<String>>>;
+
 #[derive(Debug, Clone)]
 pub struct FsWalletStore {
     root: PathBuf,
+    index: Index,
 }
 
 impl FsWalletStore {
     /// Open the wallet directory, creating it (mode 0700) if missing.
+    /// Scans existing `.key` files into the in-memory index.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
@@ -67,7 +78,27 @@ impl FsWalletStore {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
         }
-        Ok(Self { root })
+        // Build the in-memory index from a one-shot fs scan at open
+        // time. After this, list() doesn't touch disk at all.
+        let mut addrs = BTreeSet::new();
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let ext = path.extension().and_then(|s| s.to_str());
+            if ext != Some("key") {
+                continue;
+            }
+            if stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
+                addrs.insert(stem.to_string());
+            }
+        }
+        Ok(Self {
+            root,
+            index: std::sync::Arc::new(RwLock::new(addrs)),
+        })
     }
 
     /// Directory holding the .key files. Useful for tests and logging.
@@ -91,9 +122,14 @@ impl WalletStore for FsWalletStore {
             // We still guard against accidental overwrite.
             return Err(Error::WalletAlreadyExists(addr));
         }
+        // Write the key to disk FIRST. Only after the disk write
+        // succeeds do we insert into the in-memory index — otherwise a
+        // crash between insert + write would leave a ghost address in
+        // the index that `load()` couldn't satisfy.
         wallet
             .save_unencrypted(&path)
             .map_err(|e| Error::Wallet(format!("save {}: {e}", path.display())))?;
+        self.index.write().unwrap().insert(addr.clone());
         Ok((wallet, addr))
     }
 
@@ -108,27 +144,17 @@ impl WalletStore for FsWalletStore {
     }
 
     fn list(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let ext = path.extension().and_then(|s| s.to_str());
-            if ext != Some("key") {
-                continue;
-            }
-            if stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
-                out.push(stem.to_string());
-            }
-        }
-        out.sort();
-        Ok(out)
+        // O(n) memcopy out of the in-memory index. The BTreeSet
+        // iteration order gives us ascending sort for free; no extra
+        // sort() pass required.
+        Ok(self.index.read().unwrap().iter().cloned().collect())
     }
 
     fn exists(&self, address_hex: &str) -> bool {
-        self.path_for(address_hex).exists()
+        // Cheap path: index lookup. Disk-truth `path_for(...).exists()`
+        // is a fallback we don't need — the index is the in-memory
+        // source of truth, kept in sync by `create()`.
+        self.index.read().unwrap().contains(address_hex)
     }
 }
 

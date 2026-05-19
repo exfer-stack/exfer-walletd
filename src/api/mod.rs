@@ -27,6 +27,7 @@ use crate::store::WalletStore;
 use crate::tx::TransferReceipt;
 use crate::upstream::ExferNode;
 
+pub mod listbal;
 pub mod signmsg;
 
 #[derive(Clone)]
@@ -154,7 +155,8 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
     match req.method.as_str() {
         // ---- generate / list (wrapper-only) ----
         "generate_address" => generate_address(state).await,
-        "list_addresses" => list_addresses(state).await,
+        "list_addresses" => list_addresses(state, req.params).await,
+        "list_balances" => listbal::list_balances(state).await,
 
         // ---- transfer (wrapper-only) ----
         "transfer" => transfer_method(state, req.params).await,
@@ -206,7 +208,27 @@ async fn generate_address(state: &ApiState) -> Result<Value> {
     }))
 }
 
-async fn list_addresses(state: &ApiState) -> Result<Value> {
+/// Optional `with_balance` flag for `list_addresses`. When set,
+/// `list_addresses` forwards to `list_balances` and returns the richer
+/// shape; otherwise the legacy `{ addresses: hex64[] }` is returned
+/// (full backward compatibility).
+#[derive(Debug, Deserialize, Default)]
+struct ListAddressesParams {
+    #[serde(default)]
+    with_balance: bool,
+}
+
+async fn list_addresses(state: &ApiState, params: Value) -> Result<Value> {
+    // Empty `null` / `{}` → legacy mode.
+    let p: ListAddressesParams = if params.is_null() {
+        ListAddressesParams::default()
+    } else {
+        serde_json::from_value(params)
+            .map_err(|e| Error::BadEnvelope(format!("list_addresses params: {e}")))?
+    };
+    if p.with_balance {
+        return listbal::list_balances(state).await;
+    }
     let store = state.store.clone();
     let addrs = tokio::task::spawn_blocking(move || store.list())
         .await

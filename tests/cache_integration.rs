@@ -312,6 +312,81 @@ async fn block_cache_amortizes_repeat_by_height() {
 }
 
 #[tokio::test]
+async fn list_balances_returns_envelope_with_addresses() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    // Generate three addresses (each seeded with balance=0 in L2).
+    for _ in 0..3 {
+        dispatch(&state, rpc("generate_address", json!({})))
+            .await
+            .unwrap();
+    }
+
+    let r = dispatch(&state, rpc("list_balances", json!({})))
+        .await
+        .unwrap();
+
+    // Envelope shape.
+    assert!(r.get("tip").is_some(), "must include tip object");
+    assert!(r.get("as_of_ms_ago").is_some(), "must include as_of_ms_ago");
+    let rows = r["addresses"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "one row per managed address");
+
+    for row in rows {
+        assert!(row["address"].is_string());
+        // Seeded balance=0 means balance field is present (Some(0)).
+        assert_eq!(row["balance"], 0);
+        // L3 UTXO was not seeded → utxo_count is null.
+        assert!(row["utxo_count"].is_null());
+        // tip_at_fetch=0 on seed → stale must be true.
+        assert_eq!(row["stale"], true);
+        assert!(row["last_error"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn list_addresses_with_balance_forwards_to_list_balances() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+    dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+
+    // Bare list_addresses still returns the legacy array shape.
+    let legacy = dispatch(&state, rpc("list_addresses", json!({})))
+        .await
+        .unwrap();
+    assert!(legacy["addresses"][0].is_string());
+
+    // Extended shape forwards to list_balances.
+    let extended = dispatch(&state, rpc("list_addresses", json!({"with_balance": true})))
+        .await
+        .unwrap();
+    assert!(extended.get("tip").is_some());
+    assert!(extended["addresses"][0]["address"].is_string());
+}
+
+#[tokio::test]
+async fn list_balances_with_cache_off_still_works_but_all_stale() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Off);
+    dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+
+    // With cache off, the seed_zero call inside generate_address writes
+    // to the cache anyway (cache is constructed; just the refresher
+    // doesn't run). Caller gets the row as stale because tip is never
+    // primed.
+    let r = dispatch(&state, rpc("list_balances", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(r["addresses"].as_array().unwrap().len(), 1);
+    assert_eq!(r["addresses"][0]["stale"], true);
+}
+
+#[tokio::test]
 async fn cas_loss_protects_against_silent_clobber() {
     // The §9 trap from the Plan-agent design review: refresher mid-fetch
     // must not overwrite a transfer-commit invalidation. This drives the

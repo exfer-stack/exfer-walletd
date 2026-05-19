@@ -1,5 +1,19 @@
 # Quick start
 
+## Pick your shape
+
+| Scenario                                       | Command                                                            | Wire |
+| ---------------------------------------------- | ------------------------------------------------------------------ | ---- |
+| Dev — node, walletd, caller on one host        | `exfer-walletd`                                                    | plain HTTP on `127.0.0.1` |
+| **Prod — cross-host, recommended**             | `exfer-walletd --tls --bind <private-ip>:7448`                     | HTTPS, self-signed cert, SDK pins by fingerprint |
+| Prod — TLS terminator (nginx/Caddy/cloud LB) already in front | `exfer-walletd --allow-public-bind --bind 0.0.0.0:7448` | plain HTTP behind your proxy |
+
+**If your walletd talks to a backend on a different host, you want
+`--tls`.** A bearer token over plaintext HTTP is fatal — walletd
+fails-closed on public binds to make that hard to do by accident.
+Full details: [Production: enable `--tls`](#production-enable-tls)
+below.
+
 ## Dev (laptop / single VM)
 
 Node, walletd, and your code all on one host? Zero flags:

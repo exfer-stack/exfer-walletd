@@ -300,7 +300,7 @@ fn ensure_64_hex(s: &str) -> Result<()> {
 /// even-length and all hex digits. Empty is allowed — the upstream
 /// will reject empty payloads with a more specific error.
 fn ensure_hex(s: &str) -> Result<()> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(Error::BadHex(format!("odd-length hex ({} chars)", s.len())));
     }
     if !s.chars().all(|c| c.is_ascii_hexdigit()) {

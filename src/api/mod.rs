@@ -136,6 +136,11 @@ pub enum BlockSelector {
     ByHeight { height: u64 },
 }
 
+#[derive(Debug, Deserialize)]
+pub struct HeightParam {
+    pub height: u64,
+}
+
 // ============================================================================
 // Method dispatch
 // ============================================================================
@@ -153,6 +158,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,
         "get_block" => get_block(state, req.params).await,
+        "get_block_hash" => get_block_hash(state, req.params).await,
         "get_transaction" => get_transaction(state, req.params).await,
         "get_balance" => get_balance(state, req.params).await,
         "get_address_utxos" => get_address_utxos(state, req.params).await,
@@ -244,6 +250,24 @@ async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
         }
     };
     serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Bitcoin-style explicit `height → hash` lookup. Same shape as
+/// `get_block_height` so clients can treat both uniformly.
+///
+/// Performance note: upstream Exfer node has no height→hash index, so
+/// this call fetches the full block and discards everything but the
+/// hash. Cost is identical to `get_block(height=…)`. If the caller's
+/// next step is to read the block itself, prefer `get_block(height=…)`
+/// — one round trip instead of two.
+async fn get_block_hash(state: &ApiState, params: Value) -> Result<Value> {
+    let p: HeightParam = serde_json::from_value(params)
+        .map_err(|e| Error::BadEnvelope(format!("get_block_hash params: {e}")))?;
+    let blk = state.node.get_block_by_height(p.height).await?;
+    Ok(serde_json::json!({
+        "height":   blk.height,
+        "block_id": blk.hash,
+    }))
 }
 
 async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {

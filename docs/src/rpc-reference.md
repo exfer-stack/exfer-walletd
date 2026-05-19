@@ -318,6 +318,12 @@ be set.
 | `height` | u64    | Block height (genesis = 0).  |
 | `hash`   | hex64  | 64-character hex block hash. |
 
+Prefer the `hash` form when you already have it; the `height` form is
+identical in cost — one upstream RPC either way. Don't chain
+`get_block_hash` → `get_block(hash)` when you only have a height; that
+costs two round trips for no benefit (see
+[`get_block_hash`](#get_block_hash) below).
+
 **Returns**
 
 ```ts
@@ -350,6 +356,49 @@ curl -s $URL -H "Authorization: Bearer $TOKEN" \
      -H 'content-type: application/json' \
      -d '{"jsonrpc":"2.0","method":"get_block","params":{"hash":"17b95f..."},"id":1}'
 ```
+
+---
+
+## `get_block_hash`
+
+Resolve a block `height` to its `block_id`. Bitcoin-style explicit
+lookup — returns the same `{height, block_id}` shape as
+[`get_block_height`](#get_block_height) so clients can treat both
+uniformly.
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params**
+
+| Field    | Type | Required | Description                  |
+| -------- | ---- | -------- | ---------------------------- |
+| `height` | u64  | yes      | Block height (genesis = 0).  |
+
+**Returns** `{ height: u64, block_id: hex64 }`
+
+**Example**
+
+```bash
+curl -s $URL -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"get_block_hash","params":{"height":577000},"id":1}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {"height": 577000, "block_id": "17b95f159c3e51440207cc6648f655201bac84fd0e1e5a9ad8461e2d7a2932d5"},
+  "id": 1
+}
+```
+
+**Performance** — the upstream Exfer node has no height→hash index;
+this call fetches the full block and discards everything but the
+hash. Cost is identical to `get_block(height=…)`. If your next step
+is to read the block body, use `get_block(height=…)` directly — one
+round trip instead of two.
 
 ---
 

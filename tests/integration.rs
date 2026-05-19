@@ -723,3 +723,59 @@ async fn get_transaction_omits_fee_when_parent_unreachable() {
     assert!(result.get("total_in").is_none() || result["total_in"].is_null());
     assert_eq!(result["total_out"], 3_000);
 }
+
+// --- get_block_hash: height -> hash lookup ---------------------------------
+
+#[tokio::test]
+async fn get_block_hash_returns_height_and_block_id() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .and(body_partial_json(json!({
+            "method": "get_block",
+            "params": { "height": 1234 }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "hash":              "ab".repeat(32),
+                "height":            1234,
+                "timestamp":         1700000000_u64,
+                "tx_count":          2,
+                "transactions":      ["aa".repeat(32), "bb".repeat(32)],
+                "prev_block_id":     "00".repeat(32),
+                "difficulty_target": "ff".repeat(32),
+                "nonce":             42_u64,
+                "state_root":        "11".repeat(32),
+                "tx_root":           "22".repeat(32),
+            },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(&state, rpc("get_block_hash", json!({ "height": 1234 })))
+        .await
+        .unwrap();
+
+    assert_eq!(result["height"], 1234);
+    assert_eq!(result["block_id"], "ab".repeat(32));
+    // Body of the upstream block must NOT leak into the response —
+    // get_block_hash returns only the tip-shaped pair.
+    assert!(result.get("transactions").is_none());
+    assert!(result.get("tx_root").is_none());
+}
+
+#[tokio::test]
+async fn get_block_hash_rejects_missing_height_param() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let err = dispatch(&state, rpc("get_block_hash", json!({})))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::BadEnvelope(_)),
+        "expected BadEnvelope, got {err:?}"
+    );
+}

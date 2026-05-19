@@ -20,6 +20,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cache::WalletCache;
 use crate::error::{Error, Result};
 use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
@@ -33,6 +34,7 @@ pub struct ApiState {
     pub store: Arc<dyn WalletStore>,
     pub node: Arc<ExferNode>,
     pub inflight: Arc<InFlightUtxos>,
+    pub cache: Arc<WalletCache>,
 }
 
 // ============================================================================
@@ -190,6 +192,13 @@ async fn generate_address(state: &ApiState) -> Result<Value> {
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     let pubkey_hex = hex::encode(wallet.pubkey());
+    // Seed the L2 balance cache so the very next list_balances doesn't
+    // have to wait for the refresher to discover the new address.
+    // tip_at_fetch=0 inside the seed forces the refresher to overwrite
+    // on its next tick — guards against the rare case where someone
+    // funded the freshly-derived pubkey out-of-band before we generated
+    // it locally.
+    state.cache.balance.seed_zero(&addr_hex);
     tracing::info!(address = %addr_hex, "generated new address");
     Ok(serde_json::json!({
         "address": addr_hex,
@@ -305,7 +314,7 @@ async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_balance params: {e}")))?;
     ensure_64_hex(&p.address)?;
-    let bal = state.node.get_balance(&p.address).await?;
+    let bal = state.cache.get_balance(&p.address, &state.node).await?;
     serde_json::to_value(&bal).map_err(|e| Error::Internal(e.to_string()))
 }
 

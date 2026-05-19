@@ -30,6 +30,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::{dispatch, ApiState, RpcRequest, RpcResponse};
 use crate::auth::{check_bind_is_safe, Scope, Tokens};
+use crate::cache::WalletCache;
 use crate::config::Config;
 use crate::error::Error;
 use crate::inflight::InFlightUtxos;
@@ -166,10 +167,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(cfg.upstream_timeout_secs),
         retry,
     )?;
+    // For now: profile-derived cache, no refresh-secs override yet
+    // (CLI flags land in stage 7). Refresher is wired in stage 4.
+    let cache = Arc::new(WalletCache::new(crate::cache::CacheProfile::Balanced, None));
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(InFlightUtxos::new()),
+        cache,
     };
     let app_state = AppState {
         api,

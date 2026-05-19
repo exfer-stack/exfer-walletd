@@ -34,6 +34,7 @@ fn make_state_with_retry(
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        cache: Arc::new(exfer_walletd::cache::WalletCache::disabled()),
     };
     (state, wallet_dir)
 }

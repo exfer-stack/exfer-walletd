@@ -21,10 +21,12 @@
 //! Non-negotiable invariant: every L2/L3 write is CAS-on-generation.
 //! See [`entry::EntryStore::try_write`] for the mechanics.
 
+pub mod balance;
 pub mod entry;
 pub mod profile;
 pub mod tip;
 
+pub use balance::{BalanceCache, BalancePeek};
 pub use entry::{EntrySnapshot, EntryStore, Generation};
 pub use profile::{CacheParams, CacheProfile};
 pub use tip::{TipCache, TipSnapshot};
@@ -41,6 +43,7 @@ use crate::upstream::ExferNode;
 pub struct WalletCache {
     pub params: CacheParams,
     pub tip: TipCache,
+    pub balance: BalanceCache,
 }
 
 impl WalletCache {
@@ -58,9 +61,15 @@ impl WalletCache {
         } else {
             std::time::Duration::ZERO
         };
+        let balance_ttl = if params.enabled {
+            params.balance_ttl
+        } else {
+            std::time::Duration::ZERO
+        };
         Self {
             params,
             tip: TipCache::new(tip_ttl),
+            balance: BalanceCache::new(balance_ttl),
         }
     }
 
@@ -94,6 +103,28 @@ impl WalletCache {
             });
         }
         self.tip.get_or_fetch(node).await
+    }
+
+    /// Read balance for a single address. Cached when enabled
+    /// (cache-aside + write-back through L2); direct otherwise. Always
+    /// validates the upstream response address against the requested
+    /// address so a misrouting LB / sharding bug can't poison the
+    /// cache (or, on the bypass path, can't return a wrong-address
+    /// value to the caller).
+    pub async fn get_balance(
+        &self,
+        addr: &str,
+        node: &ExferNode,
+    ) -> crate::error::Result<crate::upstream::BalanceResponse> {
+        if !self.params.enabled {
+            let resp = node.get_balance(addr).await?;
+            balance::verify_address(&resp.address, addr)?;
+            return Ok(resp);
+        }
+        // Sample tip cheaply for the `tip_at_fetch` field. Don't fail
+        // the balance call if tip lookup hiccups — record 0.
+        let tip_height = self.tip.peek().map(|s| s.tip.height).unwrap_or(0);
+        self.balance.read_through(addr, node, tip_height).await
     }
 }
 

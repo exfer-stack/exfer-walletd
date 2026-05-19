@@ -25,6 +25,7 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        cache: Arc::new(exfer_walletd::cache::WalletCache::disabled()),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -150,6 +151,7 @@ async fn boot_scoped(read: Option<&str>, spend: Option<&str>) -> (String, KeepAl
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        cache: Arc::new(exfer_walletd::cache::WalletCache::disabled()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -277,6 +279,7 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        cache: Arc::new(exfer_walletd::cache::WalletCache::disabled()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

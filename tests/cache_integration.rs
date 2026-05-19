@@ -141,6 +141,73 @@ async fn generate_address_seeds_balance_cache() {
 }
 
 #[tokio::test]
+async fn on_transfer_commit_invalidates_from_only_for_self_transfer() {
+    // Self-transfer must NOT invalidate `to` — that would cause the
+    // refresher to refetch a pre-mempool state and dip balance.
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    // Generate one managed address to be both from and to.
+    let r = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+    let addr = r["address"].as_str().unwrap().to_string();
+
+    // Pre-condition: cache has seeded entries (gen=0).
+    assert_eq!(state.cache.balance.peek(&addr).generation, 0);
+
+    state.cache.on_transfer_commit(&addr, &addr, &*state.store);
+
+    // Self-transfer: from=to bumps generation exactly once (single key).
+    let after = state.cache.balance.peek(&addr);
+    assert_eq!(after.generation, 1, "single bump on self-transfer");
+    assert!(after.balance.is_none(), "invalidated");
+}
+
+#[tokio::test]
+async fn on_transfer_commit_invalidates_both_when_to_is_managed() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    let r_from = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+    let from = r_from["address"].as_str().unwrap().to_string();
+    let r_to = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+    let to = r_to["address"].as_str().unwrap().to_string();
+    assert_ne!(from, to);
+
+    state.cache.on_transfer_commit(&from, &to, &*state.store);
+
+    assert_eq!(state.cache.balance.peek(&from).generation, 1);
+    assert_eq!(state.cache.balance.peek(&to).generation, 1);
+    assert!(state.cache.balance.peek(&from).balance.is_none());
+    assert!(state.cache.balance.peek(&to).balance.is_none());
+}
+
+#[tokio::test]
+async fn on_transfer_commit_invalidates_from_only_when_to_is_external() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    let r_from = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+    let from = r_from["address"].as_str().unwrap().to_string();
+    let external_to = "ff".repeat(32);
+
+    state
+        .cache
+        .on_transfer_commit(&from, &external_to, &*state.store);
+
+    assert_eq!(state.cache.balance.peek(&from).generation, 1);
+    // External `to`: never touched the cache, generation remains 0.
+    assert_eq!(state.cache.balance.peek(&external_to).generation, 0);
+}
+
+#[tokio::test]
 async fn cas_loss_protects_against_silent_clobber() {
     // The §9 trap from the Plan-agent design review: refresher mid-fetch
     // must not overwrite a transfer-commit invalidation. This drives the

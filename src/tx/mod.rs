@@ -33,8 +33,10 @@ use exfer::wallet::auth::authenticate_tx_hex;
 use exfer::wallet::wallet::Wallet;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
+use crate::cache::WalletCache;
 use crate::error::{Error, Result};
 use crate::inflight::InFlightUtxos;
+use crate::store::WalletStore;
 use crate::upstream::ExferNode;
 
 /// How many `get_transaction` calls we'll have in flight at once during
@@ -51,6 +53,11 @@ pub struct TransferReceipt {
     pub submitted: bool,
 }
 
+// All eight parameters are essential dependencies (wallet keys, tx
+// shape, network access, mutual-exclusion state, cache + store for the
+// commit hook). Bundling them into a struct would just hide the same
+// arity behind a constructor.
+#[allow(clippy::too_many_arguments)]
 pub async fn transfer(
     wallet: &Wallet,
     recipient: Hash256,
@@ -58,11 +65,19 @@ pub async fn transfer(
     fee_exfers: u64,
     node: &ExferNode,
     inflight: &InFlightUtxos,
+    cache: &WalletCache,
+    store: &dyn WalletStore,
 ) -> Result<TransferReceipt> {
     let sender_addr_hex = hex::encode(wallet.address().as_bytes());
 
-    // 1. List candidate UTXOs.
-    let utxos = node.get_address_utxos(&sender_addr_hex).await?;
+    // 1. List candidate UTXOs — spend path always hits upstream and
+    //    writes back to the L3 cache as a side effect (priming future
+    //    display reads for free). The in-flight subtraction below
+    //    happens under the existing select_and_claim atomic lock; we
+    //    don't double-filter inside read_for_spend.
+    let utxos = cache
+        .get_address_utxos_for_spend(&sender_addr_hex, node)
+        .await?;
     let tip_height = utxos.tip_height;
     let current_height = tip_height.saturating_add(1);
 
@@ -216,6 +231,13 @@ pub async fn transfer(
     // transfer can't pick the same UTXOs before the upstream's
     // confirmed listing catches up. TTL evicts the entry eventually.
     guard.commit();
+
+    // Eager cache invalidation after commit. Bumps L2/L3 generation
+    // for `from` (and `to` if locally managed and different from from)
+    // so any in-flight refresher write loses its CAS and the next
+    // dashboard read sees post-spend state from upstream.
+    let to_hex = hex::encode(recipient.as_bytes());
+    cache.on_transfer_commit(&sender_addr_hex, &to_hex, store);
 
     Ok(TransferReceipt {
         tx_id: our_tx_id_hex,

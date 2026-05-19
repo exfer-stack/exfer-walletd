@@ -239,6 +239,8 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
         p.fee,
         &state.node,
         &state.inflight,
+        &state.cache,
+        &*state.store,
     )
     .await?;
 
@@ -322,7 +324,10 @@ async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_address_utxos params: {e}")))?;
     ensure_64_hex(&p.address)?;
-    let u = state.node.get_address_utxos(&p.address).await?;
+    let u = state
+        .cache
+        .get_address_utxos(&p.address, &state.node, &state.inflight)
+        .await?;
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
 
@@ -330,7 +335,10 @@ async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: ScriptHexParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_script_utxos params: {e}")))?;
     ensure_hex(&p.script_hex)?;
-    let u = state.node.get_script_utxos(&p.script_hex).await?;
+    let u = state
+        .cache
+        .get_script_utxos(&p.script_hex, &state.node, &state.inflight)
+        .await?;
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
 

@@ -25,11 +25,13 @@ pub mod balance;
 pub mod entry;
 pub mod profile;
 pub mod tip;
+pub mod utxo;
 
 pub use balance::{BalanceCache, BalancePeek};
 pub use entry::{EntrySnapshot, EntryStore, Generation};
 pub use profile::{CacheParams, CacheProfile};
 pub use tip::{TipCache, TipSnapshot};
+pub use utxo::{UtxoCache, UtxoPeek};
 
 use std::sync::Arc;
 
@@ -44,6 +46,7 @@ pub struct WalletCache {
     pub params: CacheParams,
     pub tip: TipCache,
     pub balance: BalanceCache,
+    pub utxo: UtxoCache,
 }
 
 impl WalletCache {
@@ -66,10 +69,16 @@ impl WalletCache {
         } else {
             std::time::Duration::ZERO
         };
+        let utxo_ttl = if params.enabled {
+            params.utxo_ttl
+        } else {
+            std::time::Duration::ZERO
+        };
         Self {
             params,
             tip: TipCache::new(tip_ttl),
             balance: BalanceCache::new(balance_ttl),
+            utxo: UtxoCache::new(utxo_ttl),
         }
     }
 
@@ -125,6 +134,101 @@ impl WalletCache {
         // the balance call if tip lookup hiccups — record 0.
         let tip_height = self.tip.peek().map(|s| s.tip.height).unwrap_or(0);
         self.balance.read_through(addr, node, tip_height).await
+    }
+
+    /// Read UTXOs for an address — *display* semantics. Cached when
+    /// enabled (with in-flight outpoints subtracted); direct otherwise.
+    pub async fn get_address_utxos(
+        &self,
+        addr: &str,
+        node: &ExferNode,
+        inflight: &crate::inflight::InFlightUtxos,
+    ) -> crate::error::Result<crate::upstream::UtxoListResponse> {
+        if !self.params.enabled {
+            let resp = node.get_address_utxos(addr).await?;
+            if let Some(returned) = resp.address.as_deref() {
+                balance::verify_address(returned, addr)?;
+            }
+            return Ok(resp);
+        }
+        let tip_height = self.tip.peek().map(|s| s.tip.height).unwrap_or(0);
+        self.utxo
+            .read_address_for_display(addr, node, inflight, tip_height)
+            .await
+    }
+
+    /// Read UTXOs for an address — *spend* semantics. Always upstream,
+    /// always write-back to prime display reads. Used internally by the
+    /// `transfer` engine.
+    pub async fn get_address_utxos_for_spend(
+        &self,
+        addr: &str,
+        node: &ExferNode,
+    ) -> crate::error::Result<crate::upstream::UtxoListResponse> {
+        if !self.params.enabled {
+            let resp = node.get_address_utxos(addr).await?;
+            if let Some(returned) = resp.address.as_deref() {
+                balance::verify_address(returned, addr)?;
+            }
+            return Ok(resp);
+        }
+        let tip_height = self.tip.peek().map(|s| s.tip.height).unwrap_or(0);
+        self.utxo
+            .read_address_for_spend(addr, node, tip_height)
+            .await
+    }
+
+    /// Read UTXOs for a script_hex — display semantics with in-flight
+    /// subtraction. Same `--cache-profile=off` bypass as
+    /// [`Self::get_address_utxos`].
+    pub async fn get_script_utxos(
+        &self,
+        script_hex: &str,
+        node: &ExferNode,
+        inflight: &crate::inflight::InFlightUtxos,
+    ) -> crate::error::Result<crate::upstream::UtxoListResponse> {
+        if !self.params.enabled {
+            return node.get_script_utxos(script_hex).await;
+        }
+        let tip_height = self.tip.peek().map(|s| s.tip.height).unwrap_or(0);
+        self.utxo
+            .read_script_for_display(script_hex, node, inflight, tip_height)
+            .await
+    }
+
+    /// Eager invalidation hook called from the `transfer` engine after
+    /// `guard.commit()` (i.e. after upstream confirms broadcast and the
+    /// in-flight UTXOs are persisted). Invalidates L2/L3 entries for
+    /// `from_hex` unconditionally and for `to_hex` only when `to ≠ from`
+    /// AND `to ∈ store`. The self-transfer skip is deliberate: see the
+    /// module-level docstring for utxo.rs and the design note in the
+    /// plan file.
+    pub fn on_transfer_commit(
+        &self,
+        from_hex: &str,
+        to_hex: &str,
+        store: &dyn crate::store::WalletStore,
+    ) {
+        if !self.params.enabled {
+            return;
+        }
+        self.balance.invalidate(from_hex);
+        self.utxo.invalidate_address(from_hex);
+        if from_hex != to_hex && store.exists(to_hex) {
+            self.balance.invalidate(to_hex);
+            self.utxo.invalidate_address(to_hex);
+            tracing::debug!(
+                from = from_hex,
+                to = to_hex,
+                "transfer-commit: invalidated both addresses"
+            );
+        } else {
+            tracing::debug!(
+                from = from_hex,
+                to = to_hex,
+                "transfer-commit: invalidated from only"
+            );
+        }
     }
 }
 

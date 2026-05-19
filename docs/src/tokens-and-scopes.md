@@ -1,9 +1,8 @@
 # Tokens and scopes
 
-`exfer-walletd` uses bearer-token authentication on every request
-except `GET /healthz`. Comparison is **constant-time**
-([`subtle::ConstantTimeEq`](https://docs.rs/subtle)) so a timing
-oracle can't peel the token byte by byte.
+Walletd uses bearer-token authentication on every request except
+`GET /healthz`. Comparison is constant-time
+([`subtle::ConstantTimeEq`](https://docs.rs/subtle)).
 
 ## Default: one auto-generated token
 
@@ -16,12 +15,11 @@ TOKEN=$(cat ~/.exfer-walletd/token)
 curl -H "Authorization: Bearer $TOKEN" ...
 ```
 
-Subsequent runs read the file silently. To override (e.g. take the
-token from a secret manager instead):
+To take the token from a secret manager instead:
 
 ```bash
 exfer-walletd --auth-token "$(vault read -field=token secret/walletd)"
-# or via env
+# or
 WALLETD_AUTH_TOKEN=... exfer-walletd
 ```
 
@@ -36,10 +34,8 @@ exfer-walletd \
     --auth-token-spend "$(openssl rand -hex 32)"
 ```
 
-(Or set `WALLETD_AUTH_TOKEN_READ` / `WALLETD_AUTH_TOKEN_SPEND`.)
-
-When either scoped token is set, walletd ignores the on-disk
-`<datadir>/token` and enforces the two-scope model:
+When either scoped token is set, walletd ignores `<datadir>/token`
+and enforces the two-scope model:
 
 | Env var                       | Scope  | Methods                                                      |
 | ----------------------------- | ------ | ------------------------------------------------------------ |
@@ -47,76 +43,28 @@ When either scoped token is set, walletd ignores the on-disk
 | `WALLETD_AUTH_TOKEN_SPEND`    | spend  | All methods. Spend implies read.                              |
 | `WALLETD_AUTH_TOKEN`          | all    | Single-token mode (also the auto-generated file's behaviour). |
 
-## Sending the token
-
-Every request:
-
-```http
-POST / HTTP/1.1
-Host: localhost:8080
-Content-Type: application/json
-Authorization: Bearer <your token>
-
-{"jsonrpc":"2.0","method":"ping","id":1}
-```
-
-## What each scope can do
-
-Method scope is hardcoded — clients can't override it.
-
-| Method                  | Read | Spend | All  |
-| ----------------------- | :--: | :---: | :--: |
-| `ping`                  |  ✓   |   ✓   |  ✓   |
-| `generate_address`      |  ✓   |   ✓   |  ✓   |
-| `list_addresses`        |  ✓   |   ✓   |  ✓   |
-| `get_balance`           |  ✓   |   ✓   |  ✓   |
-| `get_address_utxos`     |  ✓   |   ✓   |  ✓   |
-| `get_script_utxos`      |  ✓   |   ✓   |  ✓   |
-| `get_block_height`      |  ✓   |   ✓   |  ✓   |
-| `get_block`             |  ✓   |   ✓   |  ✓   |
-| `get_transaction`       |  ✓   |   ✓   |  ✓   |
-| `transfer`              |      |   ✓   |  ✓   |
-| `send_raw_transaction`  |      |   ✓   |  ✓   |
-
-Read scope hitting a spend method → `401 Unauthorized` / `-32001`.
+A read-scope token hitting a spend method → `401 Unauthorized` /
+`-32001`. Method scope is hardcoded — clients can't override it.
 
 ## Bind safety
 
-Walletd enforces a three-tier bind policy at startup:
+Walletd enforces at startup:
 
 | Bind address                              | Policy                                             |
 | ----------------------------------------- | -------------------------------------------------- |
-| Loopback (`127.0.0.1`, `::1`)             | Always allowed. No wire to encrypt.                |
-| Private (RFC1918, ULA, link-local)        | Allowed. Warns if no token — LAN clients unauthenticated. |
-| Public (any global IP, `0.0.0.0`, `::`)   | **Refused** unless `--allow-public-bind` is set.   |
+| Loopback (`127.0.0.1`, `::1`)             | Always allowed.                                    |
+| Private (RFC1918, ULA, link-local)        | Allowed; warns if no token is set.                 |
+| Public (any global IP, `0.0.0.0`, `::`)   | Refused unless `--tls` OR `--allow-public-bind`.   |
 
-The reason public binds require an explicit opt-in: walletd does not
-terminate TLS itself. Without a TLS terminator in front (Caddy, nginx,
-Cloudflare, k8s ingress, a cloud LB), the bearer token rides the wire
-as plaintext.
-
-The opt-in flag is your assertion that "a TLS terminator is in front
-of me." If you forget to set it, walletd refuses to start — fail-closed.
-
-The default `--bind` is `127.0.0.1:8080`. For cross-host calls, bind a
-private/internal IP — no opt-in needed.
-
-## Rotating tokens
-
-Single-token (auto-generated) mode — just delete the file and restart:
-
-```bash
-rm ~/.exfer-walletd/token
-exfer-walletd      # generates + prints a fresh one
-```
-
-Two-token mode — change the env values / CLI flags and restart.
-
-Either way: any in-flight request authenticated with the old token
-will fail after the restart and need to retry with the new one. Plan
-the window.
+The reason public binds need an opt-in: by default walletd doesn't
+terminate TLS, and a plaintext bearer token on the public wire is
+fatal. `--tls` (walletd terminates TLS itself, see
+[Quick start → Production](./quick-start.md#production-enable-tls))
+solves it directly; `--allow-public-bind` is your assertion that an
+external TLS terminator sits in front. Without one, walletd
+fail-closes.
 
 ## Next
 
 - [RPC reference →](./rpc-reference.md)
-- [Error codes →](./errors.md)
+- [Operations →](./operations.md)

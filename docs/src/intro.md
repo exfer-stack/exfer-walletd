@@ -1,9 +1,10 @@
 # exfer-walletd
 
-A JSON-RPC HTTP daemon that holds wallet keys and signs Exfer
+A JSON-RPC daemon that holds Ed25519 wallet keys and signs Exfer
 transactions on behalf of a backend. Same pattern as
 [`cardano-wallet`](https://github.com/cardano-foundation/cardano-wallet)
-for Cardano: a separate signing service, decoupled from the chain node.
+for Cardano — a separate signing service, decoupled from the chain
+node.
 
 ```
 your backend ──► exfer-walletd ──► exfer node(s)
@@ -11,27 +12,30 @@ your backend ──► exfer-walletd ──► exfer node(s)
                   signs locally)      broadcast — no keys)
 ```
 
-The Exfer node's own JSON-RPC is intentionally read-only + broadcast:
-it can't sign for you because nodes never hold keys. `exfer-walletd`
-closes that gap — Ed25519 keypair pool, local tx build + sign,
-broadcast through whatever node(s) you point it at (loopback, LAN,
-VPC, or a third-party public RPC).
+The Exfer node's JSON-RPC is read-only + broadcast; it can't sign,
+because nodes don't hold keys. Walletd closes that gap.
 
-One binary, one command:
+One binary, zero ceremony:
 
 ```bash
 exfer-walletd
 ```
 
-No `init` step, no env file, no systemd unit. Token auto-generated
-on first run.
+Token auto-generated on first run. Wallets persisted under
+`~/.exfer-walletd/`. Optional in-process TLS via `--tls` (the SDK
+pins by SHA-256 fingerprint, no CA required).
 
-## Where to go from here
+## Read next
 
-- [Install](./install.md) → [Quick start](./quick-start.md) → [RPC reference](./rpc-reference.md) — the shortest path.
-- [Picking a node](./picking-a-node.md) — local vs. remote vs. multi-URL.
-- [Tokens and scopes](./tokens-and-scopes.md) — single-token default, optional read/spend split, bind safety.
-- [Security model](./security-model.md) — what's protected, what's deliberately not.
-- [FAQ & troubleshooting](./faq.md) — corners that trip people up.
+[Install](./install.md) → [Quick start](./quick-start.md) →
+[RPC reference](./rpc-reference.md). Everything else
+([picking a node](./picking-a-node.md),
+[tokens](./tokens-and-scopes.md),
+[security](./security-model.md),
+[operations](./operations.md),
+[FAQ](./faq.md))
+is for when something is unclear or you're going to production.
 
-[github.com/exfer-stack/exfer-walletd](https://github.com/exfer-stack/exfer-walletd) · [Releases](https://github.com/exfer-stack/exfer-walletd/releases) · MIT licensed.
+[github.com/exfer-stack/exfer-walletd](https://github.com/exfer-stack/exfer-walletd)
+· [Releases](https://github.com/exfer-stack/exfer-walletd/releases)
+· MIT licensed.

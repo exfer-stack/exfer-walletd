@@ -1,47 +1,47 @@
 # Quick start
 
-For most real deployments — node, walletd, and backend on different
-hosts — you'll set two flags:
+## Dev (laptop / single VM)
 
-```bash
-exfer-walletd \
-    --node-rpc http://<your-node-host>:<port> \
-    --bind     <walletd-host-internal-ip>:8080
-```
-
-- `--node-rpc` — the upstream Exfer node's JSON-RPC URL. The default
-  (`http://127.0.0.1:9334`) only works if a node is running on the
-  same host on that exact port.
-- `--bind` — the address walletd listens on. The default
-  (`127.0.0.1:8080`) is loopback-only, so a backend on a different
-  server can't reach it. Use the walletd host's private/internal IP.
-  Private/RFC1918 addresses are allowed without any extra flag;
-  public IPs require `--allow-public-bind` (and a TLS terminator).
-
-On first run, walletd creates `~/.exfer-walletd/` (mode `0700`),
-generates a 32-byte bearer token at `~/.exfer-walletd/token` (mode
-`0600`) and **prints it once** to stderr, then starts serving JSON-RPC.
-
-If you ever need the token again: `cat ~/.exfer-walletd/token`.
-
-## Dev shortcut
-
-If node, walletd, and the caller are all on one host (laptop dev,
-single-VM smoke test), every flag has a sensible default and you can
-just run:
+Node, walletd, and your code all on one host? Zero flags:
 
 ```bash
 exfer-walletd
 ```
 
-(Defaults: `--bind 127.0.0.1:8080`, `--node-rpc http://127.0.0.1:9334`,
-`--datadir ~/.exfer-walletd`.)
+Defaults: `--bind 127.0.0.1:8080`, `--node-rpc http://127.0.0.1:9334`,
+`--datadir ~/.exfer-walletd`. Assumes a node is already running on
+`127.0.0.1:9334`.
+
+On first run, walletd creates `~/.exfer-walletd/` (mode `0700`),
+generates a 32-byte bearer token, prints it once in an ASCII box on
+stderr, and starts serving.
+
+## Your datadir at a glance
+
+Everything walletd manages lives in one directory. After first run:
+
+```bash
+$ ls -la ~/.exfer-walletd/
+drwx------  rufus  4096   .
+-rw-------  rufus    65   token              ← bearer token (hex)
+drwx------  rufus  4096   wallets/           ← one .key file per generate_address
+
+$ cat ~/.exfer-walletd/token
+a85da0752815bbf652a1b147649cde77c17f784f3e608d362c629c798a555e7b
+```
+
+If you also passed `--tls` (see below), three more files appear:
+`cert.pem`, `cert.key`, `cert.fingerprint`.
+
+Backup = `tar czf ... ~/.exfer-walletd`. Uninstall = `rm -rf` it.
+There's nothing else walletd touches.
 
 ## Call it
 
 ```bash
 TOKEN=$(cat ~/.exfer-walletd/token)
-curl -s http://<walletd-host>:8080/ -H 'content-type: application/json' \
+curl -s http://127.0.0.1:8080/ \
+     -H 'content-type: application/json' \
      -H "Authorization: Bearer $TOKEN" \
      -d '{"jsonrpc":"2.0","method":"ping","id":1}'
 # → {"jsonrpc":"2.0","result":{"ok":true},"id":1}
@@ -49,20 +49,33 @@ curl -s http://<walletd-host>:8080/ -H 'content-type: application/json' \
 
 Full method list: [RPC reference](./rpc-reference.md).
 
-## Production: enable TLS
+## Cross-host: bind a non-loopback interface
 
-For cross-host traffic, pass `--tls` and walletd terminates TLS itself
-with a self-signed certificate it generates on first run. No CA, no
-rotation ceremony, no reverse proxy.
+Default bind is loopback-only, so a backend on a different server
+can't reach it. Bind your host's private/internal IP:
+
+```bash
+exfer-walletd --bind 10.0.1.5:8080
+```
+
+Private/RFC1918 addresses are allowed with no extra flag. **Public
+IPs** (`0.0.0.0`, any globally routable IP) need either `--tls` (next
+section) or `--allow-public-bind` (acknowledging that an external TLS
+terminator sits in front).
+
+## Production: enable `--tls`
+
+Pass `--tls` and walletd terminates TLS itself with a self-signed
+cert it generates on first run. No CA, no rotation ceremony, no
+reverse proxy.
 
 ```bash
 exfer-walletd --tls --bind 0.0.0.0:8443
 ```
 
-On first start with `--tls`, walletd creates three files alongside
-`token` in the datadir — `cert.pem`, `cert.key`, `cert.fingerprint`
-(all mode `0600`) — and prints the SHA-256 fingerprint to stderr in
-the same box style as the token:
+On first start with `--tls`, walletd creates `cert.pem`, `cert.key`,
+and `cert.fingerprint` in the datadir (all `0600`) and prints the
+SHA-256 fingerprint once in an ASCII box on stderr:
 
 ```
   ┌─ first run ───────────────────────────────────────────────────────────
@@ -76,7 +89,9 @@ the same box style as the token:
   └───────────────────────────────────────────────────────────────────────
 ```
 
-Pin that string on the client. The Python SDK reads it automatically:
+Lost the line? `cat ~/.exfer-walletd/cert.fingerprint`.
+
+Pin it on the client. The Python SDK reads it automatically:
 
 ```python
 from exfer_walletd import Client
@@ -84,29 +99,20 @@ with Client.from_datadir(url="https://walletd.internal:8443") as c:
     print(c.healthz())
 ```
 
-(or pass `WALLETD_FINGERPRINT=sha256:…` as an env var if your backend
-isn't colocated with walletd's datadir.)
+`--tls` relaxes `--allow-public-bind` — TLS already protects the
+token on the wire.
 
-`--tls` relaxes the `--allow-public-bind` requirement, since the
-bearer token is no longer plaintext on the wire.
-
-## Other useful flags
+## Other flags
 
 ```bash
 exfer-walletd --node-rpc 'http://a:9334,http://b:9334'  # round-robin + failover
 exfer-walletd --datadir  /var/lib/walletd               # different storage location
-exfer-walletd --allow-public-bind --bind 0.0.0.0:8080   # public bind (external TLS terminator)
+exfer-walletd --auth-token-read  ...                    # split read/spend tokens
+exfer-walletd --auth-token-spend ...
 ```
 
-Every flag also reads from a matching env var (`EXFER_NODE_RPC`,
-`WALLETD_BIND`, `WALLETD_DATADIR`, `WALLETD_TLS`, …). Full list:
-`exfer-walletd --help`.
-
-## Running on boot
-
-Walletd is a single foreground binary — no systemd unit, no env
-file, no install ceremony. Wire it up under whatever supervisor you
-already use (tmux / systemd / supervisord / docker / k8s).
+Every flag also reads from a matching env var (`WALLETD_BIND`,
+`WALLETD_TLS`, `EXFER_NODE_RPC`, …). Full list: `exfer-walletd --help`.
 
 ## Next
 

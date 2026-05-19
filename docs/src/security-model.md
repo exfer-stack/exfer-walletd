@@ -1,93 +1,80 @@
 # Security model
 
-## What's protected
+## What you get out of the box
 
-| Layer            | Mechanism                                                                                                  |
-| ---------------- | ---------------------------------------------------------------------------------------------------------- |
-| Token at rest    | `<datadir>/token` written `0600`. `<datadir>` itself is `0700`.                                            |
-| Token in transit | Bind loopback (default) and keep the caller on the same host, **or** put a TLS terminator in front for cross-host. |
-| Token compare    | `subtle::ConstantTimeEq` — no timing oracle.                                                               |
-| Bind safety      | Three-tier policy: loopback always OK, private warns, public refused without explicit `--allow-public-bind`. |
-| Path traversal   | Wallet filename = 64-hex address, validated before any FS op.                                              |
-| Audit trail      | Every spend-scope request emits a structured log line: method, client IP, request id, outcome.             |
-| Wallet keys      | Files `0600`, dir `0700`, owned by the running user. Encrypt the backing volume (LUKS, dm-crypt, cloud volume encryption). |
-| Private keys     | Never transmitted. Signing happens in-process; only the signed transaction bytes go to the upstream node.  |
-| Mempool races    | In-flight UTXO tracker prevents back-to-back transfers from the same wallet from racing onto the same outpoint. |
+- Bearer token at rest is `<datadir>/token` mode `0600`; datadir itself
+  is `0700`. Constant-time comparison on every request.
+- Public binds fail-close unless TLS is on (`--tls`) or you opt in
+  with `--allow-public-bind`. See
+  [Tokens and scopes → Bind safety](./tokens-and-scopes.md#bind-safety).
+- Wallet `.key` files mode `0600` in `<datadir>/wallets/`. Filenames
+  are validated 64-hex addresses — no path traversal.
+- Signing happens in-process. Only the signed transaction bytes go
+  to the upstream node; private keys never leave the daemon.
+- In-flight UTXO tracker prevents back-to-back transfers from the
+  same wallet racing onto the same outpoint
+  (see [internals below](#in-flight-utxo-tracker)).
+- Every spend-scope request emits a structured audit log line
+  (method, client IP, request id, outcome) at `INFO`.
 
 ## What's *not* protected (by design)
 
 These are deliberate trade-offs, not bugs. Know what model you're
 running.
 
-- **Wallet keys are plaintext on disk.** A server has no human to type
-  a passphrase, so the daemon stores keys unencrypted and relies on
-  filesystem permissions plus volume-level encryption. Anyone who can
-  read the daemon's wallet directory can spend every wallet.
-- **One spend token = total spend authority.** Any holder of the
-  spend token can spend any managed wallet. No per-key authorization,
-  no quorum, no MPC. If you need finer-grained authority, implement
-  the [`WalletStore`](https://github.com/exfer-stack/exfer-walletd/blob/main/src/store/mod.rs)
-  trait against an HSM or KMS backend and slot it in.
-- **TLS is opt-in via `--tls`.** Walletd defaults to plaintext HTTP
-  on loopback. For cross-host traffic, pass `--tls` and walletd
-  terminates TLS in-process with a self-signed certificate it
-  generates on first run; pin it on the client side by SHA-256
-  fingerprint (`exfer-walletd-py` accepts `fingerprint=…`). External
-  TLS terminators (Caddy, nginx, cloud LB, ingress) still work; pair
-  with `--allow-public-bind` to acknowledge them.
-- **No rate limit, no IP allowlist.** A 32-random-byte token is
-  computationally infeasible to brute-force online, but if the
-  deployment is reachable from the public internet you still want
-  Cloudflare / a WAF / firewall rules in front of it for DoS
-  protection.
-- **Upstream node RPC is unauthenticated.** Walletd → node uses plain
-  HTTP and assumes the node's RPC port is reachable only over a
-  trusted hop (loopback, VPC, or HTTPS to a public provider). Don't
-  expose your own node's RPC port to the public internet without a
-  proxy in front.
+- **Wallet keys are plaintext on disk.** A daemon has no human to
+  type a passphrase — keys live unencrypted, protected by FS
+  permissions plus volume-level encryption (LUKS, dm-crypt, cloud
+  volume encryption). Anyone who can read the wallet directory can
+  spend every wallet.
+- **One spend token = total spend authority.** No per-key
+  authorization, no quorum, no MPC. If you need finer-grained
+  authority, implement the
+  [`WalletStore`](https://github.com/exfer-stack/exfer-walletd/blob/main/src/store/mod.rs)
+  trait against an HSM or KMS and slot it in.
+- **TLS is opt-in.** Walletd defaults to plaintext HTTP on loopback.
+  For cross-host traffic, either pass `--tls` (in-process,
+  fingerprint-pinned by the SDK) or terminate TLS externally and
+  pair with `--allow-public-bind`.
+- **No rate limit, no IP allowlist.** A 32-byte token is infeasible
+  to brute-force online, but for public exposure you still want a
+  WAF / firewall / Cloudflare in front for DoS protection.
+- **Upstream node RPC is unauthenticated.** Walletd → node assumes
+  a trusted hop (loopback, VPC, or HTTPS to a public provider).
 
 ## In-flight UTXO tracker
 
-When `transfer` selects an outpoint as an input, walletd records that
-outpoint in an in-memory set with a 10-minute TTL. Subsequent
-transfers from the same wallet skip outpoints that are still in this
-set, so two back-to-back transfers can't race onto the same UTXO
-and trigger the upstream's mempool double-spend rejection.
+When `transfer` picks an outpoint as an input, walletd records it in
+an in-memory set with a 10-minute TTL. Subsequent transfers from the
+same wallet skip outpoints in this set, so two back-to-back transfers
+can't race onto the same UTXO and trigger the upstream's mempool
+double-spend rejection.
 
-Behaviours worth knowing:
-
-- **Pre-broadcast errors release the claim.** If UTXO authentication
-  fails or the build/sign step errors, the RAII guard releases the
-  outpoints on its way out of the function. They're immediately
-  re-selectable.
-- **Broadcast success keeps the claim until TTL.** Even if the
-  consuming tx confirms in 30s, the claim stays in the in-flight set
-  for the full 10 minutes. Small wasted-availability window but
-  always safe.
-- **Transport-error broadcast also releases.** If `send_raw_transaction`
-  to the upstream failed with a transport error, walletd can't be
-  sure the broadcast went through — but on the safe side it releases
-  the claim. If the broadcast *did* land in mempool, a retry will get
-  the upstream's own double-spend rejection (surfaced as `-32020`
-  with the upstream message).
-- **No persistence across restarts.** The set is in-memory. A pending
-  tx from a pre-restart process will not be skipped by a fresh
-  process. Acceptable for most deployments; if you need stronger
-  guarantees, run a single daemon instance.
+- **Pre-broadcast errors release the claim** (RAII guard). Build /
+  sign / authentication failures leave the outpoints re-selectable.
+- **Successful broadcast holds the claim until TTL.** Even if the
+  consuming tx confirms in 30s, the slot stays held for 10 minutes —
+  small wasted availability, always safe.
+- **Transport-error broadcast also releases.** Walletd can't be sure
+  the broadcast landed; releasing is the safe call (a retry will get
+  the upstream's own double-spend rejection if it did).
+- **In-memory only — no persistence across restarts.** A pending tx
+  from a pre-restart process is invisible to a fresh one. Run a
+  single daemon instance per datadir.
 
 ## Common misconfigurations to avoid
 
-- **Don't pass `--auth-token=…` on the command line.** It shows up in
-  `ps aux` for anyone on the host. Use the auto-generated `<datadir>/token`,
-  or pass it via env var.
-- **Don't put the wallet directory on shared storage** (NFS, S3-FUSE).
-  Mode bits don't translate; concurrent writers will corrupt keys.
+- **Don't pass `--auth-token=…` on the command line.** It shows up
+  in `ps aux`. Use the auto-generated `<datadir>/token` or an env
+  var.
+- **Don't put the wallet directory on shared storage** (NFS,
+  S3-FUSE). Mode bits don't translate; concurrent writers will
+  corrupt keys.
+- **Don't deploy two walletd processes against the same datadir.**
+  They don't coordinate on the in-flight tracker.
 - **Don't expose port 80 plaintext to the public internet.** Some
-  cloud proxies' "force HTTPS" toggles only redirect GET/HEAD; a stray
-  POST will leak the token before the redirect happens. Close port 80
-  at the proxy or have your reverse proxy refuse non-TLS connections.
-- **Don't deploy two walletd processes pointing at the same datadir.**
-  They won't coordinate on the in-flight tracker.
+  cloud proxies' "force HTTPS" toggle only redirects GET/HEAD; a
+  stray POST will leak the token before redirect happens.
 
 ## Next
 

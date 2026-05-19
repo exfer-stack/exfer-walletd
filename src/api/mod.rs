@@ -251,7 +251,24 @@ async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
         .map_err(|e| Error::BadEnvelope(format!("get_transaction params: {e}")))?;
     ensure_64_hex(&p.hash)?;
     let tx = state.node.get_transaction(&p.hash).await?;
-    serde_json::to_value(&tx).map_err(|e| Error::Internal(e.to_string()))
+
+    // Always decode. Outputs are free; inputs need parent-tx fetches
+    // (concurrent, cap 8) and degrade gracefully if any parent is
+    // unreachable — partial decode is more useful than a failed call.
+    let decoded = crate::tx::decode::decode_with_inputs(&state.node, &tx.tx_hex).await?;
+
+    let mut v = serde_json::to_value(&tx).map_err(|e| Error::Internal(e.to_string()))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| Error::Internal("tx response is not an object".into()))?;
+    let decoded_value =
+        serde_json::to_value(&decoded).map_err(|e| Error::Internal(e.to_string()))?;
+    if let Some(decoded_obj) = decoded_value.as_object() {
+        for (k, val) in decoded_obj {
+            obj.insert(k.clone(), val.clone());
+        }
+    }
+    Ok(v)
 }
 
 async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {

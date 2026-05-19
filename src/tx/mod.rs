@@ -24,6 +24,8 @@
 //!              ──► self-check: node's tx_id == computed tx_id
 //! ```
 
+pub mod decode;
+
 use exfer::chain::state::{UtxoEntry, UtxoSet};
 use exfer::types::transaction::OutPoint;
 use exfer::types::Hash256;

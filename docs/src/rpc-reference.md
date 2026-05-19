@@ -373,10 +373,38 @@ or mempool entries; `in_mempool` distinguishes.
 ```ts
 {
   tx_id:        hex64,
-  tx_hex:       hex,         // serialised transaction bytes
-  in_mempool:   bool,        // true = unconfirmed, false = on chain
+  tx_hex:       hex,          // serialised transaction bytes
+  in_mempool:   bool,         // true = unconfirmed, false = on chain
   block_hash:   hex64 | null, // null if in_mempool
   block_height: u64   | null, // null if in_mempool
+
+  // Decoded view — added so callers don't have to parse tx_hex.
+  // Outputs are decoded inline (no extra upstream calls). Inputs need
+  // a parent-tx fetch per outpoint to recover the spending address +
+  // value; walletd does that in parallel (cap 8). Per-parent failures
+  // degrade gracefully — `address`/`value` come back missing for that
+  // input and `fee` / `total_in` are omitted from the response.
+  inputs: [
+    {
+      prev_tx_id:    hex64,
+      output_index:  u32,
+      address?:      hex64,   // present for standard P2PKH inputs
+      script_hex?:   hex,     // present for non-P2PKH inputs
+      value?:        u64,     // exfers
+    },
+    ...
+  ],
+  outputs: [
+    {
+      address?:    hex64,     // present for standard P2PKH outputs
+      script_hex?: hex,       // present for non-P2PKH outputs
+      value:       u64,       // exfers
+    },
+    ...
+  ],
+  total_out:  u64,            // sum of outputs[].value — always present
+  total_in?:  u64,            // omitted if any input failed to resolve
+  fee?:       u64,            // total_in - total_out; omitted with total_in
 }
 ```
 
@@ -396,11 +424,31 @@ curl -s $URL -H "Authorization: Bearer $TOKEN" \
     "tx_hex":       "01000200fcbe0c52689b...",
     "in_mempool":   false,
     "block_hash":   "1bac70390bb6d4039e82d9b881a73a69a7c569c51961163e2d0fc09a36e9b67c",
-    "block_height": 577429
+    "block_height": 577429,
+    "inputs": [
+      {
+        "prev_tx_id":   "fcbe0c52689b9d4b8e7c0411e2b1cf76d0bf2bbf25ad8cb2c3b62905ee2c1f00",
+        "output_index": 1,
+        "address":      "658f0a295fefbaa4f94a020e45aa82938ec34946a05733906ef2fc5300b2ba5f",
+        "value":        100000000
+      }
+    ],
+    "outputs": [
+      { "address": "27e1c883f3f1bdb124e5430dacc92e1e8ca25a73e50052cadba78e065ce09eaf", "value": 30000000 },
+      { "address": "658f0a295fefbaa4f94a020e45aa82938ec34946a05733906ef2fc5300b2ba5f", "value": 69900000 }
+    ],
+    "total_in":  100000000,
+    "total_out":  99900000,
+    "fee":           100000
   },
   "id": 1
 }
 ```
+
+For typical 1-input deposit/withdraw transactions this adds a single
+parallel upstream `get_transaction` call; latency is ≈ `2 × RTT` to the
+upstream node (see [Picking a node](./picking-a-node.md) for the latency
+math).
 
 ---
 

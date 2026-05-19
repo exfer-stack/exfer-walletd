@@ -9,6 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use exfer::types::transaction::{Transaction, TxInput, TxOutput, TxWitness};
+use exfer::types::Hash256;
 use exfer_walletd::api::{dispatch, ApiState, RpcRequest};
 use exfer_walletd::error::Error;
 use exfer_walletd::store::FsWalletStore;
@@ -510,4 +512,214 @@ async fn send_raw_transaction_rejects_non_hex() {
         matches!(err, Error::BadHex(_)),
         "expected BadHex, got {err:?}"
     );
+}
+
+// --- get_transaction: decoded inputs/outputs/fee --------------------------
+
+/// Build a serialized exfer transaction. Witnesses are filled in (one per
+/// input) since the wire format requires it; the decoder under test only
+/// reads inputs and outputs.
+fn build_tx(inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> Transaction {
+    let witnesses = inputs
+        .iter()
+        .map(|_| TxWitness {
+            witness: Vec::new(),
+            redeemer: None,
+        })
+        .collect();
+    Transaction {
+        inputs,
+        outputs,
+        witnesses,
+    }
+}
+
+fn p2pkh(value: u64, addr_byte: u8) -> TxOutput {
+    TxOutput {
+        value,
+        script: vec![addr_byte; 32],
+        datum: None,
+        datum_hash: None,
+    }
+}
+
+#[tokio::test]
+async fn get_transaction_returns_decoded_inputs_outputs_and_fee() {
+    // Parent tx: two outputs (10_000 -> 0xaa, 5_000 -> 0xbb).
+    let parent = build_tx(
+        vec![TxInput {
+            prev_tx_id: Hash256([0x00; 32]),
+            output_index: 0,
+        }],
+        vec![p2pkh(10_000, 0xaa), p2pkh(5_000, 0xbb)],
+    );
+    let parent_hex = hex::encode(parent.serialize().unwrap());
+    let parent_id_hex = hex::encode(parent.tx_id().unwrap().as_bytes());
+
+    // Child spends parent[0] (the 10_000 -> 0xaa output) and pays
+    // 7_000 -> 0xcc + 2_500 -> 0xaa change. Implicit fee = 500.
+    let child = build_tx(
+        vec![TxInput {
+            prev_tx_id: parent.tx_id().unwrap(),
+            output_index: 0,
+        }],
+        vec![p2pkh(7_000, 0xcc), p2pkh(2_500, 0xaa)],
+    );
+    let child_hex = hex::encode(child.serialize().unwrap());
+    let child_id_hex = hex::encode(child.tx_id().unwrap().as_bytes());
+
+    let mock = MockServer::start().await;
+
+    // Look up child first, then parent (the decoder fetches parents to
+    // resolve input addresses + value).
+    let child_id_for_match = child_id_hex.clone();
+    let child_hex_for_resp = child_hex.clone();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method": "get_transaction",
+            "params": { "hash": child_id_for_match }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tx_id":        child_id_hex,
+                "tx_hex":       child_hex_for_resp,
+                "in_mempool":   false,
+                "block_hash":   "0".repeat(64),
+                "block_height": 100,
+            },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let parent_id_for_match = parent_id_hex.clone();
+    let parent_hex_for_resp = parent_hex.clone();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method": "get_transaction",
+            "params": { "hash": parent_id_for_match }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tx_id":        parent_id_hex,
+                "tx_hex":       parent_hex_for_resp,
+                "in_mempool":   false,
+                "block_hash":   "1".repeat(64),
+                "block_height": 99,
+            },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(
+        &state,
+        rpc("get_transaction", json!({ "hash": child.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>() })),
+    )
+    .await
+    .unwrap();
+
+    // Pass-through fields are untouched.
+    assert_eq!(result["in_mempool"], false);
+    assert_eq!(result["block_height"], 100);
+
+    // Outputs are decoded.
+    let outs = result["outputs"].as_array().unwrap();
+    assert_eq!(outs.len(), 2);
+    assert_eq!(outs[0]["address"], "cc".repeat(32));
+    assert_eq!(outs[0]["value"], 7_000);
+    assert_eq!(outs[1]["address"], "aa".repeat(32));
+    assert_eq!(outs[1]["value"], 2_500);
+
+    // Inputs are resolved from the parent fetch.
+    let ins = result["inputs"].as_array().unwrap();
+    assert_eq!(ins.len(), 1);
+    assert_eq!(ins[0]["prev_tx_id"], parent.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>());
+    assert_eq!(ins[0]["output_index"], 0);
+    assert_eq!(ins[0]["address"], "aa".repeat(32));
+    assert_eq!(ins[0]["value"], 10_000);
+
+    // Fee + totals computed.
+    assert_eq!(result["total_in"], 10_000);
+    assert_eq!(result["total_out"], 9_500);
+    assert_eq!(result["fee"], 500);
+}
+
+#[tokio::test]
+async fn get_transaction_omits_fee_when_parent_unreachable() {
+    // Child references a parent the upstream doesn't know about.
+    let unknown_parent = Hash256([0xee; 32]);
+    let child = build_tx(
+        vec![TxInput {
+            prev_tx_id: unknown_parent,
+            output_index: 0,
+        }],
+        vec![p2pkh(3_000, 0xdd)],
+    );
+    let child_hex = hex::encode(child.serialize().unwrap());
+    let child_id_hex = hex::encode(child.tx_id().unwrap().as_bytes());
+
+    let mock = MockServer::start().await;
+
+    let child_id_for_match = child_id_hex.clone();
+    let child_hex_for_resp = child_hex.clone();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method": "get_transaction",
+            "params": { "hash": child_id_for_match }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tx_id":        child_id_hex,
+                "tx_hex":       child_hex_for_resp,
+                "in_mempool":   true,
+                "block_hash":   null,
+                "block_height": null,
+            },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    // Parent lookup fails (upstream returns -32004 tx not found).
+    let unknown_hex = hex::encode(unknown_parent.as_bytes());
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method": "get_transaction",
+            "params": { "hash": unknown_hex }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "error":   { "code": -32004, "message": "tx not found" },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(
+        &state,
+        rpc("get_transaction", json!({ "hash": child.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>() })),
+    )
+    .await
+    .unwrap();
+
+    // Outputs still decoded.
+    assert_eq!(result["outputs"][0]["address"], "dd".repeat(32));
+    assert_eq!(result["outputs"][0]["value"], 3_000);
+
+    // Input is present as a bare outpoint, address/value null.
+    let inp = &result["inputs"][0];
+    assert_eq!(inp["output_index"], 0);
+    assert!(inp.get("address").is_none(), "expected no address, got {inp:?}");
+    assert!(inp.get("value").is_none());
+
+    // Fee + total_in omitted when any input failed to resolve.
+    assert!(result.get("fee").is_none() || result["fee"].is_null());
+    assert!(result.get("total_in").is_none() || result["total_in"].is_null());
+    assert_eq!(result["total_out"], 3_000);
 }

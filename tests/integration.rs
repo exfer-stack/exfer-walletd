@@ -397,7 +397,10 @@ async fn get_balance_rejects_64_char_non_hex_address() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+    assert!(
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -434,12 +437,9 @@ async fn get_transaction_rejects_bad_hash() {
         .await;
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
 
-    let err = dispatch(
-        &state,
-        rpc("get_transaction", json!({"hash": "deadbeef"})),
-    )
-    .await
-    .unwrap_err();
+    let err = dispatch(&state, rpc("get_transaction", json!({"hash": "deadbeef"})))
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, Error::BadAddressLen(_)),
         "expected BadAddressLen, got {err:?}",
@@ -460,7 +460,10 @@ async fn get_block_by_hash_rejects_bad_hash() {
     let err = dispatch(&state, rpc("get_block", json!({"hash": "zz".repeat(32)})))
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+    assert!(
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -480,7 +483,10 @@ async fn get_script_utxos_rejects_odd_length_hex() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+    assert!(
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -500,5 +506,8 @@ async fn send_raw_transaction_rejects_non_hex() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, Error::BadHex(_)), "expected BadHex, got {err:?}");
+    assert!(
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}"
+    );
 }

@@ -149,6 +149,64 @@ shape is preserved for backward compatibility.
 
 ---
 
+## `refresh_address`
+
+Force a synchronous cache refresh for one address. Bypasses TTL —
+always hits upstream, then CAS-writes L2 + L3. The right primitive
+for "user just clicked check deposit" / "we know address X just had
+activity, update now."
+
+As of v0.14.0 the `balanced` profile defaults to **manual refresh
+mode** (`refresh_interval = 0`); the background refresher does not
+auto-poll. Applications drive the cadence via this method (and its
+batch sibling [`refresh_addresses`](#refresh_addresses)).
+
+| | |
+|---|---|
+| **Scope** | read |
+| **Params** | `{ address: hex64 }` |
+| **Returns** | `{ address: Row }` — same row shape as `list_balances` |
+
+On per-call upstream failure (rate limit, transport error, etc.) the
+call still returns `200` — the failure is surfaced in the row's
+`last_error` field; any prior cached value is preserved. Same
+contract as the background refresher.
+
+**Example**
+
+```bash
+curl -s $URL -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"refresh_address","params":{"address":"<addr>"},"id":1}'
+```
+
+---
+
+## `refresh_addresses`
+
+Batch forced refresh. Concurrency-bounded server-side
+(`params.concurrency`, default 8). Returns the same envelope as
+`list_balances`.
+
+| | |
+|---|---|
+| **Scope** | read |
+| **Params** | `{ addresses: hex64[] }` |
+| **Returns** | Same as [`list_balances`](#list_balances) |
+
+Use when the application knows an event affected a specific *set* of
+addresses (sweep batch, deposit-watcher pass over an active subset).
+Don't use this to poll-everything every N seconds — that's what
+`--cache-refresh-secs N` is for, and the [operations docs](./operations.md)
+explain when auto-polling is actually safe (only on dedicated nodes
+or with very small N — the 4N math is unavoidable on shared
+rate-limited RPCs).
+
+Per-address failures are isolated — one rate-limited row doesn't
+poison the whole batch; each row carries its own `last_error`.
+
+---
+
 ## `list_balances`
 
 Per-address balance + UTXO-count snapshot for every managed address,

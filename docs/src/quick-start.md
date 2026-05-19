@@ -36,9 +36,9 @@ Everything walletd manages lives in one directory. After first run:
 
 ```bash
 $ ls -la ~/.exfer-walletd/
-drwx------  rufus  4096   .
--rw-------  rufus    65   token              ← bearer token (hex)
-drwx------  rufus  4096   wallets/           ← one .key file per generate_address
+drwx------  walletd  4096   .
+-rw-------  walletd    65   token              ← bearer token (hex)
+drwx------  walletd  4096   wallets/           ← one .key file per generate_address
 
 $ cat ~/.exfer-walletd/token
 a85da0752815bbf652a1b147649cde77c17f784f3e608d362c629c798a555e7b

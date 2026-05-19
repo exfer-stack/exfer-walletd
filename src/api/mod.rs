@@ -62,6 +62,12 @@ pub struct RpcResponse {
 pub struct RpcError {
     pub code: i32,
     pub message: String,
+    /// Optional machine-readable payload — JSON-RPC 2.0 § 5.1 `data`.
+    /// Currently populated for `InsufficientBalance` (`-32031`) so SDKs
+    /// can branch on `in_flight_reserved` etc. without grepping the
+    /// message string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 impl RpcResponse {
@@ -80,6 +86,7 @@ impl RpcResponse {
             error: Some(RpcError {
                 code: err.rpc_code(),
                 message: err.to_string(),
+                data: err.rpc_data(),
             }),
             id,
         }
@@ -307,4 +314,64 @@ fn ensure_hex(s: &str) -> Result<()> {
         return Err(Error::BadHex("non-hex character".to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rpc_error_envelope_carries_structured_data_for_insufficient_balance() {
+        // With in-flight UTXOs — SDKs need `in_flight_reserved=true` to
+        // know "retry once the pending transfer confirms" is the right
+        // recovery vs. "wallet is genuinely under-funded".
+        let err = Error::InsufficientBalance {
+            needed: 5_100_000,
+            available: 4_000_000,
+            utxo_count: 1,
+            in_flight_value: 9_000_000,
+            in_flight_count: 2,
+        };
+        let resp = RpcResponse::err(json!(7), &err);
+        let v = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(v["error"]["code"], -32031);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("reserved by pending transfers"),
+            "message should still carry the human hint for log readers"
+        );
+        assert_eq!(v["error"]["data"]["in_flight_reserved"], true);
+        assert_eq!(v["error"]["data"]["needed"], 5_100_000);
+        assert_eq!(v["error"]["data"]["available"], 4_000_000);
+        assert_eq!(v["error"]["data"]["utxo_count"], 1);
+        assert_eq!(v["error"]["data"]["in_flight_value"], 9_000_000);
+        assert_eq!(v["error"]["data"]["in_flight_count"], 2);
+    }
+
+    #[test]
+    fn rpc_error_data_present_but_in_flight_reserved_false_when_no_pending() {
+        let err = Error::InsufficientBalance {
+            needed: 1_000_000,
+            available: 100_000,
+            utxo_count: 1,
+            in_flight_value: 0,
+            in_flight_count: 0,
+        };
+        let v = serde_json::to_value(RpcResponse::err(json!(1), &err)).unwrap();
+        assert_eq!(v["error"]["data"]["in_flight_reserved"], false);
+        assert_eq!(v["error"]["data"]["in_flight_count"], 0);
+    }
+
+    #[test]
+    fn rpc_error_data_omitted_for_errors_without_payload() {
+        // Other variants must not start emitting a phantom `data: null` —
+        // the field is skip-serialized when None.
+        let err = Error::Unauthorized;
+        let v = serde_json::to_value(RpcResponse::err(json!(1), &err)).unwrap();
+        assert!(v["error"].get("data").is_none(), "got {:?}", v["error"]);
+    }
 }

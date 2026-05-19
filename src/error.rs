@@ -4,6 +4,7 @@
 
 use std::io;
 
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// Crate-wide `Result` alias.
@@ -122,6 +123,31 @@ impl Error {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::BadEnvelope(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::OK,
+        }
+    }
+
+    /// Structured payload for the JSON-RPC `error.data` field. Lets
+    /// clients branch on machine-readable signals (e.g.
+    /// `in_flight_reserved`) instead of grepping the message string.
+    ///
+    /// `None` means "no structured payload" — `error.data` is omitted.
+    pub fn rpc_data(&self) -> Option<Value> {
+        match self {
+            Error::InsufficientBalance {
+                needed,
+                available,
+                utxo_count,
+                in_flight_value,
+                in_flight_count,
+            } => Some(json!({
+                "in_flight_reserved": *in_flight_count > 0,
+                "needed":           needed,
+                "available":        available,
+                "utxo_count":       utxo_count,
+                "in_flight_value":  in_flight_value,
+                "in_flight_count":  in_flight_count,
+            })),
+            _ => None,
         }
     }
 }

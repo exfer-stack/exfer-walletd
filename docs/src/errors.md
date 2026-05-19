@@ -20,19 +20,30 @@ the body. Walletd emits non-200 only for transport-layer problems
 
 ## `-32031` insufficient balance
 
-The most common spend-path error. Walletd's error body looks like:
+The most common spend-path error. Walletd's error body carries a
+machine-readable `data` payload so clients don't have to grep the
+message string:
 
 ```json
 {
-  "code": -32031,
-  "message": "insufficient balance: need 5100000 exfers (amount + fee), wallet has 4000000 spendable across 1 UTXO(s)"
+  "code":    -32031,
+  "message": "insufficient balance: need 5100000 exfers (amount + fee), wallet has 4000000 spendable across 1 UTXO(s)",
+  "data": {
+    "in_flight_reserved": false,
+    "needed":             5100000,
+    "available":          4000000,
+    "utxo_count":         1,
+    "in_flight_value":    0,
+    "in_flight_count":    0
+  }
 }
 ```
 
 If some UTXOs were filtered out by the
 [in-flight tracker](./security-model.md#in-flight-utxo-tracker)
-(another transfer from this wallet hasn't confirmed yet), the message
-will say so:
+(another transfer from this wallet hasn't confirmed yet),
+`in_flight_reserved` is `true` and the in-flight totals are
+populated; the message also spells it out for human log readers:
 
 ```text
 insufficient balance: need 1100000 exfers (amount + fee), wallet has
@@ -41,9 +52,11 @@ reserved by pending transfers from this daemon; retry once they
 confirm or use a different sending wallet)
 ```
 
-For an integrator: branch on `code == -32031`, retry after a few
-seconds if the message mentions "reserved by pending transfers." If
-not, the wallet is genuinely under-funded.
+For an integrator: branch on `data.in_flight_reserved` —
+`true` → retry after the pending tx confirms; `false` → the wallet is
+genuinely under-funded. Older clients can still grep the message
+string for `reserved by pending transfers`; the wording is stable
+but the `data` payload is the contract.
 
 ## `-32020` upstream errors
 
@@ -75,8 +88,8 @@ to avoid leaking which case it was.
 | `-32001`                | Check token + scope. Don't retry blindly.    |
 | `-32020` "unreachable"  | Wait a moment, retry. Consider multi-URL.    |
 | `-32020` "double-spend" | Retry after confirmation or use new wallet.  |
-| `-32031` (with in-flight hint) | Wait for the pending tx to confirm. |
-| `-32031` (no hint)      | Fund the wallet.                             |
+| `-32031` `data.in_flight_reserved=true`  | Wait for the pending tx to confirm.       |
+| `-32031` `data.in_flight_reserved=false` | Fund the wallet.                          |
 | `-32602`                | Programming error — check param formatting.  |
 
 ## Next

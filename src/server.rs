@@ -181,11 +181,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // appears next to the token box, not after a misleading "starting"
     // line.
     let tls_material = if cfg.tls {
+        let mut extra_sans: Vec<String> = cfg.tls_san.clone();
+        // Auto-include the bound IP. `--bind 0.0.0.0` / `::` is filtered
+        // out inside `ensure_cert_files`; operators with wildcard binds
+        // must pass real hostnames/IPs via `--tls-san`.
+        extra_sans.push(cfg.bind.ip().to_string());
         Some(crate::tls::ensure_cert_files(
             &cfg.resolved_tls_cert_path(),
             &cfg.resolved_tls_key_path(),
             &cfg.tls_fingerprint_path(),
-            Some(cfg.bind.ip()),
+            &extra_sans,
         )?)
     } else {
         None
@@ -392,13 +397,23 @@ async fn rpc_handler(
         None
     };
 
+    // Render the JSON-RPC id for the audit log. Stringified so logs
+    // tolerate the spec's "number | string | null" types uniformly.
+    let request_id = if matches!(id, Value::Null) {
+        "null".to_string()
+    } else {
+        id.to_string()
+    };
+
     match dispatch(&app.api, req).await {
         Ok(result) => {
             if let Some(ip) = ip {
                 tracing::info!(
                     method = %method,
                     client_ip = %ip,
-                    "spend method succeeded",
+                    request_id = %request_id,
+                    outcome = "ok",
+                    "spend audit",
                 );
             }
             (StatusCode::OK, Json(RpcResponse::ok(id, result))).into_response()
@@ -408,8 +423,10 @@ async fn rpc_handler(
                 tracing::warn!(
                     method = %method,
                     client_ip = %ip,
+                    request_id = %request_id,
+                    outcome = "error",
                     error = %err,
-                    "spend method failed",
+                    "spend audit",
                 );
             }
             error_response(id, &err)

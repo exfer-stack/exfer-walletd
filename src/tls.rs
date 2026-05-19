@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use rcgen::{CertificateParams, DnType, KeyPair, SanType};
+use rcgen::{CertificateParams, DnType, Ia5String, KeyPair, SanType};
 use rustls::ServerConfig;
 use rustls_pemfile::Item;
 use sha2::{Digest, Sha256};
@@ -48,15 +48,18 @@ pub struct TlsMaterial {
 /// If all three exist, load and return them. If any are missing, generate
 /// a fresh self-signed cert, write the trio with mode 0600, and print
 /// the same first-run box used for the token (so operators see the
-/// fingerprint exactly once on first start). `extra_san` lets the caller
-/// add the configured bind IP when it's not loopback, so `openssl
-/// s_client` and friends don't complain about SAN mismatch even though
-/// the SDK doesn't care.
+/// fingerprint exactly once on first start).
+///
+/// `extra_sans` is each operator-supplied SAN entry (`--tls-san`) plus
+/// the configured bind IP when it's non-loopback. Each entry is parsed
+/// as an IP first, falling back to a DNS name. This lets `curl --cacert`
+/// and other strict-validating clients connect by hostname / VPC IP
+/// instead of needing the SDK's fingerprint-pinning path.
 pub fn ensure_cert_files(
     cert_path: &Path,
     key_path: &Path,
     fingerprint_path: &Path,
-    extra_san: Option<IpAddr>,
+    extra_sans: &[String],
 ) -> anyhow::Result<TlsMaterial> {
     let all_exist = cert_path.exists() && key_path.exists() && fingerprint_path.exists();
 
@@ -76,7 +79,7 @@ pub fn ensure_cert_files(
         });
     }
 
-    let (cert_pem, key_pem, fingerprint) = generate_self_signed(extra_san)?;
+    let (cert_pem, key_pem, fingerprint) = generate_self_signed(extra_sans)?;
     write_file(cert_path, cert_pem.as_bytes())?;
     write_file(key_path, key_pem.as_bytes())?;
     write_file(fingerprint_path, format!("{fingerprint}\n").as_bytes())?;
@@ -92,15 +95,31 @@ pub fn ensure_cert_files(
     })
 }
 
-fn generate_self_signed(extra_san: Option<IpAddr>) -> anyhow::Result<(String, String, String)> {
+fn generate_self_signed(extra_sans: &[String]) -> anyhow::Result<(String, String, String)> {
     let mut sans = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::IpAddress(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
     ];
-    if let Some(extra) = extra_san {
-        if !extra.is_loopback() {
-            sans.push(SanType::IpAddress(extra));
+    for raw in extra_sans {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let san = match entry.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() => continue,
+            // Skip the wildcard bind — `0.0.0.0`/`::` aren't useful in
+            // a SAN; the operator must pass real hostnames/IPs via
+            // `--tls-san` for `--bind 0.0.0.0` deployments.
+            Ok(ip) if ip.is_unspecified() => continue,
+            Ok(ip) => SanType::IpAddress(ip),
+            Err(_) => SanType::DnsName(
+                Ia5String::try_from(entry.to_string())
+                    .with_context(|| format!("invalid --tls-san entry {entry:?}"))?,
+            ),
+        };
+        if !sans.contains(&san) {
+            sans.push(san);
         }
     }
 
@@ -109,9 +128,13 @@ fn generate_self_signed(extra_san: Option<IpAddr>) -> anyhow::Result<(String, St
         .distinguished_name
         .push(DnType::CommonName, "exfer-walletd");
     params.subject_alt_names = sans;
-    // rcgen's default is 4096 days; bump to ~10 years so operators
-    // don't have to think about rotation in any realistic timeframe.
-    params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(3650);
+    // rcgen's default validity window starts at the Unix epoch, which
+    // surfaces a confusing `notBefore=1970…` (or `1975…` after the
+    // UTCTime 2-digit-year remap) on operator inspection. Pin the
+    // window to now() ± ~10y instead.
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now;
+    params.not_after = now + time::Duration::days(3650);
 
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
@@ -210,7 +233,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cert, key, fp) = paths(&dir);
 
-        let m = ensure_cert_files(&cert, &key, &fp, None).unwrap();
+        let m = ensure_cert_files(&cert, &key, &fp, &[]).unwrap();
         assert!(m.generated);
         assert!(m.fingerprint.starts_with("sha256:"));
         assert_eq!(m.fingerprint.len(), "sha256:".len() + 64);
@@ -225,8 +248,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cert, key, fp) = paths(&dir);
 
-        let first = ensure_cert_files(&cert, &key, &fp, None).unwrap();
-        let second = ensure_cert_files(&cert, &key, &fp, None).unwrap();
+        let first = ensure_cert_files(&cert, &key, &fp, &[]).unwrap();
+        let second = ensure_cert_files(&cert, &key, &fp, &[]).unwrap();
 
         assert!(first.generated);
         assert!(!second.generated);
@@ -237,7 +260,7 @@ mod tests {
     fn fingerprint_matches_cert_der_sha256() {
         let dir = TempDir::new().unwrap();
         let (cert, key, fp) = paths(&dir);
-        ensure_cert_files(&cert, &key, &fp, None).unwrap();
+        ensure_cert_files(&cert, &key, &fp, &[]).unwrap();
 
         let pem = fs::read_to_string(&cert).unwrap();
         let mut reader = std::io::BufReader::new(pem.as_bytes());
@@ -256,7 +279,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let (cert, key, fp) = paths(&dir);
-        ensure_cert_files(&cert, &key, &fp, None).unwrap();
+        ensure_cert_files(&cert, &key, &fp, &[]).unwrap();
         for p in [&cert, &key, &fp] {
             let mode = fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}: mode={:o}", p.display(), mode);

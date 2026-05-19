@@ -41,11 +41,11 @@ See [Error codes](./errors.md) for the full code table.
 Amounts and fees are integers in **exfers**, where
 `1 EXFER = 100_000_000 exfers`.
 
-The shell variable conventions in the examples:
+Examples below assume:
 
 ```bash
 URL='http://127.0.0.1:7448'
-TOKEN='your-token-here'
+TOKEN=$(cat ~/.exfer-walletd/token)   # or your secret-manager fetch
 ```
 
 ---
@@ -603,4 +603,4 @@ console.log("address:", address);
 ## Next
 
 - [Error codes →](./errors.md)
-- [Production deploy →](./production-deploy.md)
+- [Operations →](./operations.md)

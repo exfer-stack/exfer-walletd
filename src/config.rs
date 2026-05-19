@@ -93,6 +93,22 @@ pub struct Config {
     #[arg(long, env = "WALLETD_TLS_KEY")]
     pub tls_key: Option<PathBuf>,
 
+    /// Extra `subjectAltName` entries to add to the auto-generated
+    /// self-signed cert. Comma-separated, each entry is either an IP
+    /// or a DNS name; loopback and `0.0.0.0` are ignored.
+    ///
+    /// The bound IP is always included automatically. Use this when
+    /// `--bind 0.0.0.0:7448` is paired with clients that connect by
+    /// hostname or VPC IP and do strict CA-style verification
+    /// (`curl --cacert`, Java HttpsURLConnection, …). The SDK's
+    /// fingerprint-pinning path is unaffected — it never looks at SAN.
+    ///
+    /// Only consulted on first-run cert generation. After the cert
+    /// trio exists, delete `cert.{pem,key,fingerprint}` and restart to
+    /// regenerate with a new SAN set.
+    #[arg(long, env = "WALLETD_TLS_SAN", value_delimiter = ',')]
+    pub tls_san: Vec<String>,
+
     /// JSON-RPC URL of one or more upstream Exfer nodes. Accepts a
     /// single URL or a comma-separated list — calls round-robin
     /// across them, failing over to the next on transport / 5xx
@@ -220,6 +236,7 @@ mod tests {
             tls: false,
             tls_cert: None,
             tls_key: None,
+            tls_san: Vec::new(),
             node_rpc: "http://127.0.0.1:9334".into(),
             wallet_dir: None,
             auth_token: None,

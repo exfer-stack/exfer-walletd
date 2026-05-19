@@ -70,11 +70,19 @@ cert it generates on first run. No CA, no rotation ceremony, no
 reverse proxy.
 
 ```bash
-exfer-walletd --tls --bind 0.0.0.0:7448
+exfer-walletd --tls --bind 10.0.1.5:7448
 ```
 
-On first start with `--tls`, walletd creates `cert.pem`, `cert.key`,
-and `cert.fingerprint` in the datadir (all `0600`) and prints the
+The bound IP is auto-added to the cert's `subjectAltName`. If your
+clients connect via a hostname (or you bind `0.0.0.0` and proxy in),
+also pass `--tls-san`:
+
+```bash
+exfer-walletd --tls --bind 0.0.0.0:7448 --tls-san walletd.internal,10.0.1.5
+```
+
+On first start, walletd creates `cert.pem`, `cert.key`, and
+`cert.fingerprint` in the datadir (all `0600`) and prints the
 SHA-256 fingerprint once in an ASCII box on stderr:
 
 ```
@@ -91,7 +99,16 @@ SHA-256 fingerprint once in an ASCII box on stderr:
 
 Lost the line? `cat ~/.exfer-walletd/cert.fingerprint`.
 
-Pin it on the client. The Python SDK reads it automatically:
+`--tls` relaxes `--allow-public-bind` — TLS already protects the
+token on the wire.
+
+Changed your bind, hostname, or `--tls-san` later? The cert is only
+generated on first run. Delete the trio (`rm cert.{pem,key,fingerprint}`)
+and restart to regenerate.
+
+### Two ways to verify the cert on the client
+
+**SDK — fingerprint pinning (recommended).** No CA, no SAN dance.
 
 ```python
 from exfer_walletd import Client
@@ -99,8 +116,17 @@ with Client.from_datadir(url="https://<walletd-host>:7448") as c:
     print(c.healthz())
 ```
 
-`--tls` relaxes `--allow-public-bind` — TLS already protects the
-token on the wire.
+**Strict CA-style validation** — `curl --cacert`, Java, anything that
+checks the SAN. Drop `cert.pem` on the client and verify by the same
+hostname/IP you put in the SAN:
+
+```bash
+curl --cacert /etc/walletd/cert.pem https://walletd.internal:7448/healthz
+```
+
+If the hostname/IP isn't in the SAN, you get
+`SSL: no alternative certificate subject name matches target host name`.
+Fix by regenerating the cert with `--tls-san` covering it.
 
 ### Bootstrap from the backend host (no SSH to walletd)
 
@@ -139,10 +165,10 @@ plaintext would defeat the whole pinning model.
 ## Other flags
 
 ```bash
-exfer-walletd --node-rpc 'http://a:9334,http://b:9334'  # round-robin + failover
-exfer-walletd --datadir  /var/lib/walletd               # different storage location
-exfer-walletd --auth-token-read  ...                    # split read/spend tokens
-exfer-walletd --auth-token-spend ...
+exfer-walletd --node-rpc 'http://a:9334,http://b:9334'        # round-robin + failover
+exfer-walletd --datadir  /var/lib/walletd                     # different storage location
+exfer-walletd --auth-token-read  "$(openssl rand -hex 32)" \  # split read/spend tokens
+              --auth-token-spend "$(openssl rand -hex 32)"
 ```
 
 Every flag also reads from a matching env var (`WALLETD_BIND`,

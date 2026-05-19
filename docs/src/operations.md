@@ -42,7 +42,9 @@ rm ~/.exfer-walletd/token
 exfer-walletd      # generates + prints a fresh one
 ```
 
-Two-token mode — change the env values / CLI flags and restart.
+Two-token mode (`--auth-token-read` / `--auth-token-spend` set) —
+walletd ignores `<datadir>/token`, so deleting it does nothing.
+Change the env values / CLI flags and restart instead.
 
 Either way, any in-flight request still using the old token will
 fail after the restart. Plan the window.
@@ -60,6 +62,58 @@ Clients pinning the old fingerprint will start raising
 `FingerprintMismatchError` on the next request. Push the new
 fingerprint to them before restarting if you can't tolerate the
 window.
+
+## Running under systemd
+
+Minimal hardened unit. Adjust `User`, `WALLETD_DATADIR`, and flags
+for your environment.
+
+```ini
+# /etc/systemd/system/exfer-walletd.service
+[Unit]
+Description=Exfer Wallet Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=walletd
+Group=walletd
+Environment=WALLETD_DATADIR=/var/lib/walletd
+Environment=EXFER_NODE_RPC=http://127.0.0.1:9334
+ExecStart=/usr/local/bin/exfer-walletd --tls --bind 10.0.1.5:7448
+Restart=on-failure
+RestartSec=2s
+
+# Hardening — walletd never needs anything outside its datadir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/walletd
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo useradd --system --home /var/lib/walletd --shell /usr/sbin/nologin walletd
+sudo install -d -o walletd -g walletd -m 0700 /var/lib/walletd
+sudo systemctl daemon-reload
+sudo systemctl enable --now exfer-walletd
+journalctl -u exfer-walletd -f      # first-run token + fingerprint print here
+```
+
+For Kubernetes: same idea, but mount the datadir as a
+`PersistentVolume` (token + wallet keys must persist across pod
+restarts), set `runAsUser` to a non-root UID, and add a `readinessProbe`
+hitting `GET /healthz`.
 
 ## Uninstall
 

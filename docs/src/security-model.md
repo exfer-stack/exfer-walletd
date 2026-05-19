@@ -15,7 +15,10 @@
   same wallet racing onto the same outpoint
   (see [internals below](#in-flight-utxo-tracker)).
 - Every spend-scope request emits a structured audit log line
-  (method, client IP, request id, outcome) at `INFO`.
+  (`spend audit`) with `method`, `client_ip`, `request_id`, `outcome`
+  — at `INFO` on success, `WARN` on error (the warn line also carries
+  the error message). Honors `X-Forwarded-For` for `client_ip` when
+  present.
 
 ## What's *not* protected (by design)
 

@@ -52,7 +52,7 @@ text of `-32020`. Examples seen in practice:
 
 - `upstream node returned error code -32602: Mempool pre-check failed: double-spend of OutPoint {...}` — another transfer of yours is already spending the same UTXO. The [in-flight tracker](./security-model.md#in-flight-utxo-tracker) protects against this in normal use, but it can still surface across walletd restarts.
 - `upstream node returned error code -32004: tx not found` — querying a tx_id that's neither on chain nor in mempool.
-- `upstream node unreachable: ...: error sending request` — transient transport failure. Walletd does **not** retry within a single URL. If you configured multiple `--node-rpc` URLs, walletd has already failed over and the message tells you the last URL it tried.
+- `upstream node unreachable: ...: error sending request` — transient transport failure. Walletd already retried up to `--upstream-attempts` times (default `4`) with linear backoff (`--upstream-retry-backoff-ms`, default `500ms` → waits of 500/1000/1500ms between sweeps); each attempt rotates through every configured `--node-rpc` URL before counting as failed. The message reports the last URL it tried.
 
 ## `-32001` unauthorized
 
@@ -81,5 +81,5 @@ to avoid leaking which case it was.
 
 ## Next
 
-- [Production deploy →](./production-deploy.md)
+- [Operations →](./operations.md)
 - [Security model →](./security-model.md)

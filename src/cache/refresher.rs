@@ -411,10 +411,14 @@ fn detect_reorg_and_invalidate(prev: Option<&BlockTip>, new: &BlockTip, cache: &
             prev_block = %prev.block_id,
             new_block = %new.block_id,
             reason = r,
-            "cache refresher: invalidating L2 + L3 due to chain divergence"
+            "cache refresher: invalidating L2 + L3 + L4 + L5 due to chain divergence"
         );
         cache.balance.invalidate_all();
         cache.utxo.invalidate_all();
+        // L4/L5 are LRU caches with no generation; full clear is the
+        // simplest correct path on reorg. Re-population is cheap.
+        cache.block.invalidate_all();
+        cache.tx.invalidate_all();
     }
 }
 

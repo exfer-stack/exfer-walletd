@@ -260,10 +260,12 @@ async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
     let sel: BlockSelector = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_block params: {e}")))?;
     let blk = match sel {
-        BlockSelector::ByHeight { height } => state.node.get_block_by_height(height).await?,
+        BlockSelector::ByHeight { height } => {
+            state.cache.get_block_by_height(height, &state.node).await?
+        }
         BlockSelector::ByHash { hash } => {
             ensure_64_hex(&hash)?;
-            state.node.get_block_by_hash(&hash).await?
+            state.cache.get_block_by_hash(&hash, &state.node).await?
         }
     };
     serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))
@@ -280,7 +282,10 @@ async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_block_hash(state: &ApiState, params: Value) -> Result<Value> {
     let p: HeightParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_block_hash params: {e}")))?;
-    let blk = state.node.get_block_by_height(p.height).await?;
+    let blk = state
+        .cache
+        .get_block_by_height(p.height, &state.node)
+        .await?;
     Ok(serde_json::json!({
         "height":   blk.height,
         "block_id": blk.hash,
@@ -291,12 +296,15 @@ async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: HashParam = serde_json::from_value(params)
         .map_err(|e| Error::BadEnvelope(format!("get_transaction params: {e}")))?;
     ensure_64_hex(&p.hash)?;
-    let tx = state.node.get_transaction(&p.hash).await?;
+    let tx = state.cache.get_transaction(&p.hash, &state.node).await?;
 
     // Always decode. Outputs are free; inputs need parent-tx fetches
     // (concurrent, cap 8) and degrade gracefully if any parent is
     // unreachable — partial decode is more useful than a failed call.
-    let decoded = crate::tx::decode::decode_with_inputs(&state.node, &tx.tx_hex).await?;
+    // Parent fetches now route through the cache so a repeat decode
+    // of a tx with N inputs gets ~free parent lookups on hit.
+    let decoded =
+        crate::tx::decode::decode_with_inputs(&state.node, &state.cache, &tx.tx_hex).await?;
 
     let mut v = serde_json::to_value(&tx).map_err(|e| Error::Internal(e.to_string()))?;
     let obj = v

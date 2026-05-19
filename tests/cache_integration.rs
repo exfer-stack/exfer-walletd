@@ -12,10 +12,35 @@ use serde_json::json;
 use wiremock::matchers::{body_partial_json, method};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use exfer::types::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use exfer_walletd::api::{dispatch, ApiState, RpcRequest};
 use exfer_walletd::cache::{CacheProfile, WalletCache};
 use exfer_walletd::store::FsWalletStore;
 use exfer_walletd::upstream::{ExferNode, RetryPolicy};
+
+fn p2pkh_out(value: u64, addr_byte: u8) -> TxOutput {
+    TxOutput {
+        value,
+        script: vec![addr_byte; 32],
+        datum: None,
+        datum_hash: None,
+    }
+}
+
+fn build_tx_for_test(inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> Transaction {
+    let witnesses = inputs
+        .iter()
+        .map(|_| TxWitness {
+            witness: Vec::new(),
+            redeemer: None,
+        })
+        .collect();
+    Transaction {
+        inputs,
+        outputs,
+        witnesses,
+    }
+}
 
 fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
     RpcRequest {
@@ -205,6 +230,85 @@ async fn on_transfer_commit_invalidates_from_only_when_to_is_external() {
     assert_eq!(state.cache.balance.peek(&from).generation, 1);
     // External `to`: never touched the cache, generation remains 0.
     assert_eq!(state.cache.balance.peek(&external_to).generation, 0);
+}
+
+#[tokio::test]
+async fn tx_cache_amortizes_repeat_get_transaction() {
+    // The L5 win: repeat get_transaction on a confirmed tx must hit
+    // upstream exactly once. (Note: get_transaction's decode path also
+    // fetches each input's parent; we use a coinbase-shaped tx with no
+    // inputs to keep this test focused on the L5 self-cache.)
+    let mock = MockServer::start().await;
+    // Coinbase-style: no inputs, one output.
+    let tx = build_tx_for_test(vec![], vec![p2pkh_out(10_000, 0xaa)]);
+    let tx_hex = hex::encode(tx.serialize().unwrap());
+    let tx_id = hex::encode(tx.tx_id().unwrap().as_bytes());
+    let block_hash = "cd".repeat(32);
+    let tx_hex_for_resp = tx_hex.clone();
+    let tx_id_for_resp = tx_id.clone();
+    let block_hash_for_resp = block_hash.clone();
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method":"get_transaction",
+            "params":{"hash": tx_id}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{
+                "tx_id": tx_id_for_resp,
+                "tx_hex": tx_hex_for_resp,
+                "in_mempool": false,
+                "block_hash": block_hash_for_resp,
+                "block_height": 100,
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    let r1 = dispatch(&state, rpc("get_transaction", json!({"hash": tx_id})))
+        .await
+        .unwrap();
+    assert_eq!(r1["tx_id"], tx_id);
+
+    for _ in 0..2 {
+        let r = dispatch(&state, rpc("get_transaction", json!({"hash": tx_id})))
+            .await
+            .unwrap();
+        assert_eq!(r["tx_id"], tx_id);
+    }
+}
+
+#[tokio::test]
+async fn block_cache_amortizes_repeat_by_height() {
+    let mock = MockServer::start().await;
+    let h = "11".repeat(32);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method":"get_block",
+            "params":{"height": 7}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{
+                "hash": h, "height":7, "timestamp":1, "tx_count":0,
+                "transactions":[], "prev_block_id":"00",
+                "difficulty_target":"ff", "nonce":0,
+                "state_root":"00", "tx_root":"00"
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    for _ in 0..3 {
+        let r = dispatch(&state, rpc("get_block", json!({"height": 7})))
+            .await
+            .unwrap();
+        assert_eq!(r["height"], 7);
+    }
 }
 
 #[tokio::test]

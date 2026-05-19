@@ -22,17 +22,21 @@
 //! See [`entry::EntryStore::try_write`] for the mechanics.
 
 pub mod balance;
+pub mod block;
 pub mod entry;
 pub mod profile;
 pub mod refresher;
 pub mod tip;
+pub mod tx;
 pub mod utxo;
 
 pub use balance::{BalanceCache, BalancePeek};
+pub use block::BlockCache;
 pub use entry::{EntrySnapshot, EntryStore, Generation};
 pub use profile::{CacheParams, CacheProfile};
 pub use refresher::{spawn as spawn_refresher, RefresherHandle};
 pub use tip::{TipCache, TipSnapshot};
+pub use tx::TxCache;
 pub use utxo::{UtxoCache, UtxoPeek};
 
 use std::sync::Arc;
@@ -49,6 +53,8 @@ pub struct WalletCache {
     pub tip: TipCache,
     pub balance: BalanceCache,
     pub utxo: UtxoCache,
+    pub block: BlockCache,
+    pub tx: TxCache,
 }
 
 impl WalletCache {
@@ -76,11 +82,15 @@ impl WalletCache {
         } else {
             std::time::Duration::ZERO
         };
+        let block_lru = if params.enabled { params.block_lru } else { 0 };
+        let tx_lru = if params.enabled { params.tx_lru } else { 0 };
         Self {
             params,
             tip: TipCache::new(tip_ttl),
             balance: BalanceCache::new(balance_ttl),
             utxo: UtxoCache::new(utxo_ttl),
+            block: BlockCache::new(block_lru, params.reorg_depth.max(1)),
+            tx: TxCache::new(tx_lru),
         }
     }
 
@@ -196,6 +206,48 @@ impl WalletCache {
         self.utxo
             .read_script_for_display(script_hex, node, inflight, tip_height)
             .await
+    }
+
+    /// Read a transaction by id. Cached through L5 when enabled.
+    /// Used both by the `get_transaction` handler and by the
+    /// `decode_with_inputs` parent-tx fetch path (the latter is the
+    /// big amortization win — a tx with N inputs becomes ~free on
+    /// cache hit).
+    pub async fn get_transaction(
+        &self,
+        tx_id: &str,
+        node: &ExferNode,
+    ) -> crate::error::Result<crate::upstream::TxStatus> {
+        if !self.params.enabled {
+            return node.get_transaction(tx_id).await;
+        }
+        self.tx.get_or_fetch(tx_id, node).await
+    }
+
+    /// Read a block by height. Cached through L4 when enabled.
+    pub async fn get_block_by_height(
+        &self,
+        height: u64,
+        node: &ExferNode,
+    ) -> crate::error::Result<crate::upstream::BlockSummary> {
+        if !self.params.enabled {
+            return node.get_block_by_height(height).await;
+        }
+        let tip = self.tip.peek().map(|s| s.tip.height).unwrap_or(0);
+        self.block.get_by_height(height, node, tip).await
+    }
+
+    /// Read a block by hash. Cached through L4 when enabled. By-hash
+    /// is permanent absent reorg invalidation.
+    pub async fn get_block_by_hash(
+        &self,
+        hash: &str,
+        node: &ExferNode,
+    ) -> crate::error::Result<crate::upstream::BlockSummary> {
+        if !self.params.enabled {
+            return node.get_block_by_hash(hash).await;
+        }
+        self.block.get_by_hash(hash, node).await
     }
 
     /// Eager invalidation hook called from the `transfer` engine after

@@ -108,8 +108,14 @@ pub struct DecodedTx {
 
 /// Decode `tx_hex` and (best-effort) resolve each input's spending
 /// address + value. Phase-1 P2PKH addresses come from the witness
-/// pubkey (zero upstream calls); values still need a parent fetch.
-pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<DecodedTx> {
+/// pubkey (zero upstream calls); values still need a parent fetch —
+/// those routes through the L5 tx cache when enabled, so a repeated
+/// decode of a tx with many inputs becomes near-free on hit.
+pub async fn decode_with_inputs(
+    node: &ExferNode,
+    cache: &crate::cache::WalletCache,
+    tx_hex: &str,
+) -> Result<DecodedTx> {
     let raw = hex::decode(tx_hex).map_err(|e| Error::Internal(format!("tx_hex not hex: {e}")))?;
     let size = raw.len();
     let (tx, _consumed) = Transaction::deserialize(&raw)
@@ -146,7 +152,7 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
 
     let fetches = stream::iter(outpoints.clone())
         .map(|(i, prev_id, out_idx)| async move {
-            let result = resolve_input(node, &prev_id, out_idx).await;
+            let result = resolve_input(node, cache, &prev_id, out_idx).await;
             (i, result)
         })
         .buffer_unordered(INPUT_RESOLVE_CONCURRENCY);
@@ -246,10 +252,11 @@ fn address_from_witness(w: &DecodedWitness) -> Option<String> {
 
 async fn resolve_input(
     node: &ExferNode,
+    cache: &crate::cache::WalletCache,
     prev_tx_id: &str,
     output_index: u32,
 ) -> Option<ResolvedInput> {
-    let parent = node.get_transaction(prev_tx_id).await.ok()?;
+    let parent = cache.get_transaction(prev_tx_id, node).await.ok()?;
     let raw = hex::decode(&parent.tx_hex).ok()?;
     let (parent_tx, _consumed) = Transaction::deserialize(&raw).ok()?;
     let out = parent_tx.outputs.get(output_index as usize)?;

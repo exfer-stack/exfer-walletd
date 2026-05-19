@@ -5,8 +5,10 @@
 
 **Exfer Wallet Daemon** — an independent HTTP service that manages
 wallet keypairs and exposes higher-level RPC methods
-(`generate_address`, `transfer`, `balance`, …) on top of one or more
-[Exfer](https://exfer.org/) nodes.
+(`generate_address`, `transfer`, `balance`, `list_balances`, …) on
+top of one or more [Exfer](https://exfer.org/) nodes. Built-in
+five-layer cache + background refresher means dashboard reads
+(`list_balances` over N addresses) cost one local call regardless of N.
 
 Same pattern as
 [`cardano-wallet`](https://github.com/cardano-foundation/cardano-wallet)

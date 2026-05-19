@@ -119,8 +119,8 @@ Enumerate every managed address. Sorted ascending.
 | | |
 |---|---|
 | **Scope** | read |
-| **Params** | `{}` |
-| **Returns** | `{ addresses: hex64[] }` |
+| **Params** | `{}` *or* `{ with_balance: true }` |
+| **Returns** | `{ addresses: hex64[] }` (default) *or* the same shape as [`list_balances`](#list_balances) (when `with_balance: true`) |
 
 **Example**
 
@@ -142,6 +142,98 @@ curl -s $URL -H "Authorization: Bearer $TOKEN" \
   "id": 1
 }
 ```
+
+With `{ with_balance: true }` the call forwards to `list_balances`
+(below) and returns the richer envelope. The legacy default array
+shape is preserved for backward compatibility.
+
+---
+
+## `list_balances`
+
+Per-address balance + UTXO-count snapshot for every managed address,
+sourced from the in-memory cache (no upstream RPC traffic per call).
+The background refresher keeps the cache warm; on a 30s `balanced`
+TTL, the typical row is < 30 seconds old.
+
+| | |
+|---|---|
+| **Scope** | read |
+| **Params** | `{}` |
+| **Returns** | `{ tip, as_of_ms_ago, addresses: Row[] }` |
+
+Row shape:
+
+```ts
+{
+  address:            string,      // 64-hex
+  balance:            number|null, // null iff the L2 cache has never
+                                   // resolved this address (cold +
+                                   // refresher hasn't run yet)
+  utxo_count:         number|null, // null iff L3 cache cold
+  fetched_at_ms_ago:  number|null, // age of the newer of L2/L3 entries
+  tip_at_fetch:       number|null, // older of L2/L3 tip anchors
+  stale:              boolean,     // true if either layer is past TTL
+                                   // (or upstream is degraded)
+  last_error:         string|null  // most recent per-address error
+}
+```
+
+`stale: true` is **a hint, not an error**. The value should be treated
+as a lower bound — the address had at least this balance the last
+time we successfully heard from upstream. Callers that need strict
+freshness should call `get_balance` per-address instead (synchronous
+cache-aside fetch).
+
+**Example**
+
+```bash
+curl -s $URL -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"list_balances","id":1}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "tip": { "height": 589354, "block_id": "f9c8a440..." },
+    "as_of_ms_ago": 1834,
+    "addresses": [
+      {
+        "address": "1ecce7b8e4c6ac566332cd53a0c02387bb3e5273c5bcf2d77353f7a05615c2bd",
+        "balance": 1500000,
+        "utxo_count": 3,
+        "fetched_at_ms_ago": 1834,
+        "tip_at_fetch": 589353,
+        "stale": false,
+        "last_error": null
+      },
+      {
+        "address": "27e1c883f3f1bdb124e5430dacc92e1e8ca25a73e50052cadba78e065ce09eaf",
+        "balance": null,
+        "utxo_count": null,
+        "fetched_at_ms_ago": null,
+        "tip_at_fetch": null,
+        "stale": true,
+        "last_error": null
+      }
+    ]
+  },
+  "id": 1
+}
+```
+
+The dashboard pattern that motivated this method — "give me all my
+deposit addresses with their current balance" — used to cost
+`N+1` RPCs (1 × `list_addresses` + N × `get_balance`). With
+`list_balances` and the `balanced` cache profile, it costs **one** RPC
+per call regardless of N.
+
+`list_balances` requires `--cache-profile ≠ off`. With caching
+disabled, the call still works but every row reports `stale: true`
+with `balance: null` (the cache layer is still in-place, just never
+populated).
 
 ---
 

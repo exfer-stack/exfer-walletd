@@ -387,6 +387,33 @@ async fn list_balances_with_cache_off_still_works_but_all_stale() {
 }
 
 #[tokio::test]
+async fn cache_stats_endpoint_returns_expected_shape() {
+    use exfer_walletd::server::{build_app_state_for_tests, build_router};
+
+    let mock = MockServer::start().await;
+    let (api, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+    let app_state = build_app_state_for_tests(api, None);
+    let app = build_router(app_state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resp = reqwest::get(format!("http://{addr}/cache/stats"))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["profile"], "on");
+    assert!(body["refresh_interval_ms"].as_u64().unwrap() > 0);
+    assert!(body["sizes"]["balance"].is_number());
+    assert!(body["sizes"]["tx"].is_number());
+}
+
+#[tokio::test]
 async fn cas_loss_protects_against_silent_clobber() {
     // The §9 trap from the Plan-agent design review: refresher mid-fetch
     // must not overwrite a transfer-commit invalidation. This drives the

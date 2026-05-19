@@ -164,6 +164,27 @@ pub struct Config {
     /// disables the sleep between attempts.
     #[arg(long, env = "WALLETD_UPSTREAM_RETRY_BACKOFF_MS", default_value_t = 500)]
     pub upstream_retry_backoff_ms: u64,
+
+    /// Cache profile — selects every TTL / LRU / concurrency knob the
+    /// in-memory cache uses. One flag instead of nine. Choices:
+    /// `off` (no caching; pre-0.13 behavior; useful for monitoring /
+    /// reconciliation jobs that need ground-truth);
+    /// `balanced` (default — 30s TTLs on balance/UTXO, 5s refresh tick,
+    /// 8-way concurrency, 10k tx LRU; tuned for "exchange backend
+    /// pinging a public RPC every few seconds");
+    /// `aggressive` (tighter TTLs — 5s balance/UTXO, 2s refresh,
+    /// 16-way concurrency, 50k tx LRU; tuned for "I have a dedicated
+    /// node and want the freshest possible view").
+    #[arg(long, env = "WALLETD_CACHE_PROFILE", default_value = "balanced")]
+    pub cache_profile: crate::cache::CacheProfile,
+
+    /// Optional escape hatch for the cache refresher tick interval, in
+    /// seconds. Overrides whatever value the `--cache-profile` derived.
+    /// The one knob deposit-watcher operators actually want to tune
+    /// (latency tolerance for "address X received funds"). Other knobs
+    /// stay profile-derived.
+    #[arg(long, env = "WALLETD_CACHE_REFRESH_SECS")]
+    pub cache_refresh_secs: Option<u64>,
 }
 
 impl Config {
@@ -245,6 +266,8 @@ mod tests {
             upstream_timeout_secs: 30,
             upstream_attempts: 4,
             upstream_retry_backoff_ms: 500,
+            cache_profile: crate::cache::CacheProfile::Balanced,
+            cache_refresh_secs: None,
         }
     }
 

@@ -75,6 +75,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", post(rpc_handler))
         .route("/healthz", get(healthz))
+        .route("/cache/stats", get(cache_stats))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -167,9 +168,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(cfg.upstream_timeout_secs),
         retry,
     )?;
-    // Profile-derived cache + spawned refresher. CLI flag for the
-    // profile lands in stage 7; for now default to Balanced.
-    let cache = Arc::new(WalletCache::new(crate::cache::CacheProfile::Balanced, None));
+    // Profile-derived cache + spawned refresher.
+    let cache = Arc::new(WalletCache::new(cfg.cache_profile, cfg.cache_refresh_secs));
     let store_arc: Arc<dyn crate::store::WalletStore> = Arc::new(store);
     let node_arc = Arc::new(node);
     let refresher =
@@ -212,16 +212,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     tracing::info!(
-        bind         = %cfg.bind,
-        scheme       = %scheme,
-        tls          = cfg.tls,
-        fingerprint  = %fingerprint_log,
-        node_rpc     = %cfg.node_rpc,
-        datadir      = %datadir.display(),
-        wallet_dir   = %wallet_dir.display(),
-        auth         = %tokens.description(),
-        attempts     = retry.attempts,
-        backoff_ms   = retry.backoff_ms,
+        bind          = %cfg.bind,
+        scheme        = %scheme,
+        tls           = cfg.tls,
+        fingerprint   = %fingerprint_log,
+        node_rpc      = %cfg.node_rpc,
+        datadir       = %datadir.display(),
+        wallet_dir    = %wallet_dir.display(),
+        auth          = %tokens.description(),
+        attempts      = retry.attempts,
+        backoff_ms    = retry.backoff_ms,
+        cache_profile = %cfg.cache_profile,
+        cache_refresh_secs = ?cfg.cache_refresh_secs,
         "exfer-walletd starting",
     );
 
@@ -353,6 +355,37 @@ async fn shutdown_signal() {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+/// Operator-facing cache statistics. Unauthenticated by design — the
+/// numbers are non-sensitive (sizes, profile, tip view) and useful for
+/// monitoring agents that can't carry the bearer token. If your
+/// deployment exposes /cache/stats publicly and you object to the
+/// disclosure, gate it at your reverse proxy.
+async fn cache_stats(State(app): State<AppState>) -> Json<Value> {
+    let cache = &app.api.cache;
+    let tip_view = cache.tip.peek().map(|s| {
+        serde_json::json!({
+            "height": s.tip.height,
+            "block_id": s.tip.block_id,
+            "stale": s.stale,
+            "last_error": s.last_error,
+        })
+    });
+    let profile = if cache.params.enabled { "on" } else { "off" };
+    Json(serde_json::json!({
+        "profile": profile,
+        "refresh_interval_ms": cache.params.refresh_interval.as_millis() as u64,
+        "concurrency": cache.params.concurrency,
+        "tip": tip_view,
+        "sizes": {
+            "balance": cache.balance.len(),
+            "utxo_addr": cache.utxo.address_len(),
+            "block_hash": cache.block.hash_len(),
+            "block_height": cache.block.height_len(),
+            "tx": cache.tx.len(),
+        },
+    }))
 }
 
 /// Extract the caller's IP for audit logging. Honors the first hop of

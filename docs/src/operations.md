@@ -115,6 +115,65 @@ For Kubernetes: same idea, but mount the datadir as a
 restarts), set `runAsUser` to a non-root UID, and add a `readinessProbe`
 hitting `GET /healthz`.
 
+## Cache profile
+
+Since v0.13.0 walletd keeps an in-memory cache (per-address balance,
+UTXOs, recent blocks, recent transactions) plus a background refresher
+so dashboard reads — most notably [`list_balances`](./rpc-reference.md#list_balances)
+— don't hit upstream per-call.
+
+One flag tunes everything:
+
+```bash
+exfer-walletd --cache-profile balanced   # default
+exfer-walletd --cache-profile aggressive # tighter TTLs, more refresher work
+exfer-walletd --cache-profile off        # pre-0.13 behavior, no caching
+```
+
+| | off | balanced | aggressive |
+|---|---|---|---|
+| Tip TTL | — | 200 ms | 100 ms |
+| Balance TTL | — | 30 s | 5 s |
+| UTXO TTL | — | 30 s | 5 s |
+| Block LRU | — | 1 000 | 5 000 |
+| Tx LRU | — | 10 000 | 50 000 |
+| Refresh interval | — | 5 s | 2 s |
+| Per-tick concurrency | — | 8 | 16 |
+| Max addresses / tick | — | 10 000 | 50 000 |
+
+For deposit-watcher deployments that need fresher-than-default
+latency without going to full `aggressive`, override just the refresh
+interval:
+
+```bash
+exfer-walletd --cache-profile balanced --cache-refresh-secs 2
+```
+
+Every other knob stays profile-derived — this is the one parameter
+operators actually want to tune in production.
+
+### `GET /cache/stats`
+
+Operator-facing dashboard endpoint. Unauthenticated by design (the
+output is non-sensitive). Returns the live cache profile, refresh
+interval, current tip view, and per-layer sizes:
+
+```bash
+curl -s $URL/cache/stats | jq
+```
+
+```json
+{
+  "profile": "on",
+  "refresh_interval_ms": 5000,
+  "concurrency": 8,
+  "tip": { "height": 589354, "block_id": "f9c8a440...", "stale": false, "last_error": null },
+  "sizes": { "balance": 12, "utxo_addr": 12, "block_hash": 0, "block_height": 0, "tx": 0 }
+}
+```
+
+Gate it at your reverse proxy if you don't want it exposed publicly.
+
 ## Uninstall
 
 No ceremony — walletd doesn't touch anything outside its `--datadir`.

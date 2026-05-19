@@ -597,12 +597,13 @@ dependencies = [
 
 [[package]]
 name = "exfer-walletd"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "axum",
  "axum-server",
  "clap",
+ "ed25519-dalek",
  "exfer",
  "futures",
  "hex",

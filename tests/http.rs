@@ -365,3 +365,54 @@ async fn bootstrap_endpoints_absent_on_default_router() {
         );
     }
 }
+
+#[tokio::test]
+async fn read_token_cannot_call_sign_message() {
+    // sign_message produces a proof of ownership over a wallet key.
+    // It doesn't move funds, but the artifact is value-bearing in
+    // KYC / exchange flows, so it's gated behind spend scope.
+    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method":  "sign_message",
+        "params":  { "address": "ab".repeat(32), "message": "challenge" },
+        "id": 1
+    });
+    let resp = reqwest::Client::new()
+        .post(&base)
+        .header("authorization", "Bearer READ")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn read_token_can_call_verify_message() {
+    // Verification is pure crypto with no key access — read scope.
+    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method":  "verify_message",
+        "params":  {
+            "pubkey":    "ab".repeat(32),
+            "signature": "cd".repeat(64),
+            "message":   "challenge",
+        },
+        "id": 1
+    });
+    let resp = reqwest::Client::new()
+        .post(&base)
+        .header("authorization", "Bearer READ")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let v: serde_json::Value = resp.json().await.unwrap();
+    // Auth passed; the (random) pubkey + sig don't verify, but `valid`
+    // should be a clean false rather than an auth error.
+    assert_eq!(v["result"]["valid"], false);
+}

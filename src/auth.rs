@@ -40,9 +40,14 @@ pub enum Scope {
 
 impl Scope {
     /// Map an RPC method name to the scope it requires.
+    ///
+    /// `sign_message` is `Spend` even though it doesn't move funds: a
+    /// signature is a verifiable proof of ownership over the wallet's
+    /// key, and value-bearing in exchange / KYC contexts. A leaked
+    /// read-only token must not be able to mint such proofs.
     pub fn for_method(method: &str) -> Scope {
         match method {
-            "transfer" | "send_raw_transaction" => Scope::Spend,
+            "transfer" | "send_raw_transaction" | "sign_message" => Scope::Spend,
             _ => Scope::Read,
         }
     }

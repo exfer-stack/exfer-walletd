@@ -621,6 +621,130 @@ the error is surfaced as `-32020` with the upstream's message intact.
 
 ---
 
+## `sign_message`
+
+Sign an arbitrary UTF-8 message with the Ed25519 key of a managed
+wallet. Proof-of-ownership for exchange KYC, cold-wallet
+challenge-response, off-chain auth — same role as Bitcoin's
+`signmessage`. Pure in-process crypto — no upstream calls.
+
+| | |
+|---|---|
+| **Scope** | spend |
+
+Although signing doesn't move funds, the artifact is a verifiable
+proof of ownership of a wallet key. A leaked read-only token must not
+be able to mint such proofs, so this is gated behind the spend scope.
+
+**Params**
+
+| Field     | Type   | Required | Description                                              |
+| --------- | ------ | -------- | -------------------------------------------------------- |
+| `address` | hex64  | yes      | Address of a wallet walletd holds the key for.           |
+| `message` | string | yes      | UTF-8 message to sign. Bytes signed = `"EXFER-MSG" ‖ message.as_bytes()`. |
+
+The fixed `EXFER-MSG` domain separator prevents a message signature
+from ever being mistaken for a transaction signature (transactions
+sign under `EXFER-SIG`).
+
+**Returns** `{ signature: hex128, pubkey: hex64, address: hex64 }`
+
+**Example**
+
+```bash
+curl -s $URL -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"sign_message","params":{
+            "address": "<your-managed-address>",
+            "message": "kyc-nonce-1234abcd"
+         },"id":1}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": {
+    "signature": "8f4ad5…64-byte-sig-as-128-hex…",
+    "pubkey":    "658f0a295fefbaa4f94a020e45aa82938ec34946a05733906ef2fc5300b2ba5f",
+    "address":   "27e1c883f3f1bdb124e5430dacc92e1e8ca25a73e50052cadba78e065ce09eaf"
+  },
+  "id": 1
+}
+```
+
+**Errors**
+
+| Code     | When |
+|----------|------|
+| `-32001` | Read-scope token hitting a spend method. |
+| `-32010` | Wallet not found — walletd doesn't hold the key for `address`. |
+| `-32602` | `address` not 64-hex. |
+
+---
+
+## `verify_message`
+
+Verify an Ed25519 message signature. Pure crypto, no wallet access
+required — anyone with a `read` token (or no scope split at all) can
+call it. The signer doesn't have to be a wallet walletd manages.
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params**
+
+| Field       | Type   | Required | Description                                                                |
+| ----------- | ------ | -------- | -------------------------------------------------------------------------- |
+| `pubkey`    | hex64  | yes      | Signer's 32-byte Ed25519 public key (as returned by `sign_message`).       |
+| `signature` | hex128 | yes      | 64-byte signature.                                                         |
+| `message`   | string | yes      | Same UTF-8 message that was signed.                                        |
+| `address`   | hex64  | no       | If present, walletd also checks that `H(DS_ADDR ‖ pubkey) == address`. |
+
+**Returns**
+
+```ts
+{
+  valid:   bool,    // signature verifies AND (if address provided) hash matches
+  address: hex64,   // computed `H(DS_ADDR ‖ pubkey)` — always returned
+}
+```
+
+`address` is always returned (even when `valid` is `false`) so a
+caller can see what the pubkey actually hashes to without recomputing
+locally.
+
+**Example**
+
+```bash
+curl -s $URL -H "Authorization: Bearer $TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"verify_message","params":{
+            "pubkey":    "658f0a…",
+            "signature": "8f4ad5…",
+            "message":   "kyc-nonce-1234abcd",
+            "address":   "27e1c8…"
+         },"id":1}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "result": { "valid": true, "address": "27e1c8…" },
+  "id": 1
+}
+```
+
+**Errors**
+
+| Code     | When |
+|----------|------|
+| `-32602` | `pubkey` or `address` not 64-hex; `signature` not 128-hex / 64 bytes. |
+
+A bad signature is **not** an error — it's `{ "valid": false }`.
+
+---
+
 ## `GET /healthz`
 
 Liveness probe. Returns `200 OK` with body `ok\n`. **Not** behind

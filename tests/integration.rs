@@ -779,3 +779,121 @@ async fn get_block_hash_rejects_missing_height_param() {
         "expected BadEnvelope, got {err:?}"
     );
 }
+
+// --- sign_message / verify_message ---------------------------------------
+
+#[tokio::test]
+async fn sign_message_then_verify_message_roundtrip() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    // 1. Mint a new wallet via the public API.
+    let gen = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+    let address = gen["address"].as_str().unwrap().to_string();
+
+    // 2. Sign.
+    let signed = dispatch(
+        &state,
+        rpc(
+            "sign_message",
+            json!({ "address": address, "message": "challenge:nonce-1234abcd" }),
+        ),
+    )
+    .await
+    .unwrap();
+    let signature = signed["signature"].as_str().unwrap().to_string();
+    let pubkey = signed["pubkey"].as_str().unwrap().to_string();
+    assert_eq!(signed["address"], address);
+    assert_eq!(signature.len(), 128, "ed25519 sig hex must be 128 chars");
+    assert_eq!(pubkey.len(), 64);
+
+    // 3. Verify — sig + pubkey only (no address check).
+    let v = dispatch(
+        &state,
+        rpc(
+            "verify_message",
+            json!({
+                "pubkey":    pubkey,
+                "signature": signature,
+                "message":   "challenge:nonce-1234abcd",
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["valid"], true);
+    assert_eq!(v["address"], address, "computed address must match");
+
+    // 4. Verify with the claimed address — must still succeed.
+    let v_with_addr = dispatch(
+        &state,
+        rpc(
+            "verify_message",
+            json!({
+                "pubkey":    pubkey,
+                "signature": signature,
+                "message":   "challenge:nonce-1234abcd",
+                "address":   address,
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v_with_addr["valid"], true);
+
+    // 5. Tampered message → invalid.
+    let v_bad_msg = dispatch(
+        &state,
+        rpc(
+            "verify_message",
+            json!({
+                "pubkey":    pubkey,
+                "signature": signature,
+                "message":   "tampered",
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v_bad_msg["valid"], false);
+
+    // 6. Wrong claimed address → invalid even though sig is good.
+    let v_wrong_addr = dispatch(
+        &state,
+        rpc(
+            "verify_message",
+            json!({
+                "pubkey":    pubkey,
+                "signature": signature,
+                "message":   "challenge:nonce-1234abcd",
+                "address":   "ff".repeat(32),
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v_wrong_addr["valid"], false);
+    assert_eq!(v_wrong_addr["address"], address, "still report the real address");
+}
+
+#[tokio::test]
+async fn sign_message_unknown_address_returns_wallet_not_found() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "sign_message",
+            json!({ "address": "ab".repeat(32), "message": "anything" }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::WalletNotFound(_)),
+        "expected WalletNotFound, got {err:?}"
+    );
+}

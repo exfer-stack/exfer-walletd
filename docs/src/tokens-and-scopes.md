@@ -39,7 +39,7 @@ and enforces the two-scope model:
 
 | Env var                       | Scope  | Methods                                                      |
 | ----------------------------- | ------ | ------------------------------------------------------------ |
-| `WALLETD_AUTH_TOKEN_READ`     | read   | Every method **except** `transfer` / `send_raw_transaction`. |
+| `WALLETD_AUTH_TOKEN_READ`     | read   | Every method **except** `transfer` / `send_raw_transaction` / `sign_message`. |
 | `WALLETD_AUTH_TOKEN_SPEND`    | spend  | All methods. Spend implies read.                              |
 | `WALLETD_AUTH_TOKEN`          | all    | Single-token mode (also the auto-generated file's behaviour). |
 

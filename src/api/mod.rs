@@ -26,6 +26,8 @@ use crate::store::WalletStore;
 use crate::tx::TransferReceipt;
 use crate::upstream::ExferNode;
 
+pub mod signmsg;
+
 #[derive(Clone)]
 pub struct ApiState {
     pub store: Arc<dyn WalletStore>,
@@ -166,6 +168,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
 
         // ---- broadcast passthrough ----
         "send_raw_transaction" => send_raw_transaction(state, req.params).await,
+
+        // ---- proof-of-ownership signatures ----
+        "sign_message" => signmsg::sign_message(state, req.params).await,
+        "verify_message" => signmsg::verify_message(state, req.params).await,
 
         // ---- health ----
         "ping" => Ok(serde_json::json!({ "ok": true })),

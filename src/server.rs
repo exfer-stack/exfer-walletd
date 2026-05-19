@@ -167,12 +167,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Duration::from_secs(cfg.upstream_timeout_secs),
         retry,
     )?;
-    // For now: profile-derived cache, no refresh-secs override yet
-    // (CLI flags land in stage 7). Refresher is wired in stage 4.
+    // Profile-derived cache + spawned refresher. CLI flag for the
+    // profile lands in stage 7; for now default to Balanced.
     let cache = Arc::new(WalletCache::new(crate::cache::CacheProfile::Balanced, None));
+    let store_arc: Arc<dyn crate::store::WalletStore> = Arc::new(store);
+    let node_arc = Arc::new(node);
+    let refresher =
+        crate::cache::spawn_refresher(cache.clone(), node_arc.clone(), store_arc.clone());
     let api = ApiState {
-        store: Arc::new(store),
-        node: Arc::new(node),
+        store: store_arc,
+        node: node_arc,
         inflight: Arc::new(InFlightUtxos::new()),
         cache,
     };
@@ -253,6 +257,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .with_graceful_shutdown(shutdown_signal())
             .await?;
     }
+    // Stop the cache refresher cleanly. Waits at most one per-tick
+    // worth of in-flight HTTP work to drain.
+    refresher.shutdown().await;
     Ok(())
 }
 

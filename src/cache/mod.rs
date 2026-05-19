@@ -24,12 +24,14 @@
 pub mod balance;
 pub mod entry;
 pub mod profile;
+pub mod refresher;
 pub mod tip;
 pub mod utxo;
 
 pub use balance::{BalanceCache, BalancePeek};
 pub use entry::{EntrySnapshot, EntryStore, Generation};
 pub use profile::{CacheParams, CacheProfile};
+pub use refresher::{spawn as spawn_refresher, RefresherHandle};
 pub use tip::{TipCache, TipSnapshot};
 pub use utxo::{UtxoCache, UtxoPeek};
 

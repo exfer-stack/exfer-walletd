@@ -9,3 +9,5 @@ target/
 /tests/e2e_live.sh
 docs/book/
 .replay-perf-bench/
+
+.claude/

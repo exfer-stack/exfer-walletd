@@ -29,12 +29,13 @@ pub struct Config {
     #[arg(long, env = "WALLETD_DATADIR")]
     pub datadir: Option<PathBuf>,
 
-    /// HTTP address the daemon listens on.
+    /// HTTP(S) address the daemon listens on.
     ///
     /// Default is loopback. Public-interface binds (`0.0.0.0`, any
-    /// globally-routable IP) require `--allow-public-bind` because
-    /// walletd does not terminate TLS itself — the bearer token would
-    /// otherwise travel plaintext on the wire.
+    /// globally-routable IP) require either `--tls` (in-process TLS
+    /// termination) or `--allow-public-bind` (you're acknowledging
+    /// that something else — a reverse proxy, VPN, private network —
+    /// keeps the bearer token off plaintext wire).
     #[arg(long, env = "WALLETD_BIND", default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
 
@@ -42,7 +43,8 @@ pub struct Config {
     /// network) sits in front of walletd, and bind a non-loopback
     /// interface anyway. Without this, public binds fail-close at
     /// startup so the bearer token can't accidentally end up plaintext
-    /// on the wire.
+    /// on the wire. **`--tls` is the simpler alternative** — it gives
+    /// you in-process TLS and relaxes this check automatically.
     ///
     /// As an env var, accepts `1` / `true` / `yes` / `on`.
     #[arg(
@@ -54,6 +56,42 @@ pub struct Config {
         default_missing_value = "true",
     )]
     pub allow_public_bind: bool,
+
+    /// Terminate TLS inside walletd using a self-signed certificate.
+    ///
+    /// On first start with `--tls`, walletd generates a leaf
+    /// certificate and matching private key at `<datadir>/cert.pem`
+    /// and `<datadir>/cert.key` (both mode 0600), and writes the
+    /// SHA-256 fingerprint to `<datadir>/cert.fingerprint`. The
+    /// fingerprint is also printed once to stderr — copy it to the
+    /// client side (`exfer-walletd-py`'s `fingerprint=` param) for
+    /// pinning. Subsequent starts reuse the existing files.
+    ///
+    /// `--tls` relaxes the `--allow-public-bind` requirement (the
+    /// whole reason for that flag was "the token would travel
+    /// plaintext"; with TLS it doesn't).
+    ///
+    /// As an env var, accepts `1` / `true` / `yes` / `on`.
+    #[arg(
+        long,
+        env = "WALLETD_TLS",
+        value_parser = parse_lenient_bool,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub tls: bool,
+
+    /// Override the path to the TLS certificate. Defaults to
+    /// `<datadir>/cert.pem`. Generated automatically on first run when
+    /// `--tls` is set.
+    #[arg(long, env = "WALLETD_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Override the path to the TLS private key. Defaults to
+    /// `<datadir>/cert.key`.
+    #[arg(long, env = "WALLETD_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
 
     /// JSON-RPC URL of one or more upstream Exfer nodes. Accepts a
     /// single URL or a comma-separated list — calls round-robin
@@ -136,6 +174,26 @@ impl Config {
     pub fn token_file(&self) -> PathBuf {
         self.resolved_datadir().join("token")
     }
+
+    /// Resolve `--tls-cert`, defaulting to `<datadir>/cert.pem`.
+    pub fn resolved_tls_cert_path(&self) -> PathBuf {
+        self.tls_cert
+            .clone()
+            .unwrap_or_else(|| self.resolved_datadir().join("cert.pem"))
+    }
+
+    /// Resolve `--tls-key`, defaulting to `<datadir>/cert.key`.
+    pub fn resolved_tls_key_path(&self) -> PathBuf {
+        self.tls_key
+            .clone()
+            .unwrap_or_else(|| self.resolved_datadir().join("cert.key"))
+    }
+
+    /// Path of the fingerprint file. Always lives in the datadir
+    /// (it's a small file that pairs with the cert; no override).
+    pub fn tls_fingerprint_path(&self) -> PathBuf {
+        self.resolved_datadir().join("cert.fingerprint")
+    }
 }
 
 /// Accept Unix-style booleans ("1", "yes", "on") in addition to the
@@ -159,6 +217,9 @@ mod tests {
             datadir: None,
             bind: "127.0.0.1:8080".parse().unwrap(),
             allow_public_bind: false,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             node_rpc: "http://127.0.0.1:9334".into(),
             wallet_dir: None,
             auth_token: None,

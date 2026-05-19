@@ -58,6 +58,7 @@ pub mod error;
 pub mod inflight;
 pub mod server;
 pub mod store;
+pub mod tls;
 pub mod tx;
 pub mod upstream;
 

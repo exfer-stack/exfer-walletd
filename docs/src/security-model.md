@@ -28,9 +28,13 @@ running.
   no quorum, no MPC. If you need finer-grained authority, implement
   the [`WalletStore`](https://github.com/exfer-stack/exfer-walletd/blob/main/src/store/mod.rs)
   trait against an HSM or KMS backend and slot it in.
-- **No built-in TLS.** Walletd speaks plaintext HTTP. For cross-host
-  traffic, terminate TLS in front of it (Caddy, nginx, cloud LB,
-  ingress) or keep the link on a trusted private network.
+- **TLS is opt-in via `--tls`.** Walletd defaults to plaintext HTTP
+  on loopback. For cross-host traffic, pass `--tls` and walletd
+  terminates TLS in-process with a self-signed certificate it
+  generates on first run; pin it on the client side by SHA-256
+  fingerprint (`exfer-walletd-py` accepts `fingerprint=…`). External
+  TLS terminators (Caddy, nginx, cloud LB, ingress) still work; pair
+  with `--allow-public-bind` to acknowledge them.
 - **No rate limit, no IP allowlist.** A 32-random-byte token is
   computationally infeasible to brute-force online, but if the
   deployment is reachable from the public internet you still want

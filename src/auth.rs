@@ -210,6 +210,7 @@ pub fn check_bind_is_safe(
     bind: std::net::SocketAddr,
     tokens: &Tokens,
     allow_public: bool,
+    tls_enabled: bool,
 ) -> Result<()> {
     match classify_bind(bind.ip()) {
         BindClass::Loopback => Ok(()),
@@ -225,6 +226,8 @@ pub fn check_bind_is_safe(
             Ok(())
         }
         BindClass::Public => {
+            // No token + public bind is always wrong, regardless of TLS.
+            // TLS protects the wire; it doesn't authenticate anyone.
             if !tokens.any_set() {
                 return Err(Error::Internal(format!(
                     "refusing to bind {bind} on a public interface without any \
@@ -232,21 +235,25 @@ pub fn check_bind_is_safe(
                      or bind to 127.0.0.1 / a private address."
                 )));
             }
+            // TLS-on means the bearer token is encrypted on the wire,
+            // so the explicit --allow-public-bind acknowledgement isn't
+            // needed.
+            if tls_enabled {
+                return Ok(());
+            }
             if !allow_public {
                 return Err(Error::Internal(format!(
                     "refusing to bind {bind} directly on a public interface.\n\n\
-                     Without a TLS terminator (Caddy, nginx, Cloudflare, \
-                     k8s ingress, a cloud load balancer, …) in front of \
-                     walletd, the bearer token rides the wire as plaintext \
-                     and any in-path observer (ISP, transit, target \
-                     network) can capture it and spend every managed \
-                     wallet.\n\n\
-                     Recommended fix:\n  \
-                       --bind 127.0.0.1:8080\n  \
-                     and put Caddy in front for automatic TLS. See \
-                     https://exfer-stack.github.io/exfer-walletd/#production-deploy.\n\n\
-                     If you really do have a TLS terminator in front \
-                     (k8s ingress, ALB, …), acknowledge it with:\n  \
+                     Without TLS, the bearer token rides the wire as plaintext \
+                     and any in-path observer (ISP, transit, target network) \
+                     can capture it and spend every managed wallet.\n\n\
+                     Recommended fix (in-process TLS, zero config):\n  \
+                       --tls\n  \
+                     walletd will generate a self-signed cert on first run \
+                     and print the SHA-256 fingerprint for SDK pinning. See \
+                     https://exfer-stack.github.io/exfer-walletd/quick-start.html.\n\n\
+                     If you have an external TLS terminator (Caddy, nginx, \
+                     k8s ingress, ALB, …) in front, acknowledge it with:\n  \
                        --allow-public-bind\n  \
                        (or WALLETD_ALLOW_PUBLIC_BIND=1)"
                 )));
@@ -402,34 +409,39 @@ mod tests {
     #[test]
     fn bind_check_loopback_always_ok() {
         let lo: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        assert!(check_bind_is_safe(lo, &Tokens::default(), false).is_ok());
-        assert!(check_bind_is_safe(lo, &Tokens::default(), true).is_ok());
+        assert!(check_bind_is_safe(lo, &Tokens::default(), false, false).is_ok());
+        assert!(check_bind_is_safe(lo, &Tokens::default(), true, false).is_ok());
+        assert!(check_bind_is_safe(lo, &Tokens::default(), false, true).is_ok());
     }
 
     #[test]
     fn bind_check_private_always_ok_but_warns_without_token() {
         let priv_addr: SocketAddr = "10.0.0.5:8080".parse().unwrap();
-        assert!(check_bind_is_safe(priv_addr, &Tokens::default(), false).is_ok());
+        assert!(check_bind_is_safe(priv_addr, &Tokens::default(), false, false).is_ok());
         let with_token = Tokens::from_config(None, None, Some("x"));
-        assert!(check_bind_is_safe(priv_addr, &with_token, false).is_ok());
+        assert!(check_bind_is_safe(priv_addr, &with_token, false, false).is_ok());
     }
 
     #[test]
-    fn bind_check_public_without_token_refused_either_way() {
+    fn bind_check_public_without_token_refused_regardless_of_tls_or_ack() {
         let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let empty = Tokens::default();
-        assert!(check_bind_is_safe(public, &empty, false).is_err());
-        // Even with --allow-public-bind, no token = still refused.
-        assert!(check_bind_is_safe(public, &empty, true).is_err());
+        assert!(check_bind_is_safe(public, &empty, false, false).is_err());
+        // --allow-public-bind without a token = still refused.
+        assert!(check_bind_is_safe(public, &empty, true, false).is_err());
+        // --tls without a token = still refused. TLS protects the wire,
+        // not the API — anyone can hit it without auth.
+        assert!(check_bind_is_safe(public, &empty, false, true).is_err());
     }
 
     #[test]
-    fn bind_check_public_with_token_refused_without_allow_flag() {
+    fn bind_check_public_with_token_refused_without_tls_or_ack() {
         let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let with_token = Tokens::from_config(None, None, Some("x"));
-        let err = check_bind_is_safe(public, &with_token, false).unwrap_err();
+        let err = check_bind_is_safe(public, &with_token, false, false).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("refusing to bind"));
+        assert!(msg.contains("--tls"));
         assert!(msg.contains("--allow-public-bind"));
     }
 
@@ -437,7 +449,15 @@ mod tests {
     fn bind_check_public_with_token_and_allow_flag_succeeds() {
         let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let with_token = Tokens::from_config(None, None, Some("x"));
-        assert!(check_bind_is_safe(public, &with_token, true).is_ok());
+        assert!(check_bind_is_safe(public, &with_token, true, false).is_ok());
+    }
+
+    #[test]
+    fn bind_check_public_with_token_and_tls_succeeds_without_ack() {
+        let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let with_token = Tokens::from_config(None, None, Some("x"));
+        // TLS-on relaxes the --allow-public-bind requirement.
+        assert!(check_bind_is_safe(public, &with_token, false, true).is_ok());
     }
 
     #[test]

@@ -107,9 +107,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     );
 
     // Fail closed: refuse public binds without a token, and refuse
-    // public binds *with* a token unless --allow-public-bind is set
-    // (the operator must acknowledge that TLS termination is in front).
-    check_bind_is_safe(cfg.bind, &tokens, cfg.allow_public_bind)
+    // public binds *with* a token unless either --tls is on (we
+    // terminate TLS ourselves) or --allow-public-bind is set (the
+    // operator is acknowledging an external TLS terminator / VPN).
+    check_bind_is_safe(cfg.bind, &tokens, cfg.allow_public_bind, cfg.tls)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     let store = FsWalletStore::open(&wallet_dir)?;
@@ -132,8 +133,32 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tokens: Arc::new(tokens.clone()),
     };
 
+    // Load (or generate, on first run) the TLS material if --tls is on.
+    // We do this *before* logging "starting" so the first-run cert box
+    // appears next to the token box, not after a misleading "starting"
+    // line.
+    let tls_material = if cfg.tls {
+        Some(crate::tls::ensure_cert_files(
+            &cfg.resolved_tls_cert_path(),
+            &cfg.resolved_tls_key_path(),
+            &cfg.tls_fingerprint_path(),
+            Some(cfg.bind.ip()),
+        )?)
+    } else {
+        None
+    };
+
+    let scheme = if cfg.tls { "https" } else { "http" };
+    let fingerprint_log = tls_material
+        .as_ref()
+        .map(|m| m.fingerprint.clone())
+        .unwrap_or_default();
+
     tracing::info!(
         bind         = %cfg.bind,
+        scheme       = %scheme,
+        tls          = cfg.tls,
+        fingerprint  = %fingerprint_log,
         node_rpc     = %cfg.node_rpc,
         datadir      = %datadir.display(),
         wallet_dir   = %wallet_dir.display(),
@@ -144,13 +169,29 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     );
 
     let app = build_router(app_state);
-    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+
+    if let Some(material) = tls_material {
+        // axum-server owns the listen+accept loop on the TLS path.
+        // Graceful shutdown wiring differs from axum::serve but the
+        // handle is straightforward.
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        });
+        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(material.server_config);
+        axum_server::bind_rustls(cfg.bind, rustls_cfg)
+            .handle(handle)
+            .serve(make_service)
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+        axum::serve(listener, make_service)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
     Ok(())
 }
 

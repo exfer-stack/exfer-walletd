@@ -49,16 +49,57 @@ curl -s http://<walletd-host>:8080/ -H 'content-type: application/json' \
 
 Full method list: [RPC reference](./rpc-reference.md).
 
+## Production: enable TLS
+
+For cross-host traffic, pass `--tls` and walletd terminates TLS itself
+with a self-signed certificate it generates on first run. No CA, no
+rotation ceremony, no reverse proxy.
+
+```bash
+exfer-walletd --tls --bind 0.0.0.0:8443
+```
+
+On first start with `--tls`, walletd creates three files alongside
+`token` in the datadir — `cert.pem`, `cert.key`, `cert.fingerprint`
+(all mode `0600`) — and prints the SHA-256 fingerprint to stderr in
+the same box style as the token:
+
+```
+  ┌─ first run ───────────────────────────────────────────────────────────
+  │ generated self-signed TLS cert
+  │   cert:        /var/lib/walletd/cert.pem
+  │   fingerprint: /var/lib/walletd/cert.fingerprint
+  │
+  │     sha256:b66953c47263ac0da8192676e4770f0f799563322985c57246a6fab1bf24aa86
+  │
+  │ pin this value on the client side (SDK: fingerprint=…).
+  └───────────────────────────────────────────────────────────────────────
+```
+
+Pin that string on the client. The Python SDK reads it automatically:
+
+```python
+from exfer_walletd import Client
+with Client.from_datadir(url="https://walletd.internal:8443") as c:
+    print(c.healthz())
+```
+
+(or pass `WALLETD_FINGERPRINT=sha256:…` as an env var if your backend
+isn't colocated with walletd's datadir.)
+
+`--tls` relaxes the `--allow-public-bind` requirement, since the
+bearer token is no longer plaintext on the wire.
+
 ## Other useful flags
 
 ```bash
 exfer-walletd --node-rpc 'http://a:9334,http://b:9334'  # round-robin + failover
 exfer-walletd --datadir  /var/lib/walletd               # different storage location
-exfer-walletd --allow-public-bind --bind 0.0.0.0:8080   # public bind (TLS in front!)
+exfer-walletd --allow-public-bind --bind 0.0.0.0:8080   # public bind (external TLS terminator)
 ```
 
 Every flag also reads from a matching env var (`EXFER_NODE_RPC`,
-`WALLETD_BIND`, `WALLETD_DATADIR`, …). Full list:
+`WALLETD_BIND`, `WALLETD_DATADIR`, `WALLETD_TLS`, …). Full list:
 `exfer-walletd --help`.
 
 ## Running on boot

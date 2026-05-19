@@ -1,6 +1,6 @@
 [package]
 name        = "exfer-walletd"
-version     = "0.4.3"
+version     = "0.5.0"
 edition     = "2021"
 description = "Exfer Wallet Daemon — independent wallet service that exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes"
 license     = "MIT"
@@ -33,6 +33,16 @@ thiserror        = "1"
 clap             = { version = "4", features = ["derive", "env"] }
 subtle           = "2"
 rand             = "0.8"
+
+# TLS termination (--tls). axum-server reuses our axum/tokio stack and
+# accepts a rustls ServerConfig directly; rcgen issues the self-signed
+# leaf; sha2 hashes the DER for the fingerprint we pin in the SDK.
+axum-server      = { version = "0.7", features = ["tls-rustls"] }
+rcgen            = "0.13"
+rustls           = "0.23"
+rustls-pemfile   = "2"
+sha2             = "0.10"
+time             = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

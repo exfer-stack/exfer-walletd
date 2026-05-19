@@ -36,7 +36,7 @@ pub struct Config {
     /// termination) or `--allow-public-bind` (you're acknowledging
     /// that something else — a reverse proxy, VPN, private network —
     /// keeps the bearer token off plaintext wire).
-    #[arg(long, env = "WALLETD_BIND", default_value = "127.0.0.1:8080")]
+    #[arg(long, env = "WALLETD_BIND", default_value = "127.0.0.1:7448")]
     pub bind: SocketAddr,
 
     /// Acknowledge that a TLS terminator (or a trusted private
@@ -215,7 +215,7 @@ mod tests {
     fn empty_cfg() -> Config {
         Config {
             datadir: None,
-            bind: "127.0.0.1:8080".parse().unwrap(),
+            bind: "127.0.0.1:7448".parse().unwrap(),
             allow_public_bind: false,
             tls: false,
             tls_cert: None,

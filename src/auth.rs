@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn bind_check_loopback_always_ok() {
-        let lo: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let lo: SocketAddr = "127.0.0.1:7448".parse().unwrap();
         assert!(check_bind_is_safe(lo, &Tokens::default(), false, false).is_ok());
         assert!(check_bind_is_safe(lo, &Tokens::default(), true, false).is_ok());
         assert!(check_bind_is_safe(lo, &Tokens::default(), false, true).is_ok());
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn bind_check_private_always_ok_but_warns_without_token() {
-        let priv_addr: SocketAddr = "10.0.0.5:8080".parse().unwrap();
+        let priv_addr: SocketAddr = "10.0.0.5:7448".parse().unwrap();
         assert!(check_bind_is_safe(priv_addr, &Tokens::default(), false, false).is_ok());
         let with_token = Tokens::from_config(None, None, Some("x"));
         assert!(check_bind_is_safe(priv_addr, &with_token, false, false).is_ok());
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn bind_check_public_without_token_refused_regardless_of_tls_or_ack() {
-        let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let public: SocketAddr = "0.0.0.0:7448".parse().unwrap();
         let empty = Tokens::default();
         assert!(check_bind_is_safe(public, &empty, false, false).is_err());
         // --allow-public-bind without a token = still refused.
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn bind_check_public_with_token_refused_without_tls_or_ack() {
-        let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let public: SocketAddr = "0.0.0.0:7448".parse().unwrap();
         let with_token = Tokens::from_config(None, None, Some("x"));
         let err = check_bind_is_safe(public, &with_token, false, false).unwrap_err();
         let msg = err.to_string();
@@ -447,14 +447,14 @@ mod tests {
 
     #[test]
     fn bind_check_public_with_token_and_allow_flag_succeeds() {
-        let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let public: SocketAddr = "0.0.0.0:7448".parse().unwrap();
         let with_token = Tokens::from_config(None, None, Some("x"));
         assert!(check_bind_is_safe(public, &with_token, true, false).is_ok());
     }
 
     #[test]
     fn bind_check_public_with_token_and_tls_succeeds_without_ack() {
-        let public: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let public: SocketAddr = "0.0.0.0:7448".parse().unwrap();
         let with_token = Tokens::from_config(None, None, Some("x"));
         // TLS-on relaxes the --allow-public-bind requirement.
         assert!(check_bind_is_safe(public, &with_token, false, true).is_ok());

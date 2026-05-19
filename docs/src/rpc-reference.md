@@ -44,7 +44,7 @@ Amounts and fees are integers in **exfers**, where
 The shell variable conventions in the examples:
 
 ```bash
-URL='http://127.0.0.1:8080'
+URL='http://127.0.0.1:7448'
 TOKEN='your-token-here'
 ```
 
@@ -543,7 +543,7 @@ A minimal helper:
 ```python
 import requests
 
-URL   = "http://127.0.0.1:8080"
+URL   = "http://127.0.0.1:7448"
 TOKEN = "..."  # WALLETD_AUTH_TOKEN
 
 def rpc(method, params=None, id=1):
@@ -579,7 +579,7 @@ if bal["balance"] > 200_000:
 ## Node.js client
 
 ```javascript
-const URL   = "http://127.0.0.1:8080";
+const URL   = "http://127.0.0.1:7448";
 const TOKEN = process.env.WALLETD_AUTH_TOKEN;
 
 async function rpc(method, params = {}) {

@@ -34,7 +34,7 @@ For most deployments — node, walletd, and backend on different hosts:
 ```bash
 exfer-walletd \
     --node-rpc http://<your-node-host>:<port> \
-    --bind     <walletd-host-internal-ip>:8080
+    --bind     <walletd-host-internal-ip>:7448
 ```
 
 On first run, walletd creates `~/.exfer-walletd/` (mode `0700`),
@@ -43,14 +43,14 @@ generates a 32-byte bearer token at `~/.exfer-walletd/token`
 
 **Dev shortcut**: if node, walletd, and the caller are all on one
 host, every flag has a sensible default and `exfer-walletd` with no
-args just works (defaults: `--bind 127.0.0.1:8080`, `--node-rpc
+args just works (defaults: `--bind 127.0.0.1:7448`, `--node-rpc
 http://127.0.0.1:9334`).
 
 ## Call it
 
 ```bash
 TOKEN=$(cat ~/.exfer-walletd/token)
-curl -s http://<walletd-host>:8080/ -H 'content-type: application/json' \
+curl -s http://<walletd-host>:7448/ -H 'content-type: application/json' \
      -H "Authorization: Bearer $TOKEN" \
      -d '{"jsonrpc":"2.0","method":"generate_address","id":1}'
 # → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…"},"id":1}

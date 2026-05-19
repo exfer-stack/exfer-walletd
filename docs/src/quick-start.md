@@ -8,7 +8,7 @@ Node, walletd, and your code all on one host? Zero flags:
 exfer-walletd
 ```
 
-Defaults: `--bind 127.0.0.1:8080`, `--node-rpc http://127.0.0.1:9334`,
+Defaults: `--bind 127.0.0.1:7448`, `--node-rpc http://127.0.0.1:9334`,
 `--datadir ~/.exfer-walletd`. Assumes a node is already running on
 `127.0.0.1:9334`.
 
@@ -40,7 +40,7 @@ There's nothing else walletd touches.
 
 ```bash
 TOKEN=$(cat ~/.exfer-walletd/token)
-curl -s http://127.0.0.1:8080/ \
+curl -s http://127.0.0.1:7448/ \
      -H 'content-type: application/json' \
      -H "Authorization: Bearer $TOKEN" \
      -d '{"jsonrpc":"2.0","method":"ping","id":1}'
@@ -55,7 +55,7 @@ Default bind is loopback-only, so a backend on a different server
 can't reach it. Bind your host's private/internal IP:
 
 ```bash
-exfer-walletd --bind 10.0.1.5:8080
+exfer-walletd --bind 10.0.1.5:7448
 ```
 
 Private/RFC1918 addresses are allowed with no extra flag. **Public
@@ -70,7 +70,7 @@ cert it generates on first run. No CA, no rotation ceremony, no
 reverse proxy.
 
 ```bash
-exfer-walletd --tls --bind 0.0.0.0:8443
+exfer-walletd --tls --bind 0.0.0.0:7448
 ```
 
 On first start with `--tls`, walletd creates `cert.pem`, `cert.key`,
@@ -95,7 +95,7 @@ Pin it on the client. The Python SDK reads it automatically:
 
 ```python
 from exfer_walletd import Client
-with Client.from_datadir(url="https://walletd.internal:8443") as c:
+with Client.from_datadir(url="https://<walletd-host>:7448") as c:
     print(c.healthz())
 ```
 
@@ -111,9 +111,9 @@ side without shelling into the walletd host:
 ```bash
 # from your backend host (or anywhere):
 curl --insecure -o /etc/walletd/cert.pem \
-     https://walletd.internal:8443/exfer-walletd/cert.pem
+     https://<walletd-host>:7448/exfer-walletd/cert.pem
 
-curl --insecure https://walletd.internal:8443/exfer-walletd/cert.fingerprint
+curl --insecure https://<walletd-host>:7448/exfer-walletd/cert.fingerprint
 # → sha256:b66953c47263ac0da8192676e4770f0f799563322985c57246a6fab1bf24aa86
 ```
 

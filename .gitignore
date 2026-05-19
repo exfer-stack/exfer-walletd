@@ -8,3 +8,4 @@ target/
 /scripts/deploy.sh
 /tests/e2e_live.sh
 docs/book/
+.replay-perf-bench/

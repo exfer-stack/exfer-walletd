@@ -102,8 +102,15 @@ pub fn spawn(
 ) -> RefresherHandle {
     let (tx, rx) = watch::channel(false);
 
-    if !cache.params.enabled {
-        // No-op supervisor — exits immediately when shutdown is signaled.
+    // No-op supervisor when:
+    // - cache profile is `off` (no cache at all), OR
+    // - refresh_interval is zero (manual-mode: caller drives refresh
+    //   via the refresh_address / refresh_addresses RPC methods).
+    //   This is the v0.14.0 default for the `balanced` profile —
+    //   automatic polling doesn't scale on rate-limited public RPCs
+    //   (4N seconds per refresh required at rpc.exfer.dev's 30/min),
+    //   so the gentle default is "cache present, refresh on demand."
+    if !cache.params.enabled || cache.params.refresh_interval.is_zero() {
         let mut rx = rx;
         let join = tokio::spawn(async move {
             let _ = rx.changed().await;

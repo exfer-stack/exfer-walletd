@@ -250,6 +250,73 @@ impl WalletCache {
         self.block.get_by_hash(hash, node).await
     }
 
+    /// **Manual refresh** for a single address — force a fresh fetch
+    /// from upstream and write back to L2 + L3. Used by the
+    /// `refresh_address` JSON-RPC method.
+    ///
+    /// Why this exists: the v0.14.0 `balanced` profile defaults to
+    /// `refresh_interval = 0` (manual mode) because automatic polling
+    /// can't scale on rate-limited public RPCs (see operations.md
+    /// "4N math"). Applications drive the cadence themselves —
+    /// expensive deposit-watcher addresses get frequent refreshes,
+    /// cold archives get refreshed on user demand.
+    ///
+    /// On address-mismatch from upstream OR per-call failure, the
+    /// failure is recorded in `last_error` and the cached value (if
+    /// any) is preserved — same contract as the automatic refresher.
+    /// Returns `()` on completion (errors are reflected in the cache
+    /// rows, not raised here).
+    pub async fn refresh_address(&self, addr: &str, node: &ExferNode) {
+        if !self.params.enabled {
+            // Cache profile = off → no cache state to refresh.
+            return;
+        }
+        // Best-effort tip fetch first (so post-refresh rows record an
+        // accurate tip_at_fetch). If tip itself fails, fall back to
+        // whatever was cached.
+        let tip_height = match self.tip.force_fetch(node).await {
+            Ok(s) => s.tip.height,
+            Err(_) => self.tip.peek().map(|s| s.tip.height).unwrap_or(0),
+        };
+
+        // Sample generations *before* fetching so a `transfer` commit
+        // that lands between sample and write loses CAS — same
+        // happens-after invariant the auto-refresher relies on.
+        let bal_gen = self.balance.peek(addr).generation;
+        let utxo_gen = self.utxo.by_addr.get(&addr.to_string()).generation;
+
+        let (bal_res, utxo_res) =
+            tokio::join!(node.get_balance(addr), node.get_address_utxos(addr));
+
+        match bal_res {
+            Ok(b) => {
+                if balance::verify_address(&b.address, addr).is_ok() {
+                    let _ = self.balance.cas_write(addr, bal_gen, b.balance, tip_height);
+                } else {
+                    self.balance
+                        .note_error(addr, "address-mismatch from upstream".into());
+                }
+            }
+            Err(e) => self.balance.note_error(addr, e.to_string()),
+        }
+
+        match utxo_res {
+            Ok(u) => {
+                let address_ok = match u.address.as_deref() {
+                    None => true,
+                    Some(returned) => balance::verify_address(returned, addr).is_ok(),
+                };
+                if address_ok {
+                    let _ = self.utxo.cas_write_address(addr, utxo_gen, u, tip_height);
+                } else {
+                    self.utxo
+                        .note_address_error(addr, "address-mismatch from upstream".into());
+                }
+            }
+            Err(e) => self.utxo.note_address_error(addr, e.to_string()),
+        }
+    }
+
     /// Eager invalidation hook called from the `transfer` engine after
     /// `guard.commit()` (i.e. after upstream confirms broadcast and the
     /// in-flight UTXOs are persisted). Invalidates L2/L3 entries for

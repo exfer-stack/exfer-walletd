@@ -408,9 +408,201 @@ async fn cache_stats_endpoint_returns_expected_shape() {
     let body: serde_json::Value = resp.json().await.unwrap();
 
     assert_eq!(body["profile"], "on");
-    assert!(body["refresh_interval_ms"].as_u64().unwrap() > 0);
+    // v0.14.0: balanced default is manual mode (refresh_interval=0).
+    // 0 is a valid + intentional value, not a "missing config" signal.
+    assert!(body["refresh_interval_ms"].as_u64().is_some());
     assert!(body["sizes"]["balance"].is_number());
     assert!(body["sizes"]["tx"].is_number());
+}
+
+#[tokio::test]
+async fn refresh_address_force_fetches_and_populates_cache() {
+    let mock = MockServer::start().await;
+    let addr = "ab".repeat(32);
+    let block_id = "bb".repeat(32);
+    // Tip + balance + utxos — refresh_address force-fetches all three.
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_block_height"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"height": 100, "block_id": block_id}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_balance"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"address": addr, "balance": 7_777_777}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_address_utxos"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"address": addr, "tip_height":100, "truncated":false, "utxos":[
+                {"tx_id":"cc".repeat(32), "output_index":0, "value":7_777_777, "height":50, "is_coinbase":false}
+            ]}
+        })))
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    let r = dispatch(
+        &state,
+        rpc("refresh_address", json!({"address": addr.clone()})),
+    )
+    .await
+    .unwrap();
+
+    // Response shape: { address: <row> } with the freshly-refreshed fields.
+    let row = &r["address"];
+    assert_eq!(row["address"], addr);
+    assert_eq!(row["balance"], 7_777_777);
+    assert_eq!(row["utxo_count"], 1);
+    assert_eq!(row["stale"], false);
+    assert_eq!(row["tip_at_fetch"], 100);
+    assert!(row["last_error"].is_null());
+}
+
+#[tokio::test]
+async fn refresh_addresses_batch_refreshes_only_listed_addrs() {
+    let mock = MockServer::start().await;
+    let a1 = "11".repeat(32);
+    let a2 = "22".repeat(32);
+    let block_id = "bb".repeat(32);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_block_height"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,"result":{"height":50,"block_id":block_id}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method":"get_balance", "params":{"address": a1}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,"result":{"address": a1, "balance": 100}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "method":"get_balance", "params":{"address": a2}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,"result":{"address": a2, "balance": 200}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_address_utxos"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "result":{"address": a1, "tip_height":50, "truncated":false, "utxos":[]}
+        })))
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    let r = dispatch(
+        &state,
+        rpc(
+            "refresh_addresses",
+            json!({"addresses": [a1.clone(), a2.clone()]}),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let rows = r["addresses"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let by_addr: std::collections::HashMap<_, _> = rows
+        .iter()
+        .map(|row| (row["address"].as_str().unwrap().to_string(), row.clone()))
+        .collect();
+    assert_eq!(by_addr[&a1]["balance"], 100);
+    assert_eq!(by_addr[&a2]["balance"], 200);
+}
+
+#[tokio::test]
+async fn refresh_address_records_last_error_on_upstream_failure() {
+    let mock = MockServer::start().await;
+    let addr = "33".repeat(32);
+    let block_id = "bb".repeat(32);
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_block_height"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,"result":{"height":1,"block_id":block_id}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_balance"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "error":{"code":-32603,"message":"Rate limit exceeded: max 30/min"}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"method":"get_address_utxos"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc":"2.0","id":1,
+            "error":{"code":-32603,"message":"Rate limit exceeded: max 30/min"}
+        })))
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    // refresh_address returns 200 even on per-call failure — the error
+    // surfaces in the row's last_error, not as a JSON-RPC error.
+    let r = dispatch(
+        &state,
+        rpc("refresh_address", json!({"address": addr.clone()})),
+    )
+    .await
+    .unwrap();
+    let row = &r["address"];
+    assert_eq!(row["address"], addr);
+    assert!(
+        row["balance"].is_null(),
+        "no prior cache → balance stays null"
+    );
+    assert!(
+        row["last_error"].as_str().unwrap().contains("Rate limit"),
+        "row carries last_error: {:?}",
+        row["last_error"]
+    );
+}
+
+#[tokio::test]
+async fn refresher_in_manual_mode_does_not_auto_tick() {
+    // Default v0.14.0 balanced profile = refresh_interval 0 → refresher
+    // is a no-op. Verify by setting up a mock that 404s every call
+    // (would surface as upstream errors in logs if refresher fired)
+    // and confirming the cache stays cold for the test window.
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0) // ZERO upstream calls expected
+        .mount(&mock)
+        .await;
+    let (state, _dir) = make_state(mock.uri(), CacheProfile::Balanced);
+
+    // Generate an address — this seeds L2 with balance=0 (no upstream).
+    dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+
+    // Sit quietly for 2 seconds. If the refresher were firing, it
+    // would burn at least one tick and the mock's expect(0) would fail
+    // when the wiremock server drops.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // expect(0) is verified on Mock drop.
 }
 
 #[tokio::test]

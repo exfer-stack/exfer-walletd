@@ -106,6 +106,22 @@ impl CacheParams {
     }
 
     fn balanced() -> Self {
+        // v0.14.0 breaking change: `refresh_interval = 0` means
+        // *manual* mode — the background refresher does NOT fire on
+        // its own. Callers refresh on demand via the `refresh_address`
+        // / `refresh_addresses` RPC methods.
+        //
+        // Why: on a rate-limited public RPC like rpc.exfer.dev (30
+        // balance/utxo queries/min), the automatic refresher requires
+        // `refresh_interval >= 4N` seconds where N is the managed
+        // address count — at 100 addresses that's 6.7 minutes, at
+        // 1000 it's 67 minutes. Auto-polling doesn't scale; the right
+        // primitive at scale is "app tells walletd when it cares."
+        //
+        // Operators with their own (un-rate-limited) node should
+        // pass `--cache-refresh-secs=5` to opt back into the old
+        // automatic behavior, or use `--cache-profile aggressive`
+        // which keeps the 2s tick.
         Self {
             enabled: true,
             tip_ttl: Duration::from_millis(200),
@@ -113,7 +129,7 @@ impl CacheParams {
             utxo_ttl: Duration::from_secs(30),
             block_lru: 1000,
             tx_lru: 10_000,
-            refresh_interval: Duration::from_secs(5),
+            refresh_interval: Duration::ZERO,
             concurrency: 8,
             max_per_tick: 10_000,
             reorg_depth: 6,
@@ -138,9 +154,19 @@ impl CacheParams {
     /// Apply operator overrides on top of the profile. Currently only
     /// `--cache-refresh-secs` is exposed as an escape hatch; everything
     /// else stays profile-derived.
+    ///
+    /// `None` keeps the profile's default. `Some(0)` explicitly
+    /// disables auto-refresh (manual mode — caller drives refreshes
+    /// via the `refresh_address` RPC). `Some(N)` for N >= 1 sets the
+    /// auto-refresh interval to N seconds.
+    ///
+    /// As of v0.14.0 the `balanced` profile defaults to manual mode
+    /// (`refresh_interval = 0`), so passing `None` on `balanced` ==
+    /// passing `Some(0)`. Operators who want the pre-v0.14.0 automatic
+    /// 5s tick must explicitly pass `Some(5)`.
     pub fn with_refresh_secs(mut self, refresh_secs: Option<u64>) -> Self {
         if let Some(secs) = refresh_secs {
-            if secs > 0 && self.enabled {
+            if self.enabled {
                 self.refresh_interval = Duration::from_secs(secs);
             }
         }
@@ -169,8 +195,21 @@ mod tests {
         let b = CacheProfile::Balanced.params();
         let a = CacheProfile::Aggressive.params();
         assert!(a.balance_ttl < b.balance_ttl);
-        assert!(a.refresh_interval < b.refresh_interval);
+        // balanced is now manual (refresh_interval == 0); aggressive
+        // still auto-polls. So aggressive's interval > balanced's, not <.
+        assert!(a.refresh_interval > Duration::ZERO);
+        assert_eq!(b.refresh_interval, Duration::ZERO);
         assert!(a.concurrency >= b.concurrency);
+    }
+
+    #[test]
+    fn balanced_defaults_to_manual_refresh() {
+        // v0.14.0 breaking change: caller must opt into auto via
+        // --cache-refresh-secs or --cache-profile aggressive.
+        assert_eq!(
+            CacheProfile::Balanced.params().refresh_interval,
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -186,11 +225,14 @@ mod tests {
     }
 
     #[test]
-    fn refresh_secs_zero_does_not_zero_the_interval() {
-        // Operators may set the env var to "0" expecting "default";
-        // honor that by leaving the profile-derived value untouched.
-        let p = CacheProfile::Balanced.params().with_refresh_secs(Some(0));
-        assert_eq!(p.refresh_interval, Duration::from_secs(5));
+    fn refresh_secs_zero_explicitly_disables_auto_refresh() {
+        // v0.14.0 semantic change: Some(0) now means "manual mode";
+        // the previous behavior (Some(0) → fall back to profile
+        // default) was misleading and made it impossible to disable
+        // auto-refresh on a profile whose default was nonzero.
+        // Now: None → profile default; Some(N) → set N (including 0).
+        let p = CacheProfile::Aggressive.params().with_refresh_secs(Some(0));
+        assert_eq!(p.refresh_interval, Duration::ZERO);
     }
 
     #[test]

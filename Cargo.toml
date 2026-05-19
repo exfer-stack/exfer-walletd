@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Reuse Exfer's wallet + transaction crypto so signing is byte-for-byte
 # identical to the upstream CLI. Pinned to a release tag for
 # reproducible builds; bump as new versions ship.
-exfer = { git = "https://github.com/ahuman-exfer/exfer.git", tag = "v1.10.1" }
+exfer = { git = "https://github.com/ahuman-exfer/exfer.git", tag = "v1.10.2" }
 
 axum            = { version = "0.7", features = ["macros"] }
 tokio           = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs"] }

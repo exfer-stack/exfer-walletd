@@ -28,6 +28,7 @@ use crate::tx::TransferReceipt;
 use crate::upstream::ExferNode;
 
 pub mod listbal;
+pub mod refresh;
 pub mod signmsg;
 
 #[derive(Clone)]
@@ -157,6 +158,8 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "generate_address" => generate_address(state).await,
         "list_addresses" => list_addresses(state, req.params).await,
         "list_balances" => listbal::list_balances(state).await,
+        "refresh_address" => refresh::refresh_address(state, req.params).await,
+        "refresh_addresses" => refresh::refresh_addresses(state, req.params).await,
 
         // ---- transfer (wrapper-only) ----
         "transfer" => transfer_method(state, req.params).await,
@@ -387,7 +390,7 @@ async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> 
 /// Validate a 32-byte hash hex string (address or block/tx hash).
 /// Length mismatch → `BadAddressLen` (`-32602`); right length but
 /// non-hex chars → `BadHex` (`-32602`).
-fn ensure_64_hex(s: &str) -> Result<()> {
+pub(crate) fn ensure_64_hex(s: &str) -> Result<()> {
     if s.len() != 64 {
         return Err(Error::BadAddressLen(s.len() / 2));
     }

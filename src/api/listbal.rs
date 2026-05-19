@@ -70,7 +70,7 @@ pub async fn list_balances(state: &ApiState) -> Result<Value> {
     }))
 }
 
-fn build_row(state: &ApiState, addr: &str, now: Instant) -> Value {
+pub(crate) fn build_row(state: &ApiState, addr: &str, now: Instant) -> Value {
     let bal = state.cache.balance.peek(addr);
     let utxo = state.cache.utxo.peek_address(addr, &state.inflight);
 

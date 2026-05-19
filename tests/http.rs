@@ -260,3 +260,108 @@ async fn malformed_envelope_returns_400_with_parse_error() {
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["error"]["code"], -32700);
 }
+
+/// Bootstrap endpoints are mounted only when `--tls` is on. In these
+/// tests we don't run actual TLS, but `add_tls_bootstrap_routes` is
+/// content-agnostic, so we can exercise it on the plaintext test
+/// server and verify shape (status, content-type, body). The "must
+/// not exist when TLS is off" half is covered by the default `boot()`
+/// fixture below — those tests would 404 if they accidentally hit a
+/// bootstrap path on a non-TLS server.
+async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, KeepAlive) {
+    let mock = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsWalletStore::open(dir.path()).unwrap();
+    let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
+    let api = ApiState {
+        store: Arc::new(store),
+        node: Arc::new(node),
+        inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app_state = exfer_walletd::server::build_app_state_for_tests(api, None);
+    let app = exfer_walletd::server::add_tls_bootstrap_routes(
+        exfer_walletd::server::build_router(app_state),
+        cert_pem.to_string(),
+        fingerprint.to_string(),
+    );
+    let _server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (
+        format!("http://{addr}"),
+        KeepAlive {
+            _dir: dir,
+            _mock: mock,
+            _server: _server_task,
+        },
+    )
+}
+
+#[tokio::test]
+async fn bootstrap_serves_cert_pem_verbatim() {
+    let cert = "-----BEGIN CERTIFICATE-----\nMIIBHTCB...\n-----END CERTIFICATE-----\n";
+    let fp = "sha256:b66953c47263ac0da8192676e4770f0f799563322985c57246a6fab1bf24aa86";
+    let (base, _g) = boot_with_bootstrap(cert, fp).await;
+    let resp = reqwest::get(format!("{base}/exfer-walletd/cert.pem"))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/x-pem-file"
+    );
+    assert_eq!(resp.text().await.unwrap(), cert);
+}
+
+#[tokio::test]
+async fn bootstrap_serves_fingerprint_with_trailing_newline() {
+    let cert = "-----BEGIN CERTIFICATE-----\n...\n";
+    let fp = "sha256:b66953c47263ac0da8192676e4770f0f799563322985c57246a6fab1bf24aa86";
+    let (base, _g) = boot_with_bootstrap(cert, fp).await;
+    let resp = reqwest::get(format!("{base}/exfer-walletd/cert.fingerprint"))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.starts_with("text/plain"));
+    // Matches what walletd writes to <datadir>/cert.fingerprint —
+    // single line, trailing newline, sha256:HEX form.
+    assert_eq!(resp.text().await.unwrap(), format!("{fp}\n"));
+}
+
+#[tokio::test]
+async fn bootstrap_endpoints_are_unauthenticated() {
+    // The cert and fingerprint are public information — never require
+    // a token. (The cert is what TLS hands every client anyway.)
+    let (base, _g) = boot_with_bootstrap("-----BEGIN CERTIFICATE-----\n...\n", "sha256:abcd").await;
+    for path in ["/exfer-walletd/cert.pem", "/exfer-walletd/cert.fingerprint"] {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "{path} should be reachable without an Authorization header"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_endpoints_absent_on_default_router() {
+    // Mirrors the production safety: production only registers these
+    // routes when --tls is on; tests boot the bare router (no TLS, no
+    // bootstrap routes) and assert the paths 404.
+    let (base, _g) = boot(None).await;
+    for path in ["/exfer-walletd/cert.pem", "/exfer-walletd/cert.fingerprint"] {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{path} must not be served when TLS is off"
+        );
+    }
+}

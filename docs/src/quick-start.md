@@ -102,6 +102,40 @@ with Client.from_datadir(url="https://walletd.internal:8443") as c:
 `--tls` relaxes `--allow-public-bind` — TLS already protects the
 token on the wire.
 
+### Bootstrap from the backend host (no SSH to walletd)
+
+Walletd with `--tls` exposes two unauthenticated GET endpoints on the
+HTTPS port so you can grab the cert / fingerprint from the backend
+side without shelling into the walletd host:
+
+```bash
+# from your backend host (or anywhere):
+curl --insecure -o /etc/walletd/cert.pem \
+     https://walletd.internal:8443/exfer-walletd/cert.pem
+
+curl --insecure https://walletd.internal:8443/exfer-walletd/cert.fingerprint
+# → sha256:b66953c47263ac0da8192676e4770f0f799563322985c57246a6fab1bf24aa86
+```
+
+The `--insecure` flag is the bootstrap step — it skips cert
+verification on this **one** request. After you've saved the cert
+(or the fingerprint) and configured your client to pin it, every
+subsequent connection is strict.
+
+**Security caveat** — this is
+[TOFU](https://en.wikipedia.org/wiki/Trust_on_first_use): if an
+attacker is on the network path the moment you run the bootstrap
+`curl`, they can hand you a cert they control. For deployments
+inside one VPC / private network this is essentially never an issue.
+For deployments crossing untrusted networks (public internet, cafe
+wifi, etc.), prefer copying `cert.pem` or `cert.fingerprint` over a
+channel you already trust (scp, your secret manager, the same env
+vars you push the token through).
+
+The bootstrap endpoints are only mounted when `--tls` is on. Plain
+HTTP walletd never serves these — handing out cert material over
+plaintext would defeat the whole pinning model.
+
 ## Other flags
 
 ```bash

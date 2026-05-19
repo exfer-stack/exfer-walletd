@@ -33,6 +33,12 @@ use sha2::{Digest, Sha256};
 /// peer cert it sees during the handshake.
 pub struct TlsMaterial {
     pub server_config: Arc<ServerConfig>,
+    /// PEM-encoded leaf cert, ready to serve verbatim from the
+    /// `/exfer-walletd/cert.pem` bootstrap endpoint. It's the same
+    /// bytes the operator can see in `<datadir>/cert.pem`; we hold a
+    /// copy in memory so the server doesn't re-read the file on every
+    /// bootstrap request.
+    pub cert_pem: String,
     pub fingerprint: String,
     pub generated: bool,
 }
@@ -55,6 +61,8 @@ pub fn ensure_cert_files(
     let all_exist = cert_path.exists() && key_path.exists() && fingerprint_path.exists();
 
     if all_exist {
+        let cert_pem = fs::read_to_string(cert_path)
+            .with_context(|| format!("reading {}", cert_path.display()))?;
         let server_config = load_server_config(cert_path, key_path)?;
         let fingerprint = fs::read_to_string(fingerprint_path)
             .with_context(|| format!("reading {}", fingerprint_path.display()))?
@@ -62,6 +70,7 @@ pub fn ensure_cert_files(
             .to_string();
         return Ok(TlsMaterial {
             server_config,
+            cert_pem,
             fingerprint,
             generated: false,
         });
@@ -77,6 +86,7 @@ pub fn ensure_cert_files(
     let server_config = load_server_config(cert_path, key_path)?;
     Ok(TlsMaterial {
         server_config,
+        cert_pem,
         fingerprint,
         generated: true,
     })

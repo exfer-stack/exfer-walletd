@@ -78,6 +78,49 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Bolt on the `/exfer-walletd/cert.pem` + `/exfer-walletd/cert.fingerprint`
+/// bootstrap endpoints. Production only calls this from [`run`] when
+/// `--tls` is enabled — serving the cert files over plaintext HTTP would
+/// be trivially MitM-able and would defeat the whole pinning model.
+/// Test code can call it directly to verify endpoint shape without
+/// standing up rustls.
+///
+/// Both endpoints are unauthenticated: cert.pem is the same bytes the
+/// TLS handshake hands every client anyway, and the fingerprint is the
+/// SHA-256 of that public data.
+pub fn add_tls_bootstrap_routes(router: Router, cert_pem: String, fingerprint: String) -> Router {
+    let cert_pem_for_handler = cert_pem;
+    let fingerprint_line = format!("{fingerprint}\n");
+    router
+        .route(
+            "/exfer-walletd/cert.pem",
+            get(move || {
+                let body = cert_pem_for_handler.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/x-pem-file")],
+                        body,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/exfer-walletd/cert.fingerprint",
+            get(move || {
+                let body = fingerprint_line.clone();
+                async move {
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; charset=utf-8",
+                        )],
+                        body,
+                    )
+                }
+            }),
+        )
+}
+
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let datadir = cfg.resolved_datadir();
     let wallet_dir = cfg.resolved_wallet_dir();
@@ -168,7 +211,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         "exfer-walletd starting",
     );
 
-    let app = build_router(app_state);
+    let mut app = build_router(app_state);
+
+    // Bootstrap endpoints only mounted when --tls is on — see
+    // [`add_tls_bootstrap_routes`] for the rationale.
+    if let Some(material) = tls_material.as_ref() {
+        app =
+            add_tls_bootstrap_routes(app, material.cert_pem.clone(), material.fingerprint.clone());
+    }
+
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
 
     if let Some(material) = tls_material {

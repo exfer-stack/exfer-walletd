@@ -354,6 +354,14 @@ pub struct UtxoListResponse {
     #[serde(default)]
     pub script_hex: Option<String>,
     pub tip_height: u64,
+    // `truncated` was added in a later node release; older nodes omit
+    // it (observed in real-money testing against 89.127.232.155:9334
+    // on 2026-05-20: walletd rejected the utxos response with
+    // "missing field `truncated`" and the transfer engine couldn't
+    // even read sender UTXOs). Defaulting to `false` matches the
+    // semantics: if the node didn't tell us "this list was clipped,"
+    // assume it's the full set.
+    #[serde(default)]
     pub truncated: bool,
     pub utxos: Vec<UtxoEntry>,
 }

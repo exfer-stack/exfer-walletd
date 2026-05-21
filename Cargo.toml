@@ -1,6 +1,6 @@
 [package]
 name        = "exfer-walletd"
-version     = "0.13.0"
+version     = "0.14.0"
 edition     = "2021"
 description = "Exfer Wallet Daemon — independent wallet service that exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes"
 license     = "MIT"
@@ -15,7 +15,7 @@ path = "src/main.rs"
 # Reuse Exfer's wallet + transaction crypto so signing is byte-for-byte
 # identical to the upstream CLI. Pinned to a release tag for
 # reproducible builds; bump as new versions ship.
-exfer = { git = "https://github.com/ahuman-exfer/exfer.git", tag = "v1.10.1" }
+exfer = { git = "https://github.com/ahuman-exfer/exfer.git", tag = "v1.11.0" }
 
 axum            = { version = "0.7", features = ["macros"] }
 tokio           = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs"] }

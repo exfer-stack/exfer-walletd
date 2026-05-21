@@ -575,7 +575,7 @@ dependencies = [
 [[package]]
 name = "exfer"
 version = "0.1.0"
-source = "git+https://github.com/ahuman-exfer/exfer.git?tag=v1.10.1#57dc98d6379f959e79902d266807856d235dc011"
+source = "git+https://github.com/ahuman-exfer/exfer.git?tag=v1.11.0#b7260419c4051841dbd173de5e45525f59948e11"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "exfer-walletd"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "axum",

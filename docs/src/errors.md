@@ -2,9 +2,14 @@
 
 JSON-RPC convention: errors usually return HTTP 200 with the error in
 the body. Walletd emits non-200 only for transport-layer problems
-(401, 400 for malformed JSON).
+(401, 400 for malformed JSON or invalid request envelopes).
 
-v1.0 partitions the JSON-RPC application-error range
+For non-empty batch requests, walletd returns HTTP 200 with a response
+array; item-level errors keep their JSON-RPC `error.code` in the body.
+Top-level malformed JSON and empty batches still use the HTTP status
+shown below.
+
+v1.0 partitions the JSON-RPC implementation-defined server-error range
 (`-32000..-32099`) into per-area slots so clients can branch on the
 high digit:
 
@@ -14,8 +19,8 @@ high digit:
 - `-32030..-32039`: transaction / fee
 - `-32040..`: reserved
 
-| Code     | HTTP | Name                  | Meaning                                                                  |
-| -------- | ---- | --------------------- | ------------------------------------------------------------------------ |
+| Code     | HTTP (single/top-level) | Name                  | Meaning                                                                  |
+| -------- | ----------------------- | --------------------- | ------------------------------------------------------------------------ |
 | `-32700` | 400  | Parse error           | Body is not valid JSON.                                                  |
 | `-32600` | 400  | Invalid Request       | Envelope shape wrong (bad `jsonrpc`, missing `method`, empty batch, …). |
 | `-32601` | 200  | Method not found      | Unknown method name.                                                     |

@@ -19,6 +19,11 @@ Every method below follows the same envelope:
 }
 ```
 
+`jsonrpc` must be exactly `"2.0"`. `id`, when present, must be a
+JSON string, number, or `null`; object, array, and boolean ids are
+rejected with `-32600` and response `id: null`. Omitting `id` makes
+the request a JSON-RPC notification and walletd returns no response.
+
 **Response (success)**
 
 ```json
@@ -127,8 +132,15 @@ type AddressEntry = {
 
 ## `get_wallet_balance`
 
-Aggregate confirmed balance across every managed address. Fans out
-`get_balance` to the upstream node concurrently (cap 8).
+Aggregate confirmed balance across every managed address.
+
+For each known address, walletd calls upstream `get_balance` and
+`get_address_utxos` so it can return both `balance` and `utxo_count`.
+That is **2 upstream scan RPCs per address**, executed concurrently
+with cap 8. On public/community nodes with per-IP scan quotas, large
+wallets can hit upstream rate limits; use `list_addresses` plus paced
+per-address reads if you need quota-safe polling until upstream batch
+balance lookup exists.
 
 | | |
 |---|---|
@@ -275,7 +287,7 @@ type BlockSummary = {
   timestamp:         u64,
   nonce:             u64,
   difficulty_target: hex64,
-  tx_count:          u32,
+  tx_count:          u64,
   transactions:      hex64[],   // tx_ids
 };
 ```
@@ -477,8 +489,11 @@ is true iff signature verifies AND `H(DS_ADDR || pubkey) == address`.
 
 ## Batch requests
 
-Per spec, send a JSON array of envelopes; receive a JSON array of
-responses in the same order, with notifications (no `id`) omitted.
+Send a JSON array of envelopes; receive a JSON array of responses,
+with notifications (no `id`) omitted. JSON-RPC 2.0 permits batch
+responses in any order, so clients should correlate by `id`. Walletd
+currently preserves request order in the response array, but callers
+should not rely on order when using generic JSON-RPC tooling.
 
 ```bash
 curl -s $URL \
@@ -490,5 +505,7 @@ curl -s $URL \
       ]'
 ```
 
-Empty batches return `-32600`. Batches consisting entirely of
-notifications return `204 No Content`.
+Empty batches return a single top-level `-32600` response. Batches
+consisting entirely of notifications return `204 No Content`. Mixed
+batches return HTTP 200 with per-item `result` / `error` objects in
+the array.

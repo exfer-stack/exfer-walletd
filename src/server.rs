@@ -499,6 +499,13 @@ async fn process_single(
     let is_notification = id_owned.is_none();
     let response_id = id_owned.unwrap_or(Value::Null);
 
+    if !is_valid_jsonrpc_id(&response_id) {
+        return Some(RpcResponse::err(
+            Value::Null,
+            &Error::InvalidRequest("id must be a JSON string, number, or null when present".into()),
+        ));
+    }
+
     if req.jsonrpc != "2.0" {
         if is_notification {
             return None;
@@ -568,6 +575,10 @@ async fn process_single(
         Ok(v) => RpcResponse::ok(response_id, v),
         Err(err) => RpcResponse::err(response_id, &err),
     })
+}
+
+fn is_valid_jsonrpc_id(id: &Value) -> bool {
+    matches!(id, Value::String(_) | Value::Number(_) | Value::Null)
 }
 
 fn error_response(id: Value, err: &Error) -> Response {

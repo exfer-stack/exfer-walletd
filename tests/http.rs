@@ -268,6 +268,30 @@ async fn malformed_envelope_returns_400_with_parse_error() {
     assert_eq!(v["error"]["code"], -32700);
 }
 
+#[tokio::test]
+async fn invalid_jsonrpc_id_type_returns_invalid_request() {
+    let (base, _g) = boot(None).await;
+    let body = json!({
+        "jsonrpc": "2.0",
+        "method":  "ping",
+        "params":  {},
+        "id":      { "not": "a valid json-rpc id" }
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&base)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], -32600);
+    assert_eq!(v["id"], serde_json::Value::Null);
+    assert!(v.get("result").is_none());
+}
+
 /// Bootstrap endpoints are mounted only when `--tls` is on. In these
 /// tests we don't run actual TLS, but `add_tls_bootstrap_routes` is
 /// content-agnostic, so we can exercise it on the plaintext test

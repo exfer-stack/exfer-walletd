@@ -13,7 +13,7 @@ use exfer::types::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use exfer::types::Hash256;
 use exfer_walletd::api::{dispatch, ApiState, RpcRequest};
 use exfer_walletd::error::Error;
-use exfer_walletd::store::FsWalletStore;
+use exfer_walletd::store::HdSeedStore;
 use exfer_walletd::upstream::{ExferNode, RetryPolicy};
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, method, path};
@@ -28,12 +28,13 @@ fn make_state_with_retry(
     wallet_dir: tempfile::TempDir,
     retry: RetryPolicy,
 ) -> (ApiState, tempfile::TempDir) {
-    let store = FsWalletStore::open(wallet_dir.path()).unwrap();
+    let store = HdSeedStore::open_or_init_fresh(wallet_dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::with_retry_policy(node_url, Duration::from_secs(5), retry).unwrap();
     let state = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
     };
     (state, wallet_dir)
 }
@@ -43,14 +44,14 @@ fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
         jsonrpc: "2.0".into(),
         method: method.into(),
         params,
-        id: json!(1),
+        id: Some(json!(1)),
     }
 }
 
 // --- generate_address ------------------------------------------------------
 
 #[tokio::test]
-async fn generate_address_creates_64_hex_address_and_persists_file() {
+async fn generate_address_derives_hd_index_zero_first() {
     let mock = MockServer::start().await;
     let (state, dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
 
@@ -60,29 +61,36 @@ async fn generate_address_creates_64_hex_address_and_persists_file() {
 
     let addr = result["address"].as_str().unwrap();
     let pubkey = result["pubkey"].as_str().unwrap();
+    let index = result["index"].as_u64().unwrap();
     assert_eq!(addr.len(), 64);
     assert_eq!(pubkey.len(), 64);
+    assert_eq!(index, 0, "first derived address must be at HD index 0");
 
-    let file = dir.path().join(format!("{addr}.key"));
-    assert!(file.exists(), "wallet file should be on disk");
+    // Keystore state files are present (single sealed seed, no per-addr files).
+    assert!(
+        dir.path().join("seed.enc").exists(),
+        "sealed HD seed should be on disk"
+    );
+    assert!(
+        dir.path().join("state.json").exists(),
+        "keystore state file should record next_index"
+    );
 
-    // Loading the wallet back must yield the same address (round-trip).
+    // list_addresses surfaces the entry as a structured row.
     let listed = dispatch(&state, rpc("list_addresses", json!({})))
         .await
         .unwrap();
-    let addresses = listed["addresses"].as_array().unwrap();
-    assert_eq!(addresses.len(), 1);
-    assert_eq!(addresses[0].as_str().unwrap(), addr);
+    let entries = listed["addresses"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["address"].as_str().unwrap(), addr);
+    assert_eq!(entries[0]["index"].as_u64().unwrap(), 0);
+    assert!(!entries[0]["imported"].as_bool().unwrap());
 }
 
 #[tokio::test]
-async fn list_addresses_is_sorted_and_filters_non_keys() {
+async fn list_addresses_returns_rows_in_derivation_order() {
     let mock = MockServer::start().await;
-    let (state, dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
-
-    // Drop a stray file that should be ignored.
-    std::fs::write(dir.path().join("README.md"), "ignored").unwrap();
-    std::fs::write(dir.path().join("not-hex.key"), "ignored").unwrap();
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
 
     let a = dispatch(&state, rpc("generate_address", json!({})))
         .await
@@ -90,9 +98,12 @@ async fn list_addresses_is_sorted_and_filters_non_keys() {
         .as_str()
         .unwrap()
         .to_string();
-    let b = dispatch(&state, rpc("generate_address", json!({})))
-        .await
-        .unwrap()["address"]
+    let b = dispatch(
+        &state,
+        rpc("generate_address", json!({ "label": "user-1" })),
+    )
+    .await
+    .unwrap()["address"]
         .as_str()
         .unwrap()
         .to_string();
@@ -100,16 +111,15 @@ async fn list_addresses_is_sorted_and_filters_non_keys() {
     let listed = dispatch(&state, rpc("list_addresses", json!({})))
         .await
         .unwrap();
-    let addrs: Vec<String> = listed["addresses"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+    let entries = listed["addresses"].as_array().unwrap();
 
-    let mut expected = vec![a, b];
-    expected.sort();
-    assert_eq!(addrs, expected);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["address"].as_str().unwrap(), a);
+    assert_eq!(entries[0]["index"].as_u64().unwrap(), 0);
+    assert!(entries[0].get("label").is_none(), "no label on first");
+    assert_eq!(entries[1]["address"].as_str().unwrap(), b);
+    assert_eq!(entries[1]["index"].as_u64().unwrap(), 1);
+    assert_eq!(entries[1]["label"].as_str().unwrap(), "user-1");
 }
 
 // --- unknown method --------------------------------------------------------
@@ -210,9 +220,8 @@ async fn transfer_rejects_short_address() {
         rpc(
             "transfer",
             json!({
-                "from":   "deadbeef",   // too short
-                "to":     "ff".repeat(32),
-                "amount": 1000,
+                "from":    "deadbeef",   // too short
+                "outputs": [{"to": "ff".repeat(32), "amount": 1000}],
             }),
         ),
     )
@@ -225,6 +234,93 @@ async fn transfer_rejects_short_address() {
 }
 
 #[tokio::test]
+async fn transfer_rejects_empty_outputs() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "transfer",
+            json!({
+                "from":    "ab".repeat(32),
+                "outputs": [],
+            }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadParams(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn transfer_rejects_too_many_outputs() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let outputs: Vec<serde_json::Value> = (0..17)
+        .map(|i| json!({"to": format!("{:02x}", i).repeat(32), "amount": 1000}))
+        .collect();
+    let err = dispatch(
+        &state,
+        rpc(
+            "transfer",
+            json!({
+                "from":    "ab".repeat(32),
+                "outputs": outputs,
+            }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::TooManyOutputs { .. }), "got {err:?}");
+    assert_eq!(err.rpc_code(), -32034);
+}
+
+#[tokio::test]
+async fn transfer_rejects_fee_and_fee_rate_together() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "transfer",
+            json!({
+                "from":     "ab".repeat(32),
+                "outputs":  [{"to": "ff".repeat(32), "amount": 1000}],
+                "fee":      100,
+                "fee_rate": 1,
+            }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadParams(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn transfer_rejects_short_client_token() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "transfer",
+            json!({
+                "from":         "ab".repeat(32),
+                "outputs":      [{"to": "ff".repeat(32), "amount": 1000}],
+                "client_token": "abc",
+            }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadParams(_)), "got {err:?}");
+}
+
+#[tokio::test]
 async fn transfer_rejects_missing_wallet() {
     let mock = MockServer::start().await;
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
@@ -234,9 +330,8 @@ async fn transfer_rejects_missing_wallet() {
         rpc(
             "transfer",
             json!({
-                "from":   "ab".repeat(32),  // valid format, no wallet on disk
-                "to":     "ff".repeat(32),
-                "amount": 1000,
+                "from":    "ab".repeat(32),  // valid format, no wallet derived/imported
+                "outputs": [{"to": "ff".repeat(32), "amount": 1000}],
             }),
         ),
     )
@@ -439,7 +534,7 @@ async fn get_transaction_rejects_bad_hash() {
         .await;
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
 
-    let err = dispatch(&state, rpc("get_transaction", json!({"hash": "deadbeef"})))
+    let err = dispatch(&state, rpc("get_transaction", json!({"tx_id": "deadbeef"})))
         .await
         .unwrap_err();
     assert!(
@@ -459,9 +554,12 @@ async fn get_block_by_hash_rejects_bad_hash() {
         .await;
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
 
-    let err = dispatch(&state, rpc("get_block", json!({"hash": "zz".repeat(32)})))
-        .await
-        .unwrap_err();
+    let err = dispatch(
+        &state,
+        rpc("get_block_by_id", json!({"block_id": "zz".repeat(32)})),
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, Error::BadHex(_)),
         "expected BadHex, got {err:?}"
@@ -617,7 +715,7 @@ async fn get_transaction_returns_decoded_inputs_outputs_and_fee() {
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
     let result = dispatch(
         &state,
-        rpc("get_transaction", json!({ "hash": child.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>() })),
+        rpc("get_transaction", json!({ "tx_id": child.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>() })),
     )
     .await
     .unwrap();
@@ -715,7 +813,7 @@ async fn get_transaction_omits_fee_when_parent_unreachable() {
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
     let result = dispatch(
         &state,
-        rpc("get_transaction", json!({ "hash": child.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>() })),
+        rpc("get_transaction", json!({ "tx_id": child.tx_id().unwrap().as_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>() })),
     )
     .await
     .unwrap();
@@ -770,9 +868,12 @@ async fn get_block_hash_returns_height_and_block_id() {
         .await;
 
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
-    let result = dispatch(&state, rpc("get_block_hash", json!({ "height": 1234 })))
-        .await
-        .unwrap();
+    let result = dispatch(
+        &state,
+        rpc("get_block_id_at_height", json!({ "height": 1234 })),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result["height"], 1234);
     assert_eq!(result["block_id"], "ab".repeat(32));
@@ -786,12 +887,12 @@ async fn get_block_hash_returns_height_and_block_id() {
 async fn get_block_hash_rejects_missing_height_param() {
     let mock = MockServer::start().await;
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
-    let err = dispatch(&state, rpc("get_block_hash", json!({})))
+    let err = dispatch(&state, rpc("get_block_id_at_height", json!({})))
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::BadEnvelope(_)),
-        "expected BadEnvelope, got {err:?}"
+        matches!(err, Error::BadParams(_)),
+        "expected BadParams, got {err:?}"
     );
 }
 
@@ -988,9 +1089,12 @@ async fn witness_decoded_inline_with_pubkey_signature_and_size() {
         .await;
 
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
-    let result = dispatch(&state, rpc("get_transaction", json!({ "hash": tx_id_hex })))
-        .await
-        .unwrap();
+    let result = dispatch(
+        &state,
+        rpc("get_transaction", json!({ "tx_id": tx_id_hex })),
+    )
+    .await
+    .unwrap();
 
     let inp = &result["inputs"][0];
 
@@ -1058,12 +1162,197 @@ async fn non_phase1_witness_falls_back_to_witness_hex() {
     let _ = id_for_match;
 
     let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
-    let result = dispatch(&state, rpc("get_transaction", json!({ "hash": tx_id_hex })))
-        .await
-        .unwrap();
+    let result = dispatch(
+        &state,
+        rpc("get_transaction", json!({ "tx_id": tx_id_hex })),
+    )
+    .await
+    .unwrap();
 
     let witness = &result["inputs"][0]["witness"];
     assert!(witness.get("pubkey").is_none());
     assert!(witness.get("signature").is_none());
     assert_eq!(witness["witness_hex"], hex::encode(&weird));
+}
+
+// --- validate_address ------------------------------------------------------
+
+#[tokio::test]
+async fn validate_address_returns_valid_true_for_64_hex() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(
+        &state,
+        rpc("validate_address", json!({ "address": "AB".repeat(32) })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["valid"], true);
+    // Normalised to lowercase.
+    assert_eq!(result["normalized"].as_str().unwrap(), "ab".repeat(32));
+}
+
+#[tokio::test]
+async fn validate_address_returns_valid_false_for_garbage() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let result = dispatch(
+        &state,
+        rpc("validate_address", json!({ "address": "not-a-hash" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["valid"], false);
+    assert!(result["normalized"].is_null());
+}
+
+// --- get_status -----------------------------------------------------------
+
+#[tokio::test]
+async fn get_status_reports_version_wallet_count_and_inflight() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "get_block_height" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "height": 100, "block_id": "ff".repeat(32) },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    // Mint two addresses.
+    dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+    dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap();
+
+    let result = dispatch(&state, rpc("get_status", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["version"].as_str().unwrap(),
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(result["upstream_ok"], true);
+    assert_eq!(result["wallet_count"], 2);
+    assert_eq!(result["tip"]["height"], 100);
+    assert!(!result["upstream_nodes"].as_array().unwrap().is_empty());
+    assert_eq!(result["in_flight_utxos"], 0);
+    assert_eq!(result["in_flight_transfers"], 0);
+}
+
+// --- get_wallet_balance ---------------------------------------------------
+
+#[tokio::test]
+async fn get_wallet_balance_aggregates_per_address() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    // Two addresses.
+    let a = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Per-address get_balance + get_address_utxos responses.
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({ "method": "get_balance", "params": {"address": a.clone()} }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "address": a, "balance": 1_000 },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({ "method": "get_balance", "params": {"address": b.clone()} }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "address": b, "balance": 9_000 },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "get_address_utxos" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "tip_height": 1, "truncated": false, "utxos": [] },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let result = dispatch(&state, rpc("get_wallet_balance", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(result["total"], 10_000);
+    assert_eq!(result["entries"].as_array().unwrap().len(), 2);
+}
+
+// --- abandon_transfer -----------------------------------------------------
+
+#[tokio::test]
+async fn abandon_transfer_releases_in_flight_outpoints() {
+    use exfer::types::transaction::OutPoint;
+    use exfer::types::Hash256;
+
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    // Manually claim two outpoints.
+    let op1 = OutPoint {
+        tx_id: Hash256([0xaa; 32]),
+        output_index: 0,
+    };
+    let op2 = OutPoint {
+        tx_id: Hash256([0xbb; 32]),
+        output_index: 1,
+    };
+    state.inflight.claim(&[op1, op2]);
+    assert_eq!(state.inflight.len(), 2);
+
+    let result = dispatch(
+        &state,
+        rpc(
+            "abandon_transfer",
+            json!({
+                "outpoints": [
+                    { "tx_id": "aa".repeat(32), "output_index": 0 },
+                    { "tx_id": "bb".repeat(32), "output_index": 1 },
+                ]
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["released_count"], 2);
+    assert_eq!(result["remaining_in_flight"], 0);
+}
+
+#[tokio::test]
+async fn abandon_transfer_rejects_empty_outpoints() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+    let err = dispatch(&state, rpc("abandon_transfer", json!({ "outpoints": [] })))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BadParams(_)), "got {err:?}");
 }

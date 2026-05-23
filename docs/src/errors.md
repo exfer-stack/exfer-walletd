@@ -4,19 +4,34 @@ JSON-RPC convention: errors usually return HTTP 200 with the error in
 the body. Walletd emits non-200 only for transport-layer problems
 (401, 400 for malformed JSON).
 
-| Code     | HTTP | Name                | Meaning                                                                  |
-| -------- | ---- | ------------------- | ------------------------------------------------------------------------ |
-| `-32700` | 400  | Parse error         | Malformed JSON / missing fields.                                         |
-| `-32600` | 200  | Invalid Request     | (Reserved; walletd doesn't currently emit this.)                         |
-| `-32601` | 200  | Method not found    | Unknown method name.                                                     |
-| `-32602` | 200  | Invalid params      | Bad hex, wrong address length, missing required field, …                 |
-| `-32603` | 200  | Internal error      | Unexpected; the message has details.                                     |
-| `-32001` | 401  | Unauthorized        | Missing token, wrong token, or insufficient scope.                       |
-| `-32010` | 200  | Wallet not found    | `from` address is not one walletd holds the key for.                     |
-| `-32011` | 200  | Wallet exists       | Address collision on `generate_address` (cosmically rare).               |
-| `-32020` | 200  | Upstream            | Upstream node unreachable, or returned an RPC error; message intact.     |
-| `-32030` | 200  | Tx build / auth     | UTXO authentication failed, or transaction construction failed.          |
-| `-32031` | 200  | Insufficient balance| Walletd can't cover `amount + fee` from spendable UTXOs.                 |
+v1.0 partitions the JSON-RPC application-error range
+(`-32000..-32099`) into per-area slots so clients can branch on the
+high digit:
+
+- `-32000..-32009`: auth
+- `-32010..-32019`: wallet / keystore
+- `-32020..-32029`: upstream
+- `-32030..-32039`: transaction / fee
+- `-32040..`: reserved
+
+| Code     | HTTP | Name                  | Meaning                                                                  |
+| -------- | ---- | --------------------- | ------------------------------------------------------------------------ |
+| `-32700` | 400  | Parse error           | Body is not valid JSON.                                                  |
+| `-32600` | 400  | Invalid Request       | Envelope shape wrong (bad `jsonrpc`, missing `method`, empty batch, …). |
+| `-32601` | 200  | Method not found      | Unknown method name.                                                     |
+| `-32602` | 200  | Invalid params        | Per-method param shape error: bad hex, wrong address length, mutually-exclusive fields supplied together, … |
+| `-32603` | 200  | Internal error        | Unexpected; the message has details.                                     |
+| `-32001` | 401  | Unauthorized          | Missing token, wrong token, or insufficient scope.                       |
+| `-32010` | 200  | Wallet not found      | Address is not derived or imported in this keystore.                     |
+| `-32011` | 200  | Wallet exists         | Address collision on `import` (cosmically rare for derived).             |
+| `-32012` | 200  | Keystore locked       | Wrong passphrase / corrupted seed file.                                  |
+| `-32020` | 200  | Upstream              | Upstream node unreachable, or returned an RPC error; message intact.     |
+| `-32030` | 200  | Tx build / auth       | UTXO authentication failed, or transaction construction failed.          |
+| `-32031` | 200  | Insufficient balance  | Walletd can't cover `amount + fee` from spendable UTXOs.                 |
+| `-32032` | 200  | Fee too high          | Computed fee exceeds the `max_fee` cap on `transfer`.                    |
+| `-32033` | 200  | Dust output           | An `outputs[].amount` < DUST_THRESHOLD (200 exfers).                     |
+| `-32034` | 200  | Too many outputs      | `transfer.outputs[]` longer than the hard cap (16).                      |
+| `-32035` | 200  | Idempotency conflict  | `transfer.client_token` reused with different params.                    |
 
 ## `-32031` insufficient balance
 

@@ -33,7 +33,7 @@ use crate::auth::{check_bind_is_safe, Scope, Tokens};
 use crate::config::Config;
 use crate::error::Error;
 use crate::inflight::InFlightUtxos;
-use crate::store::FsWalletStore;
+use crate::store::HdSeedStore;
 use crate::upstream::{ExferNode, RetryPolicy};
 
 #[derive(Clone)]
@@ -44,24 +44,29 @@ pub struct AppState {
 
 /// Test-only constructor — exposed so integration tests can build an
 /// `AppState` without going through CLI/env config parsing.
+///
+/// `single_token`, when `Some`, is installed as the **spend** token
+/// (the broadest scope; satisfies every request). For per-scope
+/// control use [`build_app_state_for_tests_scoped`].
 #[doc(hidden)]
-pub fn build_app_state_for_tests(api: ApiState, legacy_token: Option<String>) -> AppState {
-    let tokens = Tokens::from_config(legacy_token.as_deref(), None, None);
+pub fn build_app_state_for_tests(api: ApiState, single_token: Option<String>) -> AppState {
+    let tokens = Tokens::from_config(None, None, single_token.as_deref());
     AppState {
         api,
         tokens: Arc::new(tokens),
     }
 }
 
-/// Test helper that lets integration tests inject explicit scoped
-/// tokens. Production callers go through [`run`].
+/// Test helper that lets integration tests inject any subset of the
+/// three scoped tokens. Production callers go through [`run`].
 #[doc(hidden)]
 pub fn build_app_state_for_tests_scoped(
     api: ApiState,
     read: Option<String>,
+    manage: Option<String>,
     spend: Option<String>,
 ) -> AppState {
-    let tokens = Tokens::from_config(None, read.as_deref(), spend.as_deref());
+    let tokens = Tokens::from_config(read.as_deref(), manage.as_deref(), spend.as_deref());
     AppState {
         api,
         tokens: Arc::new(tokens),
@@ -130,24 +135,24 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     ensure_dir(&datadir, 0o700)?;
     ensure_dir(&wallet_dir, 0o700)?;
 
-    // Resolve the auth token: explicit override wins, else read or
-    // auto-generate `<datadir>/token`. If the operator opts into the
-    // two-scope model with --auth-token-{read,spend}, we don't touch
-    // the on-disk token at all.
-    let scoped_in_use = cfg.auth_token_read.is_some() || cfg.auth_token_spend.is_some();
-    let effective_legacy = if scoped_in_use {
-        cfg.auth_token.clone()
-    } else if let Some(t) = cfg.auth_token.clone() {
-        Some(t)
-    } else {
-        Some(ensure_token_file(&cfg.token_file())?)
+    // Resolve the three scoped tokens. For each scope: explicit
+    // env/CLI value wins; otherwise auto-generate (and persist) on
+    // first run inside the datadir. The three files are independent
+    // — operators can env-override any subset.
+    let paths = cfg.token_files();
+    let read = match cfg.auth_token_read.clone() {
+        Some(t) => t,
+        None => ensure_token_file(&paths.read, "read")?,
     };
-
-    let tokens = Tokens::from_config(
-        effective_legacy.as_deref(),
-        cfg.auth_token_read.as_deref(),
-        cfg.auth_token_spend.as_deref(),
-    );
+    let manage = match cfg.auth_token_manage.clone() {
+        Some(t) => t,
+        None => ensure_token_file(&paths.manage, "manage")?,
+    };
+    let spend = match cfg.auth_token_spend.clone() {
+        Some(t) => t,
+        None => ensure_token_file(&paths.spend, "spend")?,
+    };
+    let tokens = Tokens::from_config(Some(&read), Some(&manage), Some(&spend));
 
     // Fail closed: refuse public binds without a token, and refuse
     // public binds *with* a token unless either --tls is on (we
@@ -156,7 +161,23 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     check_bind_is_safe(cfg.bind, &tokens, cfg.allow_public_bind, cfg.tls)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let store = FsWalletStore::open(&wallet_dir)?;
+    // Keystore passphrase MUST come from the environment — never default.
+    // We fail-closed at startup so a misconfigured deployment can't
+    // silently run with an empty / well-known passphrase.
+    let passphrase = std::env::var("WALLETD_KEYSTORE_PASSPHRASE").unwrap_or_default();
+    if passphrase.is_empty() {
+        anyhow::bail!(
+            "WALLETD_KEYSTORE_PASSPHRASE is required. \
+             walletd v1 encrypts the HD seed at rest with argon2id + ChaCha20-Poly1305 \
+             and refuses to start without an explicit passphrase. \
+             Set it in env (or your container/secret manager) before launching."
+        );
+    }
+    let store = HdSeedStore::open_or_init_fresh(&wallet_dir, passphrase.as_bytes())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    if let Some(words) = store.take_fresh_mnemonic() {
+        print_fresh_mnemonic(&words);
+    }
     let retry = RetryPolicy {
         attempts: cfg.upstream_attempts,
         backoff_ms: cfg.upstream_retry_backoff_ms,
@@ -170,6 +191,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(InFlightUtxos::new()),
+        idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
     };
     let app_state = AppState {
         api,
@@ -296,9 +318,8 @@ fn ensure_dir(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
 }
 
 /// Read the token at `path`, or generate + persist a fresh one and
-/// print it prominently to stderr (so the operator sees it once on
-/// first run).
-fn ensure_token_file(path: &std::path::Path) -> anyhow::Result<String> {
+/// print it prominently to stderr the first time we mint it.
+fn ensure_token_file(path: &std::path::Path, scope: &str) -> anyhow::Result<String> {
     if let Ok(s) = fs::read_to_string(path) {
         let trimmed = s.trim().to_string();
         if !trimmed.is_empty() {
@@ -322,7 +343,7 @@ fn ensure_token_file(path: &std::path::Path) -> anyhow::Result<String> {
     f.write_all(b"\n")?;
 
     eprintln!();
-    eprintln!("  ┌─ first run ───────────────────────────────────────────────────────────");
+    eprintln!("  ┌─ first run: {scope} token ─────────────────────────────────────────────");
     eprintln!("  │ generated bearer token (saved to {}):", path.display());
     eprintln!("  │");
     eprintln!("  │     {token}");
@@ -337,6 +358,32 @@ fn ensure_token_file(path: &std::path::Path) -> anyhow::Result<String> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
+}
+
+/// Print the freshly-generated BIP-39 mnemonic to stderr exactly once
+/// (only after a brand-new keystore was initialised). Matches the style
+/// of `ensure_token_file` so first-run output reads as one boxed
+/// section.
+fn print_fresh_mnemonic(words: &[String]) {
+    eprintln!();
+    eprintln!("  ┌─ first run: HD seed ──────────────────────────────────────────────────");
+    eprintln!("  │ A new BIP-39 mnemonic has been generated and the seed has been");
+    eprintln!("  │ encrypted at rest with your WALLETD_KEYSTORE_PASSPHRASE.");
+    eprintln!("  │");
+    eprintln!("  │ ⚠  WRITE THESE 24 WORDS DOWN. They are the ONLY way to recover");
+    eprintln!("  │    every address this daemon will ever derive. They will NEVER be");
+    eprintln!("  │    shown again.");
+    eprintln!("  │");
+    for (chunk_idx, chunk) in words.chunks(6).enumerate() {
+        let row: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, w)| format!("{:>2}. {:<10}", chunk_idx * 6 + i + 1, w))
+            .collect();
+        eprintln!("  │    {}", row.join(" "));
+    }
+    eprintln!("  └───────────────────────────────────────────────────────────────────────");
+    eprintln!();
 }
 
 async fn healthz() -> &'static str {
@@ -361,52 +408,135 @@ async fn rpc_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // ---- Parse envelope first so we know the method (needed for
-    //      scope-based auth and audit logging). ----
-    let req: RpcRequest = match serde_json::from_slice(&body) {
+    // Parse the body as a generic Value first so we can distinguish a
+    // single request envelope (Object) from a batch (Array) per
+    // JSON-RPC 2.0 § 6.
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_response(Value::Null, &Error::ParseError(e.to_string())),
+    };
+
+    let peer_ip: IpAddr = connect_info
+        .as_ref()
+        .map(|ci| ci.0.ip())
+        .unwrap_or_else(|| std::net::Ipv4Addr::UNSPECIFIED.into());
+
+    match parsed {
+        Value::Array(items) => {
+            // § 6: an empty array is invalid; respond with a single
+            // Invalid Request, id null.
+            if items.is_empty() {
+                return error_response(Value::Null, &Error::InvalidRequest("empty batch".into()));
+            }
+            let futs = items.into_iter().map(|item| {
+                let app = app.clone();
+                let headers = headers.clone();
+                async move { process_single(&app, item, &headers, peer_ip).await }
+            });
+            let results: Vec<Option<RpcResponse>> = futures::future::join_all(futs).await;
+            let responses: Vec<RpcResponse> = results.into_iter().flatten().collect();
+            // § 6: "If there are no Response objects contained within
+            // the Response array as it is to be sent to the client, the
+            // server MUST NOT return an empty Array and should return
+            // nothing at all."
+            if responses.is_empty() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            (StatusCode::OK, Json(responses)).into_response()
+        }
+        Value::Object(_) => match process_single(&app, parsed, &headers, peer_ip).await {
+            Some(resp) => {
+                // Auth / envelope-shape errors get non-200 statuses; all
+                // other JSON-RPC errors ride inside a 200 body per
+                // convention.
+                let status = match resp.error.as_ref().map(|e| e.code) {
+                    Some(-32001) => StatusCode::UNAUTHORIZED,
+                    Some(-32600) | Some(-32700) => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::OK,
+                };
+                (status, Json(resp)).into_response()
+            }
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
+        _ => error_response(
+            Value::Null,
+            &Error::InvalidRequest("request must be a JSON object or array".into()),
+        ),
+    }
+}
+
+/// Process one envelope (single request or one batch element). Returns
+/// `None` if the request was a JSON-RPC notification (envelope parsed
+/// successfully and had no `id` field) — per § 4.1, notifications get
+/// no reply at all.
+async fn process_single(
+    app: &AppState,
+    raw: Value,
+    headers: &HeaderMap,
+    peer_ip: IpAddr,
+) -> Option<RpcResponse> {
+    // Each batch element must itself be a JSON object envelope.
+    if !raw.is_object() {
+        return Some(RpcResponse::err(
+            Value::Null,
+            &Error::InvalidRequest("request must be a JSON object".into()),
+        ));
+    }
+
+    let req: RpcRequest = match serde_json::from_value(raw) {
         Ok(r) => r,
         Err(e) => {
-            let err = Error::BadEnvelope(e.to_string());
-            return error_response(Value::Null, &err);
+            // Parse failure on the envelope. We cannot reliably recover
+            // the id, so respond with id: null per spec.
+            return Some(RpcResponse::err(
+                Value::Null,
+                &Error::InvalidRequest(e.to_string()),
+            ));
         }
     };
 
-    if req.jsonrpc != "2.0" && !req.jsonrpc.is_empty() {
-        let err = Error::BadEnvelope(format!("unsupported jsonrpc version: {}", req.jsonrpc));
-        return error_response(req.id.clone(), &err);
+    let id_owned = req.id.clone();
+    let is_notification = id_owned.is_none();
+    let response_id = id_owned.unwrap_or(Value::Null);
+
+    if req.jsonrpc != "2.0" {
+        if is_notification {
+            return None;
+        }
+        return Some(RpcResponse::err(
+            response_id,
+            &Error::InvalidRequest(format!(
+                "unsupported jsonrpc version: {:?} (must be \"2.0\")",
+                req.jsonrpc
+            )),
+        ));
     }
 
-    let id = req.id.clone();
-
-    // ---- Auth (scope-aware). ----
     let required = Scope::for_method(&req.method);
-    if let Err(err) = app.tokens.authenticate(&headers, required) {
-        return error_response(id, &err);
+    if let Err(err) = app.tokens.authenticate(headers, required) {
+        if is_notification {
+            return None;
+        }
+        return Some(RpcResponse::err(response_id, &err));
     }
 
-    // ---- Dispatch. ----
     let method = req.method.clone();
     let is_spend = matches!(required, Scope::Spend);
     let ip = if is_spend {
-        let peer: IpAddr = connect_info
-            .as_ref()
-            .map(|ci| ci.0.ip())
-            .unwrap_or_else(|| std::net::Ipv4Addr::UNSPECIFIED.into());
-        Some(audit_client_ip(&headers, peer))
+        Some(audit_client_ip(headers, peer_ip))
     } else {
         None
     };
 
-    // Render the JSON-RPC id for the audit log. Stringified so logs
-    // tolerate the spec's "number | string | null" types uniformly.
-    let request_id = if matches!(id, Value::Null) {
+    let request_id = if matches!(response_id, Value::Null) {
         "null".to_string()
     } else {
-        id.to_string()
+        response_id.to_string()
     };
 
-    match dispatch(&app.api, req).await {
-        Ok(result) => {
+    let result = dispatch(&app.api, req).await;
+    match &result {
+        Ok(_) => {
             if let Some(ip) = ip {
                 tracing::info!(
                     method = %method,
@@ -416,7 +546,6 @@ async fn rpc_handler(
                     "spend audit",
                 );
             }
-            (StatusCode::OK, Json(RpcResponse::ok(id, result))).into_response()
         }
         Err(err) => {
             if let Some(ip) = ip {
@@ -429,9 +558,16 @@ async fn rpc_handler(
                     "spend audit",
                 );
             }
-            error_response(id, &err)
         }
     }
+
+    if is_notification {
+        return None;
+    }
+    Some(match result {
+        Ok(v) => RpcResponse::ok(response_id, v),
+        Err(err) => RpcResponse::err(response_id, &err),
+    })
 }
 
 fn error_response(id: Value, err: &Error) -> Response {

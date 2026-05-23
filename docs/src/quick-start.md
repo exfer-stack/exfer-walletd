@@ -16,19 +16,28 @@ below.
 
 ## Dev (laptop / single VM)
 
-Node, walletd, and your code all on one host? Zero flags:
+Node, walletd, and your code all on one host:
 
 ```bash
+export WALLETD_KEYSTORE_PASSPHRASE='correct horse battery staple'
 exfer-walletd
 ```
 
 Defaults: `--bind 127.0.0.1:7448`, `--node-rpc http://127.0.0.1:9334`,
-`--datadir ~/.exfer-walletd`. Assumes a node is already running on
-`127.0.0.1:9334`.
+`--datadir ~/.exfer-walletd`. `WALLETD_KEYSTORE_PASSPHRASE` is
+**required** — walletd encrypts the HD seed at rest with argon2id +
+ChaCha20-Poly1305 and refuses to start without an explicit passphrase.
 
-On first run, walletd creates `~/.exfer-walletd/` (mode `0700`),
-generates a 32-byte bearer token, prints it once in an ASCII box on
-stderr, and starts serving.
+On first run, walletd:
+
+1. Creates `~/.exfer-walletd/` (mode `0700`).
+2. Generates a 24-word BIP-39 mnemonic + a fresh HD seed; seals the
+   seed and prints the mnemonic once on stderr inside an ASCII box.
+   **Write the words down — they are the only seed backup.**
+3. Generates three bearer tokens (one per scope) at
+   `<datadir>/token-{read,manage,spend}` and prints each once in an
+   ASCII box.
+4. Starts serving.
 
 ## Your datadir at a glance
 
@@ -37,23 +46,31 @@ Everything walletd manages lives in one directory. After first run:
 ```bash
 $ ls -la ~/.exfer-walletd/
 drwx------  walletd  4096   .
--rw-------  walletd    65   token              ← bearer token (hex)
-drwx------  walletd  4096   wallets/           ← one .key file per generate_address
+-rw-------  walletd    65   token-read
+-rw-------  walletd    65   token-manage
+-rw-------  walletd    65   token-spend
+drwx------  walletd  4096   wallets/
+    ├── seed.enc        ← sealed BIP-39 entropy
+    ├── state.json      ← next_index, labels, imported list
+    └── imported/       ← legacy .key migrations (sealed)
 
-$ cat ~/.exfer-walletd/token
+$ cat ~/.exfer-walletd/token-spend
 a85da0752815bbf652a1b147649cde77c17f784f3e608d362c629c798a555e7b
 ```
 
 If you also passed `--tls` (see below), three more files appear:
 `cert.pem`, `cert.key`, `cert.fingerprint`.
 
-Backup = `tar czf ... ~/.exfer-walletd`. Uninstall = `rm -rf` it.
-There's nothing else walletd touches.
+**Backup** = the 24-word mnemonic (offline) plus
+`tar czf ... ~/.exfer-walletd/wallets/imported`. The mnemonic
+recovers every HD-derived address; the `imported/` files cover
+addresses that came in via `migrate`. Uninstall = `rm -rf` the
+datadir.
 
 ## Call it
 
 ```bash
-TOKEN=$(cat ~/.exfer-walletd/token)
+TOKEN=$(cat ~/.exfer-walletd/token-spend)
 curl -s http://127.0.0.1:7448/ \
      -H 'content-type: application/json' \
      -H "Authorization: Bearer $TOKEN" \
@@ -181,8 +198,9 @@ plaintext would defeat the whole pinning model.
 ```bash
 exfer-walletd --node-rpc 'http://a:9334,http://b:9334'        # round-robin + failover
 exfer-walletd --datadir  /var/lib/walletd                     # different storage location
-exfer-walletd --auth-token-read  "$(openssl rand -hex 32)" \  # split read/spend tokens
-              --auth-token-spend "$(openssl rand -hex 32)"
+exfer-walletd --auth-token-read   "$(openssl rand -hex 32)" \ # supply any subset of the
+              --auth-token-manage "$(openssl rand -hex 32)" \ # three scoped tokens from
+              --auth-token-spend  "$(openssl rand -hex 32)"   # a secret manager
 ```
 
 Every flag also reads from a matching env var (`WALLETD_BIND`,

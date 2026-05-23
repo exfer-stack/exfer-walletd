@@ -4,47 +4,51 @@ Walletd uses bearer-token authentication on every request except
 `GET /healthz`. Comparison is constant-time
 ([`subtle::ConstantTimeEq`](https://docs.rs/subtle)).
 
-## Default: one auto-generated token
+## Three scoped tokens
 
-First run creates `<datadir>/token` (default `~/.exfer-walletd/token`,
-mode `0600`) with a 32-byte CSPRNG hex string. That single token
-grants every method.
+v1.0 issues **three** tokens, one per scope. On first start walletd
+auto-generates them at `<datadir>/token-{read,manage,spend}` (mode
+`0600`).
 
-```bash
-TOKEN=$(cat ~/.exfer-walletd/token)
-curl -H "Authorization: Bearer $TOKEN" ...
-```
+| Scope    | Methods                                                                                            |
+| -------- | -------------------------------------------------------------------------------------------------- |
+| `read`   | `ping`, `validate_address`, `get_*` family, `list_addresses`, `verify_message`, `get_status`, `get_wallet_balance` |
+| `manage` | `generate_address`, `abandon_transfer`                                                              |
+| `spend`  | `transfer`, `send_raw_transaction`, `sign_message`                                                  |
 
-To take the token from a secret manager instead:
+**Containment**: `spend ⊇ manage ⊇ read`. A token at a higher scope
+satisfies every lower scope, so an exchange's withdrawal worker only
+needs the spend token — it gets `manage` and `read` for free.
 
-```bash
-exfer-walletd --auth-token "$(vault read -field=token secret/walletd)"
-# or
-WALLETD_AUTH_TOKEN=... exfer-walletd
-```
+## Configuring
 
-## Optional: split read / spend
-
-If a deposit-watcher and a withdrawal-worker are separate services,
-issue them separate tokens so a leaked read token can't move funds:
+The default behaviour (auto-generate on first run) suits most setups.
+Override any subset from a secret manager:
 
 ```bash
 exfer-walletd \
-    --auth-token-read  "$(openssl rand -hex 32)" \
-    --auth-token-spend "$(openssl rand -hex 32)"
+    --auth-token-read   "$(vault read -field=token secret/walletd-read)" \
+    --auth-token-manage "$(vault read -field=token secret/walletd-manage)" \
+    --auth-token-spend  "$(vault read -field=token secret/walletd-spend)"
 ```
 
-When either scoped token is set, walletd ignores `<datadir>/token`
-and enforces the two-scope model:
+Env equivalents: `WALLETD_AUTH_TOKEN_READ`, `WALLETD_AUTH_TOKEN_MANAGE`,
+`WALLETD_AUTH_TOKEN_SPEND`. Setting any of them suppresses auto-file
+creation for that scope.
 
-| Env var                       | Scope  | Methods                                                      |
-| ----------------------------- | ------ | ------------------------------------------------------------ |
-| `WALLETD_AUTH_TOKEN_READ`     | read   | Every method **except** `transfer` / `send_raw_transaction` / `sign_message`. |
-| `WALLETD_AUTH_TOKEN_SPEND`    | spend  | All methods. Spend implies read.                              |
-| `WALLETD_AUTH_TOKEN`          | all    | Single-token mode (also the auto-generated file's behaviour). |
+## Typical splits
 
-A read-scope token hitting a spend method → `401 Unauthorized` /
-`-32001`. Method scope is hardcoded — clients can't override it.
+| Component                 | Token to issue  |
+| ------------------------- | --------------- |
+| Deposit watcher           | `token-read`    |
+| Address provisioning      | `token-manage`  |
+| Withdrawal worker         | `token-spend`   |
+| Operator dashboard / SRE  | `token-read`    |
+
+A leaked read token can survey balances and pubkeys but cannot mint
+addresses or spend. A leaked manage token can mint addresses but
+cannot spend or sign messages. A leaked spend token is "every wallet,
+all funds" — guard accordingly.
 
 ## Bind safety
 

@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::idempotency::IdempotencyCache;
 use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
-use crate::tx::TransferReceipt;
+use crate::tx::{FeeChoice, TransferReceipt};
 use crate::upstream::ExferNode;
 
 pub mod signmsg;
@@ -33,6 +34,7 @@ pub struct ApiState {
     pub store: Arc<dyn WalletStore>,
     pub node: Arc<ExferNode>,
     pub inflight: Arc<InFlightUtxos>,
+    pub idempotency: Arc<IdempotencyCache>,
 }
 
 // ============================================================================
@@ -46,8 +48,12 @@ pub struct RpcRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    /// `None` distinguishes a JSON-RPC *notification* (no `id` field
+    /// present in the request) from a request that explicitly passed
+    /// `id: null` (`Some(Value::Null)`). Notifications get no response
+    /// per spec § 4.1.
     #[serde(default)]
-    pub id: Value,
+    pub id: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,26 +105,73 @@ impl RpcResponse {
 // Method param shapes
 // ============================================================================
 
+/// `transfer` request shape. Multi-output, fee/fee_rate optional with
+/// `max_fee` safety cap, plus optional `client_token` for idempotent
+/// retries.
 #[derive(Debug, Deserialize)]
 pub struct TransferParams {
+    /// Sender address (HD-derived or imported). Identifies the wallet
+    /// walletd should spend from.
     pub from: String,
+    /// One or more recipient outputs. Empty array → `BadParams`;
+    /// > [`MAX_OUTPUTS`] → `TooManyOutputs`.
+    pub outputs: Vec<TransferOutput>,
+    /// Fee in exfers per cost-unit. Mutually exclusive with `fee`.
+    /// If both are omitted, defaults to `1` (= consensus minimum).
+    #[serde(default)]
+    pub fee_rate: Option<u64>,
+    /// Absolute fee in exfers. Mutually exclusive with `fee_rate`.
+    #[serde(default)]
+    pub fee: Option<u64>,
+    /// Safety cap on the final fee. The transfer is rejected with
+    /// [`Error::FeeTooHigh`] before broadcast if the computed fee
+    /// exceeds this. Defaults to [`DEFAULT_MAX_FEE`].
+    #[serde(default)]
+    pub max_fee: Option<u64>,
+    /// Optional idempotency key — see [`crate::idempotency`].
+    /// 8..=128 ASCII chars.
+    #[serde(default)]
+    pub client_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransferOutput {
     pub to: String,
     pub amount: u64,
-    #[serde(default = "default_fee")]
-    pub fee: u64,
 }
-fn default_fee() -> u64 {
-    100_000 // 0.001 EXFER
-}
+
+/// Maximum number of outputs in a single transfer. Bounds the
+/// transfer engine's work and the fee-estimation iteration depth.
+pub const MAX_OUTPUTS: usize = 16;
+
+/// Default `max_fee` cap (0.02 EXFER). At consensus' min_fee floor a
+/// well-formed 1-input/2-output transfer costs ~150 exfers; the cap is
+/// four orders of magnitude above that, so it never trips on legitimate
+/// transfers but catches the "off-by-zero" mistake (e.g. operator types
+/// `fee: 50000000` thinking it's exfers/byte).
+pub const DEFAULT_MAX_FEE: u64 = 2_000_000;
 
 #[derive(Debug, Deserialize)]
 pub struct AddressParam {
     pub address: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct GenerateAddressParams {
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Parameter for any method that takes a single transaction id.
 #[derive(Debug, Deserialize)]
-pub struct HashParam {
-    pub hash: String,
+pub struct TxIdParam {
+    pub tx_id: String,
+}
+
+/// Parameter for `get_block_by_id`.
+#[derive(Debug, Deserialize)]
+pub struct BlockIdParam {
+    pub block_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,13 +182,6 @@ pub struct ScriptHexParam {
 #[derive(Debug, Deserialize)]
 pub struct TxHexParam {
     pub tx_hex: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum BlockSelector {
-    ByHash { hash: String },
-    ByHeight { height: u64 },
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,7 +197,7 @@ pub struct HeightParam {
 pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
     match req.method.as_str() {
         // ---- generate / list (wrapper-only) ----
-        "generate_address" => generate_address(state).await,
+        "generate_address" => generate_address(state, req.params).await,
         "list_addresses" => list_addresses(state).await,
 
         // ---- transfer (wrapper-only) ----
@@ -159,8 +205,9 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,
-        "get_block" => get_block(state, req.params).await,
-        "get_block_hash" => get_block_hash(state, req.params).await,
+        "get_block_by_id" => get_block_by_id(state, req.params).await,
+        "get_block_by_height" => get_block_by_height(state, req.params).await,
+        "get_block_id_at_height" => get_block_id_at_height(state, req.params).await,
         "get_transaction" => get_transaction(state, req.params).await,
         "get_balance" => get_balance(state, req.params).await,
         "get_address_utxos" => get_address_utxos(state, req.params).await,
@@ -173,6 +220,12 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "sign_message" => signmsg::sign_message(state, req.params).await,
         "verify_message" => signmsg::verify_message(state, req.params).await,
 
+        // ---- wallet-side conveniences ----
+        "validate_address" => validate_address(req.params).await,
+        "get_wallet_balance" => get_wallet_balance(state).await,
+        "get_status" => get_status(state).await,
+        "abandon_transfer" => abandon_transfer(state, req.params).await,
+
         // ---- health ----
         "ping" => Ok(serde_json::json!({ "ok": true })),
 
@@ -184,56 +237,144 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
 // Wrapper-only methods
 // ----------------------------------------------------------------------------
 
-async fn generate_address(state: &ApiState) -> Result<Value> {
+async fn generate_address(state: &ApiState, params: Value) -> Result<Value> {
+    // Accept either {} or {"label": "..."} — label is optional.
+    let p: GenerateAddressParams = if params.is_null() {
+        GenerateAddressParams::default()
+    } else {
+        serde_json::from_value(params)
+            .map_err(|e| Error::BadParams(format!("generate_address params: {e}")))?
+    };
     let store = state.store.clone();
-    let (wallet, addr_hex) = tokio::task::spawn_blocking(move || store.create())
+    let label = p.label.clone();
+    let derived = tokio::task::spawn_blocking(move || store.create(label))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
-    let pubkey_hex = hex::encode(wallet.pubkey());
-    tracing::info!(address = %addr_hex, "generated new address");
-    Ok(serde_json::json!({
-        "address": addr_hex,
-        "pubkey":  pubkey_hex,
-    }))
+    tracing::info!(address = %derived.address, index = derived.index, "generated new address");
+    serde_json::to_value(&derived).map_err(|e| Error::Internal(e.to_string()))
 }
 
 async fn list_addresses(state: &ApiState) -> Result<Value> {
     let store = state.store.clone();
-    let addrs = tokio::task::spawn_blocking(move || store.list())
+    let entries = tokio::task::spawn_blocking(move || store.list())
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
-    Ok(serde_json::json!({ "addresses": addrs }))
+    Ok(serde_json::json!({ "addresses": entries }))
 }
 
 async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
     let p: TransferParams = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("transfer params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("transfer params: {e}")))?;
 
+    // ---- envelope-level validation (cheap, no upstream calls) --------
     ensure_64_hex(&p.from)?;
-    ensure_64_hex(&p.to)?;
+    if p.outputs.is_empty() {
+        return Err(Error::BadParams(
+            "transfer: outputs[] must not be empty".into(),
+        ));
+    }
+    if p.outputs.len() > MAX_OUTPUTS {
+        return Err(Error::TooManyOutputs {
+            n: p.outputs.len(),
+            max: MAX_OUTPUTS,
+        });
+    }
+    for o in &p.outputs {
+        ensure_64_hex(&o.to)?;
+    }
+    if p.fee.is_some() && p.fee_rate.is_some() {
+        return Err(Error::BadParams(
+            "transfer: `fee` and `fee_rate` are mutually exclusive".into(),
+        ));
+    }
+    if let Some(ref t) = p.client_token {
+        let n = t.len();
+        if !(8..=128).contains(&n) || !t.is_ascii() {
+            return Err(Error::BadParams(format!(
+                "transfer: client_token must be 8..=128 ASCII characters (got {n})"
+            )));
+        }
+    }
+    let fee_choice = match (p.fee, p.fee_rate) {
+        (Some(f), None) => FeeChoice::Absolute(f),
+        (None, Some(r)) => FeeChoice::Rate(r),
+        // Default: rate = 1 (consensus minimum).
+        (None, None) => FeeChoice::Rate(1),
+        (Some(_), Some(_)) => unreachable!("guarded above"),
+    };
+    let max_fee = p.max_fee.unwrap_or(DEFAULT_MAX_FEE);
 
-    // Wallet load is sync FS I/O — run on a blocking worker so we
-    // don't tie up a tokio runtime thread under concurrent transfers.
+    // Convert recipient addresses into Hash256s.
+    let mut recipients: Vec<(exfer::types::Hash256, u64)> = Vec::with_capacity(p.outputs.len());
+    for o in &p.outputs {
+        let bytes = hex::decode(&o.to).map_err(|e| Error::BadHex(e.to_string()))?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        recipients.push((exfer::types::Hash256(arr), o.amount));
+    }
+
+    // ---- load the signer (blocking FS I/O on the keystore) -----------
     let store = state.store.clone();
     let from = p.from.clone();
-    let wallet = tokio::task::spawn_blocking(move || store.load(&from))
+    let signer = tokio::task::spawn_blocking(move || store.load_by_address(&from))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
-    let to_bytes = hex::decode(&p.to).map_err(|e| Error::BadHex(e.to_string()))?;
-    let mut to_arr = [0u8; 32];
-    to_arr.copy_from_slice(&to_bytes);
 
-    let receipt: TransferReceipt = crate::tx::transfer(
-        &wallet,
-        exfer::types::Hash256(to_arr),
-        p.amount,
-        p.fee,
-        &state.node,
-        &state.inflight,
-    )
-    .await?;
+    // ---- run, possibly through the idempotency cache -----------------
+    let receipt: std::sync::Arc<TransferReceipt> = match p.client_token.as_deref() {
+        Some(token) => {
+            let fingerprint = fingerprint_transfer(&p, &fee_choice, max_fee);
+            let recipients_for_run = recipients.clone();
+            state
+                .idempotency
+                .get_or_run(token, fingerprint, move || async move {
+                    crate::tx::transfer(
+                        &signer,
+                        recipients_for_run,
+                        fee_choice,
+                        max_fee,
+                        &state.node,
+                        &state.inflight,
+                    )
+                    .await
+                })
+                .await?
+        }
+        None => {
+            let r = crate::tx::transfer(
+                &signer,
+                recipients,
+                fee_choice,
+                max_fee,
+                &state.node,
+                &state.inflight,
+            )
+            .await?;
+            std::sync::Arc::new(r)
+        }
+    };
 
-    serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))
+    serde_json::to_value(&*receipt).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Deterministic fingerprint over the *meaningful* request shape: which
+/// inputs would yield "the same" transfer result. Captured so the
+/// idempotency layer can detect token reuse with different parameters.
+fn fingerprint_transfer(p: &TransferParams, fee_choice: &FeeChoice, max_fee: u64) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    p.from.to_ascii_lowercase().hash(&mut h);
+    for o in &p.outputs {
+        o.to.to_ascii_lowercase().hash(&mut h);
+        o.amount.hash(&mut h);
+    }
+    match fee_choice {
+        FeeChoice::Absolute(f) => (0u8, *f).hash(&mut h),
+        FeeChoice::Rate(r) => (1u8, *r).hash(&mut h),
+    }
+    max_fee.hash(&mut h);
+    h.finish()
 }
 
 // ----------------------------------------------------------------------------
@@ -245,42 +386,45 @@ async fn get_block_height(state: &ApiState) -> Result<Value> {
     serde_json::to_value(&tip).map_err(|e| Error::Internal(e.to_string()))
 }
 
-async fn get_block(state: &ApiState, params: Value) -> Result<Value> {
-    let sel: BlockSelector = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("get_block params: {e}")))?;
-    let blk = match sel {
-        BlockSelector::ByHeight { height } => state.node.get_block_by_height(height).await?,
-        BlockSelector::ByHash { hash } => {
-            ensure_64_hex(&hash)?;
-            state.node.get_block_by_hash(&hash).await?
-        }
-    };
+async fn get_block_by_id(state: &ApiState, params: Value) -> Result<Value> {
+    let p: BlockIdParam = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_block_by_id params: {e}")))?;
+    ensure_64_hex(&p.block_id)?;
+    let blk = state.node.get_block_by_hash(&p.block_id).await?;
     serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))
 }
 
-/// Bitcoin-style explicit `height → hash` lookup. Same shape as
-/// `get_block_height` so clients can treat both uniformly.
-///
-/// Performance note: upstream Exfer node has no height→hash index, so
-/// this call fetches the full block and discards everything but the
-/// hash. Cost is identical to `get_block(height=…)`. If the caller's
-/// next step is to read the block itself, prefer `get_block(height=…)`
-/// — one round trip instead of two.
-async fn get_block_hash(state: &ApiState, params: Value) -> Result<Value> {
+async fn get_block_by_height(state: &ApiState, params: Value) -> Result<Value> {
     let p: HeightParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("get_block_hash params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("get_block_by_height params: {e}")))?;
+    let blk = state.node.get_block_by_height(p.height).await?;
+    serde_json::to_value(&blk).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Bitcoin-style explicit `height → block_id` lookup. Returns the
+/// same `{block_id, height}` shape as `get_block_height` so clients
+/// can treat both uniformly.
+///
+/// Performance note: upstream Exfer node has no height→block_id index,
+/// so this call fetches the full block and discards everything but the
+/// id. Cost is identical to `get_block_by_height`. If the caller's next
+/// step is to read the block itself, prefer `get_block_by_height`
+/// — one round trip instead of two.
+async fn get_block_id_at_height(state: &ApiState, params: Value) -> Result<Value> {
+    let p: HeightParam = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_block_id_at_height params: {e}")))?;
     let blk = state.node.get_block_by_height(p.height).await?;
     Ok(serde_json::json!({
         "height":   blk.height,
-        "block_id": blk.hash,
+        "block_id": blk.block_id,
     }))
 }
 
 async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
-    let p: HashParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("get_transaction params: {e}")))?;
-    ensure_64_hex(&p.hash)?;
-    let tx = state.node.get_transaction(&p.hash).await?;
+    let p: TxIdParam = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_transaction params: {e}")))?;
+    ensure_64_hex(&p.tx_id)?;
+    let tx = state.node.get_transaction(&p.tx_id).await?;
 
     // Always decode. Outputs are free; inputs need parent-tx fetches
     // (concurrent, cap 8) and degrade gracefully if any parent is
@@ -303,7 +447,7 @@ async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
 
 async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("get_balance params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("get_balance params: {e}")))?;
     ensure_64_hex(&p.address)?;
     let bal = state.node.get_balance(&p.address).await?;
     serde_json::to_value(&bal).map_err(|e| Error::Internal(e.to_string()))
@@ -311,7 +455,7 @@ async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
 
 async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("get_address_utxos params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("get_address_utxos params: {e}")))?;
     ensure_64_hex(&p.address)?;
     let u = state.node.get_address_utxos(&p.address).await?;
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
@@ -319,7 +463,7 @@ async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
 
 async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
     let p: ScriptHexParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("get_script_utxos params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("get_script_utxos params: {e}")))?;
     ensure_hex(&p.script_hex)?;
     let u = state.node.get_script_utxos(&p.script_hex).await?;
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
@@ -327,10 +471,165 @@ async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
 
 async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: TxHexParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("send_raw_transaction params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("send_raw_transaction params: {e}")))?;
     ensure_hex(&p.tx_hex)?;
     let r = state.node.send_raw_transaction(&p.tx_hex).await?;
     serde_json::to_value(&r).map_err(|e| Error::Internal(e.to_string()))
+}
+
+// ----------------------------------------------------------------------------
+// New wallet-side conveniences (v1.0)
+// ----------------------------------------------------------------------------
+
+/// `validate_address` — pure check that a string is a syntactically
+/// well-formed 64-char lowercase hex address. No upstream calls.
+async fn validate_address(params: Value) -> Result<Value> {
+    let p: AddressParam = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("validate_address params: {e}")))?;
+    let trimmed = p.address.trim();
+    let valid = trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+    let normalized = if valid {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "valid": valid,
+        "normalized": normalized,
+    }))
+}
+
+/// `get_wallet_balance` — aggregate balance across every managed
+/// address. Fans out `get_balance` calls concurrently (cap 8).
+async fn get_wallet_balance(state: &ApiState) -> Result<Value> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
+    let store = state.store.clone();
+    let entries = tokio::task::spawn_blocking(move || store.list())
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+
+    let node = state.node.clone();
+    let rows: Vec<Value> = stream::iter(entries.clone())
+        .map(|entry| {
+            let node = node.clone();
+            async move {
+                let bal = node.get_balance(&entry.address).await?;
+                let utxos = node.get_address_utxos(&entry.address).await?;
+                Ok::<Value, Error>(serde_json::json!({
+                    "address": entry.address,
+                    "index": entry.index,
+                    "label": entry.label,
+                    "imported": entry.imported,
+                    "balance": bal.balance,
+                    "utxo_count": utxos.utxos.len(),
+                    "truncated": utxos.truncated,
+                }))
+            }
+        })
+        .buffer_unordered(8)
+        .try_collect()
+        .await?;
+
+    // Sort by index ascending then address (matches list_addresses).
+    let mut rows = rows;
+    rows.sort_by(|a, b| {
+        let ai = a["index"].as_u64();
+        let bi = b["index"].as_u64();
+        match (ai, bi) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a["address"].as_str().cmp(&b["address"].as_str()),
+        }
+    });
+    let total: u64 = rows
+        .iter()
+        .map(|r| r["balance"].as_u64().unwrap_or(0))
+        .sum();
+    Ok(serde_json::json!({
+        "entries": rows,
+        "total": total,
+    }))
+}
+
+/// `get_status` — single round-trip operator dashboard. Includes the
+/// daemon's version, current chain tip (one upstream RPC), wallet
+/// count, configured upstream URLs, and in-flight counters.
+async fn get_status(state: &ApiState) -> Result<Value> {
+    let store = state.store.clone();
+    let wallet_count_fut = tokio::task::spawn_blocking(move || store.list().map(|v| v.len()));
+    let tip_fut = state.node.get_block_height();
+    let (wallet_count_res, tip_res) = tokio::join!(wallet_count_fut, tip_fut);
+
+    let wallet_count =
+        wallet_count_res.map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+
+    // Tip may be unreachable (offline upstream); surface what we have
+    // and leave tip null in that case rather than failing the whole
+    // status call.
+    let (tip_block_id, tip_height, upstream_ok) = match tip_res {
+        Ok(t) => (Some(t.block_id), Some(t.height), true),
+        Err(_) => (None, None, false),
+    };
+
+    Ok(serde_json::json!({
+        "version":             env!("CARGO_PKG_VERSION"),
+        "tip": {
+            "block_id": tip_block_id,
+            "height":   tip_height,
+        },
+        "upstream_ok":         upstream_ok,
+        "upstream_nodes":      state.node.nodes(),
+        "wallet_count":        wallet_count,
+        "in_flight_utxos":     state.inflight.len(),
+        "in_flight_transfers": state.idempotency.len(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AbandonTransferParams {
+    pub outpoints: Vec<OutpointParam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutpointParam {
+    pub tx_id: String,
+    pub output_index: u32,
+}
+
+/// `abandon_transfer` — manually release outpoints from the in-flight
+/// claim set. Use when a `transfer` failed transport-side and you've
+/// confirmed (via `get_transaction(tx_id)`) that the broadcast did NOT
+/// land. After release, the same outpoints become re-selectable.
+async fn abandon_transfer(state: &ApiState, params: Value) -> Result<Value> {
+    let p: AbandonTransferParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("abandon_transfer params: {e}")))?;
+    if p.outpoints.is_empty() {
+        return Err(Error::BadParams(
+            "abandon_transfer: outpoints[] must not be empty".into(),
+        ));
+    }
+    let before = state.inflight.len();
+    let mut converted: Vec<exfer::types::transaction::OutPoint> =
+        Vec::with_capacity(p.outpoints.len());
+    for o in &p.outpoints {
+        ensure_64_hex(&o.tx_id)?;
+        let bytes = hex::decode(&o.tx_id).map_err(|e| Error::BadHex(e.to_string()))?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        converted.push(exfer::types::transaction::OutPoint {
+            tx_id: exfer::types::Hash256(arr),
+            output_index: o.output_index,
+        });
+    }
+    state.inflight.release(&converted);
+    let after = state.inflight.len();
+    let released = before.saturating_sub(after);
+    Ok(serde_json::json!({
+        "released_count": released,
+        "remaining_in_flight": after,
+    }))
 }
 
 // ----------------------------------------------------------------------------

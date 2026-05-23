@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use exfer_walletd::api::ApiState;
-use exfer_walletd::store::FsWalletStore;
+use exfer_walletd::store::HdSeedStore;
 use exfer_walletd::upstream::ExferNode;
 use serde_json::json;
 use wiremock::MockServer;
@@ -19,12 +19,13 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
     let mock = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
 
-    let store = FsWalletStore::open(dir.path()).unwrap();
+    let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -140,22 +141,28 @@ async fn unknown_method_returns_error_with_code_minus_32601() {
     assert_eq!(v["error"]["code"], -32601);
 }
 
-/// Boot the server with explicit scoped tokens (read + spend).
-async fn boot_scoped(read: Option<&str>, spend: Option<&str>) -> (String, KeepAlive) {
+/// Boot the server with explicit scoped tokens (read + manage + spend).
+async fn boot_scoped(
+    read: Option<&str>,
+    manage: Option<&str>,
+    spend: Option<&str>,
+) -> (String, KeepAlive) {
     let mock = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = FsWalletStore::open(dir.path()).unwrap();
+    let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app_state = exfer_walletd::server::build_app_state_for_tests_scoped(
         api,
         read.map(String::from),
+        manage.map(String::from),
         spend.map(String::from),
     );
     let app = exfer_walletd::server::build_router(app_state);
@@ -174,7 +181,7 @@ async fn boot_scoped(read: Option<&str>, spend: Option<&str>) -> (String, KeepAl
 
 #[tokio::test]
 async fn read_token_cannot_call_transfer() {
-    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+    let (base, _g) = boot_scoped(Some("READ"), Some("MANAGE"), Some("SPEND")).await;
 
     let body = json!({
         "jsonrpc": "2.0",
@@ -216,7 +223,7 @@ async fn read_token_cannot_call_transfer() {
 
 #[tokio::test]
 async fn read_token_can_call_read_methods() {
-    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+    let (base, _g) = boot_scoped(Some("READ"), Some("MANAGE"), Some("SPEND")).await;
     let body = json!({ "jsonrpc": "2.0", "method": "ping", "params": {}, "id": 1 });
     let resp = reqwest::Client::new()
         .post(&base)
@@ -232,7 +239,7 @@ async fn read_token_can_call_read_methods() {
 
 #[tokio::test]
 async fn spend_token_grants_read_too() {
-    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+    let (base, _g) = boot_scoped(Some("READ"), Some("MANAGE"), Some("SPEND")).await;
     let body = json!({ "jsonrpc": "2.0", "method": "ping", "params": {}, "id": 1 });
     let resp = reqwest::Client::new()
         .post(&base)
@@ -271,12 +278,13 @@ async fn malformed_envelope_returns_400_with_parse_error() {
 async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, KeepAlive) {
     let mock = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let store = FsWalletStore::open(dir.path()).unwrap();
+    let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
+        idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -371,7 +379,7 @@ async fn read_token_cannot_call_sign_message() {
     // sign_message produces a proof of ownership over a wallet key.
     // It doesn't move funds, but the artifact is value-bearing in
     // KYC / exchange flows, so it's gated behind spend scope.
-    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+    let (base, _g) = boot_scoped(Some("READ"), Some("MANAGE"), Some("SPEND")).await;
 
     let body = json!({
         "jsonrpc": "2.0",
@@ -392,7 +400,7 @@ async fn read_token_cannot_call_sign_message() {
 #[tokio::test]
 async fn read_token_can_call_verify_message() {
     // Verification is pure crypto with no key access — read scope.
-    let (base, _g) = boot_scoped(Some("READ"), Some("SPEND")).await;
+    let (base, _g) = boot_scoped(Some("READ"), Some("MANAGE"), Some("SPEND")).await;
     let body = json!({
         "jsonrpc": "2.0",
         "method":  "verify_message",

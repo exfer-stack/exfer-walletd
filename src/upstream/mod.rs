@@ -307,7 +307,11 @@ pub struct BlockTip {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockSummary {
-    pub hash: String,
+    /// Upstream returns this field as `"hash"`; walletd's outward
+    /// surface normalises it to `block_id` so the same concept has the
+    /// same name everywhere in our API.
+    #[serde(rename(deserialize = "hash"))]
+    pub block_id: String,
     pub height: u64,
     pub timestamp: u64,
     pub tx_count: u64,
@@ -324,8 +328,9 @@ pub struct TxStatus {
     pub tx_id: String,
     pub tx_hex: String,
     pub in_mempool: bool,
-    #[serde(default)]
-    pub block_hash: Option<String>,
+    /// Upstream sends `"block_hash"`; we normalise to `block_id`.
+    #[serde(default, rename(deserialize = "block_hash"))]
+    pub block_id: Option<String>,
     #[serde(default)]
     pub block_height: Option<u64>,
 }
@@ -343,8 +348,6 @@ pub struct UtxoEntry {
     pub value: u64,
     pub height: u64,
     pub is_coinbase: bool,
-    #[serde(default)]
-    pub script_len: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

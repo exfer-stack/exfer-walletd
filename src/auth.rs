@@ -1,20 +1,21 @@
-//! Bearer-token authentication with two scopes (`read` and `spend`).
+//! Bearer-token authentication with three scopes — `read` < `manage` < `spend`.
 //!
-//! The wrapper supports configuring **two independent tokens**:
+//! The wrapper supports configuring **three independent tokens**:
 //!
-//! - The **read** token grants every method *except* spending: balance
-//!   lookups, UTXO listings, address generation, list, ping. A deposit-
-//!   watcher service typically only needs this scope.
-//! - The **spend** token grants everything, including `transfer` and
-//!   `send_raw_transaction`. A withdrawal worker needs this.
+//! - **`read`**: query-only methods (`get_balance`, `get_address_utxos`,
+//!   `get_status`, `validate_address`, `list_addresses`, `verify_message`,
+//!   `ping`, …). Deposit-watcher services usually need only this scope.
+//! - **`manage`**: methods that mutate local walletd state but do not move
+//!   funds (`generate_address`, `abandon_transfer`). A provisioning
+//!   service that mints deposit addresses needs this.
+//! - **`spend`**: value-moving methods (`transfer`, `send_raw_transaction`,
+//!   `sign_message`). A withdrawal worker needs this.
 //!
-//! Operators can:
+//! Containment: presenting the `spend` token satisfies any required scope;
+//! `manage` satisfies `manage` and `read`; `read` only satisfies `read`.
 //!
-//! - Set both tokens and split duties between services.
-//! - Set only `auth_token_spend` (or the legacy single `auth_token`) and
-//!   use one token for everything.
-//! - Set neither — but only if the daemon binds to a loopback address.
-//!   Public binds without a token are refused at startup.
+//! All three tokens are optional, but the daemon refuses to bind a public
+//! interface without at least one configured (see `check_bind_is_safe`).
 //!
 //! All token comparisons are **constant-time** to defeat timing attacks.
 
@@ -29,25 +30,35 @@ use crate::error::{Error, Result};
 // Scope
 // ----------------------------------------------------------------------------
 
-/// Per-method authority requirement.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Per-method authority requirement. Ordered so that `Spend > Manage >
+/// Read` — a presented token satisfies its own scope and every lower
+/// scope (see [`Tokens::authenticate`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
-    /// Read-only RPC + address management (no value at risk).
+    /// Read-only RPC (no state mutation, no funds movement).
     Read,
-    /// Operations that move funds. Includes `Read`.
+    /// Methods that mutate local walletd state but cannot move funds:
+    /// `generate_address`, `abandon_transfer`.
+    Manage,
+    /// Operations that move funds OR mint value-bearing proofs.
     Spend,
 }
 
 impl Scope {
     /// Map an RPC method name to the scope it requires.
     ///
-    /// `sign_message` is `Spend` even though it doesn't move funds: a
+    /// `sign_message` is `Spend` even though it doesn't move funds: the
     /// signature is a verifiable proof of ownership over the wallet's
     /// key, and value-bearing in exchange / KYC contexts. A leaked
     /// read-only token must not be able to mint such proofs.
+    ///
+    /// `generate_address` is `Manage` (not `Read` as in v0.x): it
+    /// creates persistent state on the keystore. Read-scope tokens
+    /// must not write.
     pub fn for_method(method: &str) -> Scope {
         match method {
             "transfer" | "send_raw_transaction" | "sign_message" => Scope::Spend,
+            "generate_address" | "abandon_transfer" => Scope::Manage,
             _ => Scope::Read,
         }
     }
@@ -57,47 +68,45 @@ impl Scope {
 // Token bundle
 // ----------------------------------------------------------------------------
 
-/// Configured tokens. Either or both may be empty.
+/// Configured tokens. Any subset may be empty.
 ///
-/// Construction rules (see [`Tokens::from_config`]):
-///
-/// - Legacy `auth_token` is treated as the **spend** token if set
-///   alone. If both legacy and scoped tokens are set, scoped wins.
-/// - The spend token implicitly grants read access (you don't need to
-///   present it twice).
+/// Containment is enforced at authenticate-time: presenting the
+/// `spend` token always passes; `manage` passes for `manage` and `read`;
+/// `read` only passes for `read`.
 #[derive(Debug, Clone, Default)]
 pub struct Tokens {
     read: Option<Vec<u8>>,
+    manage: Option<Vec<u8>>,
     spend: Option<Vec<u8>>,
 }
 
 impl Tokens {
+    /// Build from the three scoped values. All three are independent;
+    /// any combination of `None`s is legal.
     pub fn from_config(
-        legacy: Option<&str>,
         scoped_read: Option<&str>,
+        scoped_manage: Option<&str>,
         scoped_spend: Option<&str>,
     ) -> Self {
-        let read = scoped_read.map(|s| s.as_bytes().to_vec());
-        // Legacy single-token folds into spend (everything-grants).
-        let spend = scoped_spend
-            .map(|s| s.as_bytes().to_vec())
-            .or_else(|| legacy.map(|s| s.as_bytes().to_vec()));
-        Self { read, spend }
+        Self {
+            read: scoped_read.map(|s| s.as_bytes().to_vec()),
+            manage: scoped_manage.map(|s| s.as_bytes().to_vec()),
+            spend: scoped_spend.map(|s| s.as_bytes().to_vec()),
+        }
     }
 
     /// Whether at least one token is configured.
     pub fn any_set(&self) -> bool {
-        self.read.is_some() || self.spend.is_some()
+        self.read.is_some() || self.manage.is_some() || self.spend.is_some()
     }
 
     /// Authenticate an incoming request for the given scope. Constant
-    /// time. Returns `Ok(())` if a configured token matches; `Err` if
-    /// the supplied token is wrong, missing, or insufficient for the
-    /// required scope.
+    /// time. Returns `Ok(())` if a configured token matches AND has
+    /// sufficient scope; `Err(Unauthorized)` otherwise.
     pub fn authenticate(&self, headers: &HeaderMap, required: Scope) -> Result<()> {
-        // If no tokens configured anywhere, requests are permitted —
-        // the startup check ensures this is only allowed on loopback.
         if !self.any_set() {
+            // No tokens configured anywhere → open API. Startup safety
+            // check ensures this only happens on loopback / private binds.
             return Ok(());
         }
 
@@ -108,16 +117,24 @@ impl Tokens {
             .unwrap_or("")
             .as_bytes();
 
-        // Spend token grants every scope.
-        if let Some(ref spend) = self.spend {
-            if ct_eq(supplied, spend) {
+        // Spend token satisfies every scope.
+        if let Some(ref t) = self.spend {
+            if ct_eq(supplied, t) {
                 return Ok(());
             }
         }
-        // Read scope additionally accepts the read token.
+        // Manage token satisfies Manage and Read.
+        if required <= Scope::Manage {
+            if let Some(ref t) = self.manage {
+                if ct_eq(supplied, t) {
+                    return Ok(());
+                }
+            }
+        }
+        // Read token satisfies Read only.
         if required == Scope::Read {
-            if let Some(ref read) = self.read {
-                if ct_eq(supplied, read) {
+            if let Some(ref t) = self.read {
+                if ct_eq(supplied, t) {
                     return Ok(());
                 }
             }
@@ -128,11 +145,25 @@ impl Tokens {
     /// Stable description of which tokens are configured. Used in
     /// startup logs.
     pub fn description(&self) -> String {
-        match (self.read.is_some(), self.spend.is_some()) {
-            (false, false) => "no auth (open API — loopback only)".into(),
-            (false, true) => "single token (spend, grants all)".into(),
-            (true, false) => "single token (read-only — spend disabled)".into(),
-            (true, true) => "two tokens (read + spend)".into(),
+        match (
+            self.read.is_some(),
+            self.manage.is_some(),
+            self.spend.is_some(),
+        ) {
+            (false, false, false) => "no auth (open API — loopback only)".into(),
+            (r, m, s) => {
+                let mut parts = Vec::new();
+                if r {
+                    parts.push("read");
+                }
+                if m {
+                    parts.push("manage");
+                }
+                if s {
+                    parts.push("spend");
+                }
+                format!("scoped tokens: {}", parts.join(" + "))
+            }
         }
     }
 }
@@ -297,6 +328,7 @@ impl FromStr for Scope {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "read" => Ok(Scope::Read),
+            "manage" => Ok(Scope::Manage),
             "spend" => Ok(Scope::Spend),
             _ => Err(()),
         }
@@ -307,6 +339,7 @@ impl std::fmt::Display for Scope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Scope::Read => "read",
+            Scope::Manage => "manage",
             Scope::Spend => "spend",
         })
     }
@@ -338,9 +371,10 @@ mod tests {
     }
 
     #[test]
-    fn spend_token_grants_read() {
+    fn spend_token_grants_every_scope() {
         let toks = Tokens::from_config(None, None, Some("S"));
         assert!(toks.authenticate(&hdrs(Some("S")), Scope::Read).is_ok());
+        assert!(toks.authenticate(&hdrs(Some("S")), Scope::Manage).is_ok());
         assert!(toks.authenticate(&hdrs(Some("S")), Scope::Spend).is_ok());
         assert!(matches!(
             toks.authenticate(&hdrs(Some("wrong")), Scope::Read),
@@ -349,35 +383,56 @@ mod tests {
     }
 
     #[test]
-    fn read_token_does_not_grant_spend() {
-        let toks = Tokens::from_config(None, Some("R"), Some("S"));
-        // R is only valid for Read
+    fn manage_token_grants_manage_and_read_but_not_spend() {
+        let toks = Tokens::from_config(None, Some("M"), Some("S"));
+        assert!(toks.authenticate(&hdrs(Some("M")), Scope::Read).is_ok());
+        assert!(toks.authenticate(&hdrs(Some("M")), Scope::Manage).is_ok());
+        assert!(matches!(
+            toks.authenticate(&hdrs(Some("M")), Scope::Spend),
+            Err(Error::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn read_token_grants_read_only() {
+        let toks = Tokens::from_config(Some("R"), Some("M"), Some("S"));
         assert!(toks.authenticate(&hdrs(Some("R")), Scope::Read).is_ok());
+        assert!(matches!(
+            toks.authenticate(&hdrs(Some("R")), Scope::Manage),
+            Err(Error::Unauthorized)
+        ));
         assert!(matches!(
             toks.authenticate(&hdrs(Some("R")), Scope::Spend),
             Err(Error::Unauthorized)
         ));
-        // S is valid for both
-        assert!(toks.authenticate(&hdrs(Some("S")), Scope::Read).is_ok());
-        assert!(toks.authenticate(&hdrs(Some("S")), Scope::Spend).is_ok());
     }
 
     #[test]
-    fn legacy_token_acts_as_spend() {
-        let toks = Tokens::from_config(Some("L"), None, None);
-        assert!(toks.authenticate(&hdrs(Some("L")), Scope::Read).is_ok());
-        assert!(toks.authenticate(&hdrs(Some("L")), Scope::Spend).is_ok());
-    }
-
-    #[test]
-    fn scoped_spend_overrides_legacy() {
-        let toks = Tokens::from_config(Some("LEGACY"), None, Some("NEW"));
-        // Legacy no longer authenticates if scoped spend is set.
-        assert!(matches!(
-            toks.authenticate(&hdrs(Some("LEGACY")), Scope::Spend),
-            Err(Error::Unauthorized)
-        ));
-        assert!(toks.authenticate(&hdrs(Some("NEW")), Scope::Spend).is_ok());
+    fn all_three_tokens_independent() {
+        let toks = Tokens::from_config(Some("R"), Some("M"), Some("S"));
+        // Each token only grants its own + lower scopes.
+        for (tok, ok_read, ok_manage, ok_spend) in [
+            ("R", true, false, false),
+            ("M", true, true, false),
+            ("S", true, true, true),
+            ("WRONG", false, false, false),
+        ] {
+            assert_eq!(
+                toks.authenticate(&hdrs(Some(tok)), Scope::Read).is_ok(),
+                ok_read,
+                "{tok} vs Read"
+            );
+            assert_eq!(
+                toks.authenticate(&hdrs(Some(tok)), Scope::Manage).is_ok(),
+                ok_manage,
+                "{tok} vs Manage"
+            );
+            assert_eq!(
+                toks.authenticate(&hdrs(Some(tok)), Scope::Spend).is_ok(),
+                ok_spend,
+                "{tok} vs Spend"
+            );
+        }
     }
 
     #[test]
@@ -469,8 +524,11 @@ mod tests {
     fn method_scope_mapping_is_strict() {
         assert_eq!(Scope::for_method("transfer"), Scope::Spend);
         assert_eq!(Scope::for_method("send_raw_transaction"), Scope::Spend);
+        assert_eq!(Scope::for_method("sign_message"), Scope::Spend);
+        assert_eq!(Scope::for_method("generate_address"), Scope::Manage);
+        assert_eq!(Scope::for_method("abandon_transfer"), Scope::Manage);
         assert_eq!(Scope::for_method("get_block_height"), Scope::Read);
-        assert_eq!(Scope::for_method("generate_address"), Scope::Read);
+        assert_eq!(Scope::for_method("verify_message"), Scope::Read);
         assert_eq!(Scope::for_method("ping"), Scope::Read);
     }
 }

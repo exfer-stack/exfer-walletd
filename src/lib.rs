@@ -55,6 +55,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod idempotency;
 pub mod inflight;
 pub mod server;
 pub mod store;

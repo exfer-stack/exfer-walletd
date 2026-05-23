@@ -1,182 +1,128 @@
-//! Wallet storage.
+//! Wallet keystore.
 //!
-//! The store is abstracted behind a trait so the rest of the codebase
-//! can be written against `dyn WalletStore`. The single shipped backend
-//! is filesystem-based (`FsWalletStore`); future backends — `redb`,
-//! cloud KMS, HSMs — implement the same trait and drop in.
+//! v1.0 model: a single HD seed encrypted at rest. Addresses are derived
+//! on demand via SLIP-0010 (Ed25519). Backup the BIP-39 mnemonic and you
+//! have backed up every present and future address. See `hd::HdSeedStore`
+//! for the on-disk layout.
 //!
-//! ## Filesystem layout (the bundled `FsWalletStore`)
+//! Imported (non-derived) addresses live alongside derived ones — used
+//! by the `migrate` subcommand to absorb legacy walletd `.key` files.
 //!
-//! ```text
-//!   <wallet_dir>/
-//!   ├── 8d896d64...d750.key     ← one file per managed address
-//!   ├── fcbd5a81...c69d.key
-//!   └── ...
-//! ```
-//!
-//! The filename is the 64-hex address. Files are unencrypted (server-side,
-//! no passphrase prompt possible) but written with mode 0600. Protect the
-//! disk at rest with LUKS / dm-crypt / cloud volume encryption / equivalent.
+//! Everything in this module is filesystem-backed; the trait stays
+//! abstract so future backends (cloud KMS, HSM) can drop in.
 
-use std::path::{Path, PathBuf};
+pub mod hd;
+pub mod sealed;
 
-use exfer::wallet::wallet::Wallet;
+use ed25519_dalek::SigningKey;
+use exfer::types::transaction::TxOutput;
+use exfer::types::Hash256;
+use serde::Serialize;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
-// ============================================================================
+pub use hd::HdSeedStore;
+
+// ----------------------------------------------------------------------------
+// Signer — the only thing the rest of walletd needs from a loaded key
+// ----------------------------------------------------------------------------
+
+/// A loaded keypair in memory. Returned by every `WalletStore::load_*`
+/// method. Holds the Ed25519 signing key plus the cached pubkey /
+/// address so callers don't recompute the hash on every use.
+#[derive(Clone)]
+pub struct Signer {
+    signing_key: SigningKey,
+    pubkey: [u8; 32],
+    address: Hash256,
+}
+
+impl Signer {
+    /// Build a signer from a raw 32-byte ed25519 secret. The pubkey and
+    /// address are derived once and cached.
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(secret);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let address = TxOutput::pubkey_hash_from_key(&pubkey);
+        Self {
+            signing_key,
+            pubkey,
+            address,
+        }
+    }
+
+    pub fn signing_key(&self) -> &SigningKey {
+        &self.signing_key
+    }
+    pub fn pubkey(&self) -> [u8; 32] {
+        self.pubkey
+    }
+    pub fn address(&self) -> Hash256 {
+        self.address
+    }
+    pub fn address_hex(&self) -> String {
+        hex::encode(self.address.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // NEVER print the private key.
+        f.debug_struct("Signer")
+            .field("address", &self.address_hex())
+            .finish()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Public DTOs
+// ----------------------------------------------------------------------------
+
+/// Result of `WalletStore::create`. Carries enough for callers (the
+/// `generate_address` RPC) to assemble the JSON response.
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivedAddress {
+    pub address: String,
+    pub pubkey: String,
+    pub index: u32,
+}
+
+/// One row of `WalletStore::list`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressEntry {
+    pub address: String,
+    /// HD derivation index; `None` for imported (non-derived) addresses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    /// Operator-supplied label (e.g. "user-123"); `None` if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// True iff this address came from a legacy `.key` import rather
+    /// than HD derivation.
+    pub imported: bool,
+}
+
+// ----------------------------------------------------------------------------
 // Trait
-// ============================================================================
+// ----------------------------------------------------------------------------
 
-/// Persistence-backend abstraction.
-///
-/// The shipped implementation is [`FsWalletStore`]. Replace it with a
-/// `redb`, cloud-KMS, or HSM-backed implementation by writing another
-/// type that implements this trait; the API and HTTP layers are agnostic.
 pub trait WalletStore: Send + Sync + 'static {
-    /// Generate a fresh keypair and persist it. Returns the loaded
-    /// `Wallet` and the hex-encoded address used as its identifier.
-    fn create(&self) -> Result<(Wallet, String)>;
+    /// Derive the next HD address and persist `next_index`. Optional
+    /// label is attached to the new address.
+    fn create(&self, label: Option<String>) -> Result<DerivedAddress>;
 
-    /// Load an existing wallet by its 64-hex address.
-    fn load(&self, address_hex: &str) -> Result<Wallet>;
+    /// Load a signer for the given 64-hex address. Works for both
+    /// derived and imported addresses.
+    fn load_by_address(&self, address_hex: &str) -> Result<Signer>;
 
-    /// Enumerate every managed address. Sorted ascending.
-    fn list(&self) -> Result<Vec<String>>;
+    /// Enumerate every known address (derived + imported), sorted by
+    /// derivation index ascending (imported addresses appended).
+    fn list(&self) -> Result<Vec<AddressEntry>>;
 
-    /// Whether a wallet exists for the given address.
+    /// Import a raw 32-byte ed25519 secret as a non-derived address.
+    /// Returns the derived address (hex).
+    fn import(&self, secret: &[u8; 32], label: Option<String>) -> Result<String>;
+
+    /// Whether an address is known to this store.
     fn exists(&self, address_hex: &str) -> bool;
-}
-
-// ============================================================================
-// Filesystem implementation
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct FsWalletStore {
-    root: PathBuf,
-}
-
-impl FsWalletStore {
-    /// Open the wallet directory, creating it (mode 0700) if missing.
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        std::fs::create_dir_all(&root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
-        }
-        Ok(Self { root })
-    }
-
-    /// Directory holding the .key files. Useful for tests and logging.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Path for the given 64-hex address.
-    fn path_for(&self, address_hex: &str) -> PathBuf {
-        self.root.join(format!("{address_hex}.key"))
-    }
-}
-
-impl WalletStore for FsWalletStore {
-    fn create(&self) -> Result<(Wallet, String)> {
-        let wallet = Wallet::generate();
-        let addr = hex::encode(wallet.address().as_bytes());
-        let path = self.path_for(&addr);
-        if path.exists() {
-            // SHA-256 collision on Ed25519 → effectively impossible.
-            // We still guard against accidental overwrite.
-            return Err(Error::WalletAlreadyExists(addr));
-        }
-        wallet
-            .save_unencrypted(&path)
-            .map_err(|e| Error::Wallet(format!("save {}: {e}", path.display())))?;
-        Ok((wallet, addr))
-    }
-
-    fn load(&self, address_hex: &str) -> Result<Wallet> {
-        let path = self.path_for(address_hex);
-        if !path.exists() {
-            return Err(Error::WalletNotFound(address_hex.to_string()));
-        }
-        // We always save with `save_unencrypted`, so passphrase is None.
-        Wallet::load(&path, None)
-            .map_err(|e| Error::Wallet(format!("load {}: {e}", path.display())))
-    }
-
-    fn list(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let ext = path.extension().and_then(|s| s.to_str());
-            if ext != Some("key") {
-                continue;
-            }
-            if stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()) {
-                out.push(stem.to_string());
-            }
-        }
-        out.sort();
-        Ok(out)
-    }
-
-    fn exists(&self, address_hex: &str) -> bool {
-        self.path_for(address_hex).exists()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn temp() -> (tempfile::TempDir, FsWalletStore) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FsWalletStore::open(dir.path()).unwrap();
-        (dir, store)
-    }
-
-    #[test]
-    fn create_then_load_roundtrip() {
-        let (_dir, store) = temp();
-        let (w1, addr) = store.create().unwrap();
-        assert_eq!(addr.len(), 64);
-        let w2 = store.load(&addr).unwrap();
-        assert_eq!(w1.pubkey(), w2.pubkey());
-        assert_eq!(w1.address().as_bytes(), w2.address().as_bytes());
-    }
-
-    #[test]
-    fn list_returns_all_created_addresses() {
-        let (_dir, store) = temp();
-        let mut expected = Vec::new();
-        for _ in 0..3 {
-            let (_w, addr) = store.create().unwrap();
-            expected.push(addr);
-        }
-        expected.sort();
-        let listed = store.list().unwrap();
-        assert_eq!(listed, expected);
-    }
-
-    #[test]
-    fn load_missing_returns_typed_error() {
-        let (_dir, store) = temp();
-        let result = store.load(&"00".repeat(32));
-        assert!(matches!(result, Err(Error::WalletNotFound(_))));
-    }
-
-    #[test]
-    fn exists_works() {
-        let (_dir, store) = temp();
-        let (_w, addr) = store.create().unwrap();
-        assert!(store.exists(&addr));
-        assert!(!store.exists(&"00".repeat(32)));
-    }
 }

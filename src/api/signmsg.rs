@@ -66,25 +66,24 @@ pub async fn sign_message(
     params: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let p: SignMessageParams = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("sign_message params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("sign_message params: {e}")))?;
     ensure_64_hex(&p.address)?;
 
     // Wallet load is sync FS I/O — match the transfer path's blocking
     // pattern so we don't tie up a tokio runtime thread.
     let store = state.store.clone();
     let addr = p.address.clone();
-    let wallet = tokio::task::spawn_blocking(move || store.load(&addr))
+    let signer = tokio::task::spawn_blocking(move || store.load_by_address(&addr))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
 
-    let signing_key = wallet.signing_key_for_cli();
-    let signature: Signature = signing_key.sign(&domain_message(&p.message));
-    let pubkey = wallet.pubkey();
+    let signature: Signature = signer.signing_key().sign(&domain_message(&p.message));
+    let pubkey = signer.pubkey();
 
     let result = SignMessageResult {
         signature: hex::encode(signature.to_bytes()),
         pubkey: hex::encode(pubkey),
-        address: hex::encode(wallet.address().as_bytes()),
+        address: signer.address_hex(),
     };
     serde_json::to_value(&result).map_err(|e| Error::Internal(e.to_string()))
 }
@@ -115,7 +114,7 @@ pub async fn verify_message(
     params: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let p: VerifyMessageParams = serde_json::from_value(params)
-        .map_err(|e| Error::BadEnvelope(format!("verify_message params: {e}")))?;
+        .map_err(|e| Error::BadParams(format!("verify_message params: {e}")))?;
     ensure_64_hex(&p.pubkey)?;
     if let Some(a) = p.address.as_deref() {
         ensure_64_hex(a)?;
@@ -128,7 +127,7 @@ pub async fn verify_message(
     let sig_bytes =
         hex::decode(&p.signature).map_err(|e| Error::BadHex(format!("signature: {e}")))?;
     if sig_bytes.len() != SIGNATURE_LENGTH {
-        return Err(Error::BadEnvelope(format!(
+        return Err(Error::BadParams(format!(
             "signature: expected {} bytes, got {}",
             SIGNATURE_LENGTH,
             sig_bytes.len()

@@ -12,6 +12,14 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// On-disk paths for the three auto-generated scoped token files.
+#[derive(Debug, Clone)]
+pub struct ScopedTokenPaths {
+    pub read: PathBuf,
+    pub manage: PathBuf,
+    pub spend: PathBuf,
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "exfer-walletd",
@@ -124,24 +132,23 @@ pub struct Config {
     #[arg(long, env = "WALLETD_WALLET_DIR")]
     pub wallet_dir: Option<PathBuf>,
 
-    /// Single all-scope bearer token. If unset, walletd uses (or
-    /// creates) the one stored at `<datadir>/token`.
-    ///
-    /// Override only when you want walletd to take its token from a
-    /// secret manager / env var rather than the datadir file.
-    #[arg(long, env = "WALLETD_AUTH_TOKEN")]
-    pub auth_token: Option<String>,
-
-    /// Optional read-scope bearer token. Grants every method
-    /// **except** value-moving operations (`transfer`,
-    /// `send_raw_transaction`). Pair with `--auth-token-spend` to
-    /// split deposit-watcher and withdrawal-worker credentials.
+    /// Read-scope bearer token. Grants query-only methods (`get_*`,
+    /// `list_addresses`, `validate_address`, `verify_message`, `ping`).
+    /// If all three `--auth-token-*` flags are unset, walletd
+    /// auto-generates them on first run and stores them at
+    /// `<datadir>/token-{read,manage,spend}`.
     #[arg(long, env = "WALLETD_AUTH_TOKEN_READ")]
     pub auth_token_read: Option<String>,
 
-    /// Optional spend-scope bearer token. Grants all methods. When
-    /// set alongside `--auth-token-read`, the two scopes are
-    /// enforced independently.
+    /// Manage-scope bearer token. Grants methods that mutate local
+    /// walletd state but cannot move funds (`generate_address`,
+    /// `abandon_transfer`). Implies `read`.
+    #[arg(long, env = "WALLETD_AUTH_TOKEN_MANAGE")]
+    pub auth_token_manage: Option<String>,
+
+    /// Spend-scope bearer token. Grants value-moving methods
+    /// (`transfer`, `send_raw_transaction`, `sign_message`). Implies
+    /// `manage` and `read`.
     #[arg(long, env = "WALLETD_AUTH_TOKEN_SPEND")]
     pub auth_token_spend: Option<String>,
 
@@ -186,9 +193,18 @@ impl Config {
             .unwrap_or_else(|| self.resolved_datadir().join("wallets"))
     }
 
-    /// Path of the auto-generated token file inside the datadir.
-    pub fn token_file(&self) -> PathBuf {
-        self.resolved_datadir().join("token")
+    /// Paths of the three auto-generated scoped token files inside the
+    /// datadir. Only consulted on first-run when an `auth_token_*` flag
+    /// is unset; once written, the env-supplied value wins on later
+    /// starts (so an operator can transition to a secret manager
+    /// without re-keying).
+    pub fn token_files(&self) -> ScopedTokenPaths {
+        let dd = self.resolved_datadir();
+        ScopedTokenPaths {
+            read: dd.join("token-read"),
+            manage: dd.join("token-manage"),
+            spend: dd.join("token-spend"),
+        }
     }
 
     /// Resolve `--tls-cert`, defaulting to `<datadir>/cert.pem`.
@@ -239,8 +255,8 @@ mod tests {
             tls_san: Vec::new(),
             node_rpc: "http://127.0.0.1:9334".into(),
             wallet_dir: None,
-            auth_token: None,
             auth_token_read: None,
+            auth_token_manage: None,
             auth_token_spend: None,
             upstream_timeout_secs: 30,
             upstream_attempts: 4,
@@ -273,9 +289,12 @@ mod tests {
     }
 
     #[test]
-    fn token_file_is_in_datadir() {
+    fn token_files_live_in_datadir() {
         let mut cfg = empty_cfg();
         cfg.datadir = Some(PathBuf::from("/x"));
-        assert_eq!(cfg.token_file(), PathBuf::from("/x/token"));
+        let p = cfg.token_files();
+        assert_eq!(p.read, PathBuf::from("/x/token-read"));
+        assert_eq!(p.manage, PathBuf::from("/x/token-manage"));
+        assert_eq!(p.spend, PathBuf::from("/x/token-spend"));
     }
 }

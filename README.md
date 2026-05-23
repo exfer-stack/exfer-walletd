@@ -8,6 +8,16 @@ wallet keypairs and exposes higher-level RPC methods
 (`generate_address`, `transfer`, `balance`, …) on top of one or more
 [Exfer](https://exfer.org/) nodes.
 
+> **v1.0 — breaking release.** Schema, scope model, and on-disk
+> keystore are all new. v0.x clients won't speak to v1.0 unmodified.
+> See the [migration guide](https://exfer-stack.github.io/exfer-walletd/migration-v1.html)
+> for the renaming table and the `migrate` subcommand. Highlights:
+> multi-output `transfer` with `fee_rate` + `max_fee` + idempotency
+> keys; BIP-39 HD seed encrypted at rest with argon2id +
+> ChaCha20-Poly1305; three scoped tokens (`read` / `manage` / `spend`);
+> JSON-RPC 2.0 batch support; spec-correct `-32700` / `-32600` /
+> `-32602` boundaries.
+
 Same pattern as
 [`cardano-wallet`](https://github.com/cardano-foundation/cardano-wallet)
 for Cardano: a separate signing daemon, decoupled from the chain node.
@@ -33,17 +43,23 @@ For most deployments — node, walletd, and backend on different hosts —
 turn on TLS so the bearer token isn't on plaintext wire:
 
 ```bash
+export WALLETD_KEYSTORE_PASSPHRASE='whatever-your-secret-manager-provides'
 exfer-walletd --tls \
     --node-rpc http://<your-node-host>:<port> \
     --bind     <walletd-host-internal-ip>:7448
 ```
 
+`WALLETD_KEYSTORE_PASSPHRASE` is **required** — walletd encrypts the
+HD seed at rest and refuses to start without it.
+
 On first run, walletd creates `~/.exfer-walletd/` (mode `0700`),
-generates a 32-byte bearer token at `~/.exfer-walletd/token`
-(mode `0600`), and — with `--tls` — a self-signed cert trio
-(`cert.pem`, `cert.key`, `cert.fingerprint`). The token and the
-cert fingerprint are each printed once to stderr; copy both to the
-backend side. The SDK pins by fingerprint, no CA needed.
+generates a 24-word BIP-39 mnemonic and a sealed HD seed
+(`wallets/seed.enc`), three scoped bearer tokens
+(`token-{read,manage,spend}`, mode `0600`), and — with `--tls` — a
+self-signed cert trio (`cert.pem`, `cert.key`, `cert.fingerprint`).
+The mnemonic, every token, and the cert fingerprint are each printed
+once to stderr; capture the mnemonic offline (paper / password
+manager) — it is the only seed backup.
 
 **Dev shortcut**: if node, walletd, and the caller are all on one
 host, every flag has a sensible default and `exfer-walletd` with no
@@ -57,13 +73,13 @@ front, pass `--allow-public-bind`.
 ## Call it
 
 ```bash
-TOKEN=$(cat ~/.exfer-walletd/token)
+TOKEN=$(cat ~/.exfer-walletd/token-manage)
 curl -s https://<walletd-host>:7448/ \
      --cacert /etc/walletd/cert.pem \
      -H 'content-type: application/json' \
      -H "Authorization: Bearer $TOKEN" \
      -d '{"jsonrpc":"2.0","method":"generate_address","id":1}'
-# → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…"},"id":1}
+# → {"jsonrpc":"2.0","result":{"address":"…","pubkey":"…","index":0},"id":1}
 ```
 
 Loopback-only dev: drop `--tls`, use `http://127.0.0.1:7448` and skip

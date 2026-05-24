@@ -2,13 +2,17 @@
 
 ## What you get out of the box
 
-- Bearer token at rest is `<datadir>/token` mode `0600`; datadir itself
-  is `0700`. Constant-time comparison on every request.
+- Three scoped bearer tokens at rest: `<datadir>/token-{read,manage,spend}`,
+  mode `0600`; datadir itself is `0700`. Constant-time comparison on
+  every request. See [Tokens and scopes](./tokens-and-scopes.md).
 - Public binds fail-close unless TLS is on (`--tls`) or you opt in
   with `--allow-public-bind`. See
   [Tokens and scopes → Bind safety](./tokens-and-scopes.md#bind-safety).
-- Wallet `.key` files mode `0600` in `<datadir>/wallets/`. Filenames
-  are validated 64-hex addresses — no path traversal.
+- HD seed sealed at `<wallet_dir>/seed.enc` with argon2id +
+  ChaCha20-Poly1305 (KEK from `WALLETD_KEYSTORE_PASSPHRASE`).
+  Imported (non-derived) secrets sealed under the same KEK at
+  `<wallet_dir>/imported/<addr>.key.enc`. Filenames are validated
+  64-hex addresses — no path traversal.
 - Signing happens in-process. Only the signed transaction bytes go
   to the upstream node; private keys never leave the daemon.
 - In-flight UTXO tracker prevents back-to-back transfers from the
@@ -25,11 +29,12 @@
 These are deliberate trade-offs, not bugs. Know what model you're
 running.
 
-- **Wallet keys are plaintext on disk.** A daemon has no human to
-  type a passphrase — keys live unencrypted, protected by FS
-  permissions plus volume-level encryption (LUKS, dm-crypt, cloud
-  volume encryption). Anyone who can read the wallet directory can
-  spend every wallet.
+- **One passphrase unlocks every key.** The HD seed and any imported
+  secrets share the same KEK (derived from
+  `WALLETD_KEYSTORE_PASSPHRASE` via argon2id). Anyone who has the
+  passphrase plus read access to `<wallet_dir>/` can spend every
+  wallet. At-rest encryption defeats offline attackers against the
+  disk; live attackers with both inputs get full authority.
 - **One spend token = total spend authority.** No per-key
   authorization, no quorum, no MPC. If you need finer-grained
   authority, implement the
@@ -67,9 +72,10 @@ double-spend rejection.
 
 ## Common misconfigurations to avoid
 
-- **Don't pass `--auth-token=…` on the command line.** It shows up
-  in `ps aux`. Use the auto-generated `<datadir>/token` or an env
-  var.
+- **Don't pass `--auth-token-{read,manage,spend}=…` on the command
+  line.** They show up in `ps aux`. Use the auto-generated
+  `<datadir>/token-{read,manage,spend}` files, or env vars from a
+  secret manager.
 - **Don't put the wallet directory on shared storage** (NFS,
   S3-FUSE). Mode bits don't translate; concurrent writers will
   corrupt keys.

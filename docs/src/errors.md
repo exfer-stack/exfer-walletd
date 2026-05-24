@@ -31,7 +31,7 @@ high digit:
 | `-32011` | 200  | Wallet exists         | Address collision on `import` (cosmically rare for derived).             |
 | `-32012` | 200  | Keystore locked       | Wrong passphrase / corrupted seed file.                                  |
 | `-32020` | 200  | Upstream              | Upstream node unreachable, or returned an RPC error; message intact.     |
-| `-32030` | 200  | Tx build / auth       | UTXO authentication failed, or transaction construction failed.          |
+| `-32030` | 200  | Tx build              | Transaction construction failed (param overflow, encoding error, etc.).  |
 | `-32031` | 200  | Insufficient balance  | Walletd can't cover `amount + fee` from spendable UTXOs.                 |
 | `-32032` | 200  | Fee too high          | Computed fee exceeds the `max_fee` cap on `transfer`.                    |
 | `-32033` | 200  | Dust output           | An `outputs[].amount` < DUST_THRESHOLD (200 exfers).                     |
@@ -89,17 +89,20 @@ text of `-32020`. Examples seen in practice:
 
 ## `-32001` unauthorized
 
-Four cases produce this:
+Three cases produce this:
 
 1. No `Authorization: Bearer` header.
-2. The header is set but the token doesn't match.
-3. Two-token mode, the request used the read token, but the method
-   needs spend scope.
-4. The token compares against `subtle::ConstantTimeEq` — even a
-   single-character difference returns 401 in identical time.
+2. The header is set but the token doesn't match any of the three
+   scoped tokens (`read` / `manage` / `spend`).
+3. The token matched, but the method requires a higher scope than the
+   one presented (a `read` token calling `transfer`, for example).
+   Containment is `spend ⊇ manage ⊇ read` — see
+   [Tokens and scopes](./tokens-and-scopes.md).
 
-The body message is the same across all four (`authentication required`)
-to avoid leaking which case it was.
+Comparison is `subtle::ConstantTimeEq`, so even a one-character
+difference returns 401 in the same time as a totally-wrong token.
+The body message is the same across all three (`authentication
+required`) to avoid leaking which case it was.
 
 ## Mapping table for clients
 

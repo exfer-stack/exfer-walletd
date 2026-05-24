@@ -14,9 +14,14 @@ gpg --symmetric --cipher-algo AES256 wallets-$(date +%F).tar.gz
 ```
 
 If you can't stop the daemon, snapshot the underlying volume (LVM,
-ZFS, your cloud snapshot). Walletd writes `.key` files with
-`O_CREAT | O_EXCL` and never modifies in place, so atomic per-file
-copies are fine too.
+ZFS, your cloud snapshot). Walletd writes `seed.enc`, `state.json`,
+and `imported/*.key.enc` atomically (write-to-`.tmp` + rename), so
+per-file copies during a quiet moment are fine too.
+
+The 24-word mnemonic printed on first run is the canonical backup
+of the HD seed — keep it offline. With the mnemonic you can rederive
+every HD address; only the `imported/` directory holds non-HD
+secrets that are not recoverable from the mnemonic.
 
 ## Upgrade
 
@@ -35,19 +40,23 @@ file written by any other version.
 
 ## Rotate tokens
 
-Single-token (auto-generated) mode — delete the file and restart:
+Auto-generated mode — delete the file(s) for the scope(s) you want
+to rotate and restart:
 
 ```bash
-rm ~/.exfer-walletd/token
-exfer-walletd      # generates + prints a fresh one
+rm ~/.exfer-walletd/token-spend          # one scope
+# or:
+rm ~/.exfer-walletd/token-{read,manage,spend}   # all three
+exfer-walletd      # regenerates + prints whatever's missing
 ```
 
-Two-token mode (`--auth-token-read` / `--auth-token-spend` set) —
-walletd ignores `<datadir>/token`, so deleting it does nothing.
-Change the env values / CLI flags and restart instead.
+Externally-supplied mode (any of `--auth-token-{read,manage,spend}`
+or `WALLETD_AUTH_TOKEN_{READ,MANAGE,SPEND}` set) — walletd ignores
+the on-disk file for that scope, so deleting it does nothing. Change
+the env / CLI value and restart instead.
 
-Either way, any in-flight request still using the old token will
-fail after the restart. Plan the window.
+Any in-flight request still using the old token will fail after the
+restart. Plan the window.
 
 ## Rotate the TLS cert
 

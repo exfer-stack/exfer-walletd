@@ -19,5 +19,4 @@
 
 - [Security model](./security-model.md)
 - [Backup, upgrade, rotate](./operations.md)
-- [Migrating from v0.x → v1.0](./migration-v1.md)
 - [FAQ & troubleshooting](./faq.md)

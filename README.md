@@ -8,15 +8,11 @@ wallet keypairs and exposes higher-level RPC methods
 (`generate_address`, `transfer`, `balance`, …) on top of one or more
 [Exfer](https://exfer.org/) nodes.
 
-> **v1.0 — breaking release.** Schema, scope model, and on-disk
-> keystore are all new. v0.x clients won't speak to v1.0 unmodified.
-> See the [migration guide](https://exfer-stack.github.io/exfer-walletd/migration-v1.html)
-> for the renaming table and the `migrate` subcommand. Highlights:
-> multi-output `transfer` with `fee_rate` + `max_fee` + idempotency
-> keys; BIP-39 HD seed encrypted at rest with argon2id +
-> ChaCha20-Poly1305; three scoped tokens (`read` / `manage` / `spend`);
-> JSON-RPC 2.0 batch support; spec-correct `-32700` / `-32600` /
-> `-32602` boundaries.
+> **v1.x release line.** Multi-output `transfer` with `fee_rate` +
+> `max_fee` + idempotency keys; BIP-39 HD seed encrypted at rest with
+> argon2id + ChaCha20-Poly1305; three scoped tokens (`read` /
+> `manage` / `spend`); JSON-RPC 2.0 batch support; spec-correct
+> `-32700` / `-32600` / `-32602` boundaries.
 
 Same pattern as
 [`cardano-wallet`](https://github.com/cardano-foundation/cardano-wallet)

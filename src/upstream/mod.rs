@@ -9,10 +9,10 @@
 //! On transport failure (connection refused, timeout, 5xx) the client
 //! does a full pass over every configured node before considering the
 //! whole *attempt* failed, then waits a linear backoff and starts another
-//! attempt up to [`RetryPolicy::attempts`] times. This matters most for
-//! `transfer`, which fires 1 + N + 1 sequential calls during UTXO
-//! authentication — without retry the per-call failure probability
-//! compounds and a flaky public RPC becomes unusable.
+//! attempt up to [`RetryPolicy::attempts`] times. This matters for any
+//! transfer behind a flaky public RPC — `get_address_utxos` and
+//! `send_raw_transaction` are sequential, so without retry the failure
+//! probabilities compound.
 //!
 //! All wire types are strongly typed. The rest of the codebase never
 //! touches raw JSON.

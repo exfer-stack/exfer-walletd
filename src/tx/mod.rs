@@ -19,12 +19,19 @@
 //! ```text
 //!   list UTXOs ──► estimate fee for (1 input, N outputs + 1 change)
 //!              ──► greedy-pick covering total_amount + estimate (skip in-flight)
-//!              ──► authenticate selected (concurrently, cap 8)
 //!              ──► build tx; compute actual fee; re-select if estimate was low
 //!              ──► sign locally (ed25519 over sig_message)
 //!              ──► send_raw_transaction
 //!              ──► self-check: node tx_id == computed tx_id
 //! ```
+//!
+//! Input values are taken directly from `get_address_utxos`. A dishonest
+//! upstream that lies about UTXO values can only cause the resulting tx
+//! to fail consensus on broadcast — funds aren't at risk because the
+//! signature is over what we built. We don't pre-verify against funding
+//! `tx_hex`: that traded one cheap broadcast-failure for N extra RPCs
+//! per transfer, which on rate-limited public nodes was the dominant
+//! failure mode.
 
 pub mod decode;
 
@@ -32,19 +39,12 @@ use ed25519_dalek::Signer as _;
 use exfer::consensus::cost::{min_fee, tx_cost};
 use exfer::types::transaction::{OutPoint, Transaction, TxInput, TxOutput, TxWitness};
 use exfer::types::{Hash256, DUST_THRESHOLD, MIN_FEE_DIVISOR};
-use exfer::wallet::auth::authenticate_tx_hex;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::inflight::InFlightUtxos;
 use crate::store::Signer;
 use crate::upstream::ExferNode;
-
-/// How many `get_transaction` calls we fan out at once during UTXO
-/// authentication. Sub-linear scaling vs input count, gentle on shared
-/// public RPCs.
-const AUTH_CONCURRENCY: usize = 8;
 
 /// Upper bound on fee-estimation iterations. Each iteration may add a
 /// few inputs, increasing tx_cost and thus min_fee. Two iterations
@@ -125,7 +125,7 @@ pub async fn transfer(
     })?;
 
     let sender_addr_hex = signer.address_hex();
-    let wallet_script = std::sync::Arc::new(signer.address().as_bytes().to_vec());
+    let wallet_script: Vec<u8> = signer.address().as_bytes().to_vec();
 
     // ---- 1. fetch sender UTXOs once ---------------------------------
     let utxos = node.get_address_utxos(&sender_addr_hex).await?;
@@ -162,13 +162,7 @@ pub async fn transfer(
                 .checked_add(estimated_fee)
                 .ok_or_else(|| Error::TxBuild("amount + fee overflows u64".into()))?;
 
-            let result: std::result::Result<
-                (
-                    crate::inflight::ClaimGuard<'_>,
-                    Vec<(OutPoint, crate::upstream::UtxoEntry)>,
-                ),
-                Error,
-            > = inflight.select_and_claim(|pending| {
+            let result = inflight.select_and_claim(|pending| {
                 let mut chosen: Vec<(OutPoint, crate::upstream::UtxoEntry)> = Vec::new();
                 let mut chosen_outpoints: Vec<OutPoint> = Vec::new();
                 let mut accumulated: u64 = 0;
@@ -225,46 +219,13 @@ pub async fn transfer(
         }
     };
 
-    // ---- 3. authenticate selected UTXOs in parallel -----------------
-    let owned: Vec<crate::upstream::UtxoEntry> = selected.into_iter().map(|(_, e)| e).collect();
-    let authed: Vec<(OutPoint, u64)> = stream::iter(owned)
-        .map(|entry| {
-            let wallet_script = wallet_script.clone();
-            async move {
-                let tx_id_bytes = decode_hash(&entry.tx_id)?;
-                let tx_id = Hash256(tx_id_bytes);
-
-                let funding = node.get_transaction(&entry.tx_id).await?;
-                let raw = hex::decode(&funding.tx_hex)
-                    .map_err(|e| Error::UtxoAuth(format!("funding tx_hex not hex: {e}")))?;
-
-                let (auth_value, _auth_script) = authenticate_tx_hex(
-                    &raw,
-                    tx_id,
-                    entry.output_index,
-                    Some(wallet_script.as_ref()),
-                )
-                .map_err(|e| Error::UtxoAuth(e.to_string()))?;
-
-                Ok::<_, Error>((
-                    OutPoint {
-                        tx_id,
-                        output_index: entry.output_index,
-                    },
-                    auth_value,
-                ))
-            }
-        })
-        .buffer_unordered(AUTH_CONCURRENCY)
-        .try_collect()
-        .await?;
-
-    let total_in: u64 = authed.iter().map(|(_, v)| *v).sum();
-
-    // ---- 4. assemble outputs, then iteratively settle on the fee.
+    // ---- 3. assemble outputs, then iteratively settle on the fee.
+    //         Values are trusted as the node reported them; a lying node
+    //         can only cause broadcast to fail consensus, not move funds.
     //         We may need to redo the assembly if min_fee on the actual
     //         tx exceeds the estimated_fee we covered.
-    let inputs: Vec<TxInput> = authed
+    let total_in: u64 = selected.iter().map(|(_, e)| e.value).sum();
+    let inputs: Vec<TxInput> = selected
         .iter()
         .map(|(op, _)| TxInput {
             prev_tx_id: op.tx_id,
@@ -286,7 +247,7 @@ pub async fn transfer(
     // change so the cost includes it).
     let placeholder_change = TxOutput {
         value: 0,
-        script: (*wallet_script).clone(),
+        script: wallet_script.clone(),
         datum: None,
         datum_hash: None,
     };
@@ -341,7 +302,7 @@ pub async fn transfer(
         return Err(Error::InsufficientBalance {
             needed: needed_total,
             available: total_in,
-            utxo_count: authed.len(),
+            utxo_count: selected.len(),
             in_flight_value: 0,
             in_flight_count: 0,
         });
@@ -356,7 +317,7 @@ pub async fn transfer(
     if change_value >= DUST_THRESHOLD {
         outputs.push(TxOutput {
             value: change_value,
-            script: (*wallet_script).clone(),
+            script: wallet_script.clone(),
             datum: None,
             datum_hash: None,
         });
@@ -372,7 +333,7 @@ pub async fn transfer(
         });
     }
 
-    // ---- 5. sign locally ----
+    // ---- 4. sign locally ----
     let mut tx = Transaction {
         inputs,
         outputs,
@@ -406,7 +367,7 @@ pub async fn transfer(
         .serialize()
         .map_err(|e| Error::TxSerialize(format!("{e:?}")))?;
 
-    // ---- 6. broadcast ----
+    // ---- 5. broadcast ----
     let tx_hex = hex::encode(&serialized);
     let sent = node.send_raw_transaction(&tx_hex).await?;
     let our_tx_id_hex = hex::encode(tx_id.as_bytes());
@@ -418,13 +379,13 @@ pub async fn transfer(
     }
     guard.commit();
 
-    // ---- 7. assemble receipt ----
-    let receipt_inputs: Vec<ReceiptInput> = authed
+    // ---- 6. assemble receipt ----
+    let receipt_inputs: Vec<ReceiptInput> = selected
         .iter()
-        .map(|(op, v)| ReceiptInput {
+        .map(|(op, e)| ReceiptInput {
             tx_id: hex::encode(op.tx_id.as_bytes()),
             output_index: op.output_index,
-            value: *v,
+            value: e.value,
         })
         .collect();
     let mut receipt_outputs: Vec<ReceiptOutput> = recipients

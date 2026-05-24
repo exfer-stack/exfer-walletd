@@ -31,23 +31,24 @@ even be wrong if nodes are out of sync.
 
 ## Latency math (why local nodes matter)
 
-Walletd's `transfer` makes 3 sequential round-trips plus N parallel
-parent-tx fetches (N = number of input UTXOs, parallelism capped at 8):
+Walletd's `transfer` makes 2 sequential round-trips, regardless of how
+many input UTXOs the tx consumes:
 
 ```
 list_utxos                                    1 RTT
-get_transaction × N (parallel, cap 8)         ⌈N/8⌉ RTTs
 send_raw_transaction                          1 RTT
 ```
 
-Submit time ≈ `(2 + ⌈N/8⌉) × RTT`.
+Submit time ≈ `2 × RTT`.
 
-- Local node (RTT ~5ms): single-UTXO transfer ~15ms
-- LAN node (RTT ~50ms): ~150ms
-- Public RPC (RTT ~750ms): ~2.3s
+- Local node (RTT ~5ms): ~10ms
+- LAN node (RTT ~50ms): ~100ms
+- Public RPC (RTT ~750ms): ~1.5s
 
-For an exchange hot wallet with many small UTXOs, run a local or
-VPC-internal node — public RPC will be visibly slow.
+Input count doesn't enter the latency budget: walletd trusts the
+`value` reported by `get_address_utxos` and does not pre-fetch each
+funding tx. A node that returns wrong values can only cause the
+broadcast to fail consensus — funds stay safe.
 
 ## Next
 

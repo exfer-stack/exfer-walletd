@@ -89,9 +89,6 @@ pub enum Error {
     #[error("transaction serialization failed: {0}")]
     TxSerialize(String),
 
-    #[error("UTXO authentication failed: {0}")]
-    UtxoAuth(String),
-
     #[error("{}", insufficient_balance_message(*needed, *available, *utxo_count, *in_flight_value, *in_flight_count))]
     InsufficientBalance {
         /// `amount + fee` — what the transfer asked for.
@@ -158,7 +155,7 @@ impl Error {
             Error::UpstreamUnreachable(_)
             | Error::UpstreamRpc { .. }
             | Error::UpstreamUnexpected(_) => -32020,
-            Error::TxBuild(_) | Error::UtxoAuth(_) => -32030,
+            Error::TxBuild(_) => -32030,
             Error::InsufficientBalance { .. } => -32031,
             Error::FeeTooHigh { .. } => -32032,
             Error::DustOutput { .. } => -32033,

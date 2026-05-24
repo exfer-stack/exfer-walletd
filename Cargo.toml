@@ -1,6 +1,6 @@
 [package]
 name        = "exfer-walletd"
-version     = "1.1.0"
+version     = "1.2.0"
 edition     = "2021"
 description = "Exfer Wallet Daemon — independent wallet service that exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes"
 license     = "MIT"
@@ -19,6 +19,7 @@ exfer = { git = "https://github.com/ahuman-exfer/exfer.git", tag = "v1.11.0" }
 
 axum            = { version = "0.7", features = ["macros"] }
 tokio           = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "fs"] }
+tokio-util      = { version = "0.7", features = ["rt"] }
 futures         = "0.3"
 tower            = "0.5"
 tower-http       = { version = "0.6", features = ["trace", "cors"] }

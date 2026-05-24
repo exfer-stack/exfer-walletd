@@ -13,7 +13,6 @@ use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use rand::{rngs::OsRng, RngCore};
 
@@ -29,12 +28,9 @@ use serde_json::Value;
 use tower_http::trace::TraceLayer;
 
 use crate::api::{dispatch, ApiState, RpcRequest, RpcResponse};
-use crate::auth::{check_bind_is_safe, Scope, Tokens};
+use crate::auth::{Scope, Tokens};
 use crate::config::Config;
 use crate::error::Error;
-use crate::inflight::InFlightUtxos;
-use crate::store::HdSeedStore;
-use crate::upstream::{ExferNode, RetryPolicy};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -126,44 +122,15 @@ pub fn add_tls_bootstrap_routes(router: Router, cert_pem: String, fingerprint: S
         )
 }
 
+/// Daemon entry point. Reads `WALLETD_KEYSTORE_PASSPHRASE` from the
+/// environment, wires `tokio::signal::ctrl_c()` to a cancellation
+/// token, delegates the actual setup + serve to
+/// [`crate::embed::run_embedded`], and awaits the server task.
+///
+/// Library callers (Tauri shells, integration tests, anything that
+/// wants to drive shutdown programmatically or surface the bound
+/// port) should call `run_embedded` directly.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
-    let datadir = cfg.resolved_datadir();
-    let wallet_dir = cfg.resolved_wallet_dir();
-
-    // Create datadir + wallet dir on first run. Mode 0700 — only the
-    // running user should ever read these.
-    ensure_dir(&datadir, 0o700)?;
-    ensure_dir(&wallet_dir, 0o700)?;
-
-    // Resolve the three scoped tokens. For each scope: explicit
-    // env/CLI value wins; otherwise auto-generate (and persist) on
-    // first run inside the datadir. The three files are independent
-    // — operators can env-override any subset.
-    let paths = cfg.token_files();
-    let read = match cfg.auth_token_read.clone() {
-        Some(t) => t,
-        None => ensure_token_file(&paths.read, "read")?,
-    };
-    let manage = match cfg.auth_token_manage.clone() {
-        Some(t) => t,
-        None => ensure_token_file(&paths.manage, "manage")?,
-    };
-    let spend = match cfg.auth_token_spend.clone() {
-        Some(t) => t,
-        None => ensure_token_file(&paths.spend, "spend")?,
-    };
-    let tokens = Tokens::from_config(Some(&read), Some(&manage), Some(&spend));
-
-    // Fail closed: refuse public binds without a token, and refuse
-    // public binds *with* a token unless either --tls is on (we
-    // terminate TLS ourselves) or --allow-public-bind is set (the
-    // operator is acknowledging an external TLS terminator / VPN).
-    check_bind_is_safe(cfg.bind, &tokens, cfg.allow_public_bind, cfg.tls)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    // Keystore passphrase MUST come from the environment — never default.
-    // We fail-closed at startup so a misconfigured deployment can't
-    // silently run with an empty / well-known passphrase.
     let passphrase = std::env::var("WALLETD_KEYSTORE_PASSPHRASE").unwrap_or_default();
     if passphrase.is_empty() {
         anyhow::bail!(
@@ -173,104 +140,17 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
              Set it in env (or your container/secret manager) before launching."
         );
     }
-    let store = HdSeedStore::open_or_init_fresh(&wallet_dir, passphrase.as_bytes())
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    if let Some(words) = store.take_fresh_mnemonic() {
-        print_fresh_mnemonic(&words);
-    }
-    let retry = RetryPolicy {
-        attempts: cfg.upstream_attempts,
-        backoff_ms: cfg.upstream_retry_backoff_ms,
-    };
-    let node = ExferNode::with_retry_policy(
-        cfg.node_rpc.clone(),
-        Duration::from_secs(cfg.upstream_timeout_secs),
-        retry,
-    )?;
-    let api = ApiState {
-        store: Arc::new(store),
-        node: Arc::new(node),
-        inflight: Arc::new(InFlightUtxos::new()),
-        idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
-    };
-    let app_state = AppState {
-        api,
-        tokens: Arc::new(tokens.clone()),
-    };
 
-    // Load (or generate, on first run) the TLS material if --tls is on.
-    // We do this *before* logging "starting" so the first-run cert box
-    // appears next to the token box, not after a misleading "starting"
-    // line.
-    let tls_material = if cfg.tls {
-        let mut extra_sans: Vec<String> = cfg.tls_san.clone();
-        // Auto-include the bound IP. `--bind 0.0.0.0` / `::` is filtered
-        // out inside `ensure_cert_files`; operators with wildcard binds
-        // must pass real hostnames/IPs via `--tls-san`.
-        extra_sans.push(cfg.bind.ip().to_string());
-        Some(crate::tls::ensure_cert_files(
-            &cfg.resolved_tls_cert_path(),
-            &cfg.resolved_tls_key_path(),
-            &cfg.tls_fingerprint_path(),
-            &extra_sans,
-        )?)
-    } else {
-        None
-    };
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+        shutdown_signal.cancel();
+    });
 
-    let scheme = if cfg.tls { "https" } else { "http" };
-    let fingerprint_log = tls_material
-        .as_ref()
-        .map(|m| m.fingerprint.clone())
-        .unwrap_or_default();
-
-    tracing::info!(
-        bind         = %cfg.bind,
-        scheme       = %scheme,
-        tls          = cfg.tls,
-        fingerprint  = %fingerprint_log,
-        node_rpc     = %cfg.node_rpc,
-        datadir      = %datadir.display(),
-        wallet_dir   = %wallet_dir.display(),
-        auth         = %tokens.description(),
-        attempts     = retry.attempts,
-        backoff_ms   = retry.backoff_ms,
-        "exfer-walletd starting",
-    );
-
-    let mut app = build_router(app_state);
-
-    // Bootstrap endpoints only mounted when --tls is on — see
-    // [`add_tls_bootstrap_routes`] for the rationale.
-    if let Some(material) = tls_material.as_ref() {
-        app =
-            add_tls_bootstrap_routes(app, material.cert_pem.clone(), material.fingerprint.clone());
-    }
-
-    let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
-
-    if let Some(material) = tls_material {
-        // axum-server owns the listen+accept loop on the TLS path.
-        // Graceful shutdown wiring differs from axum::serve but the
-        // handle is straightforward.
-        let handle = axum_server::Handle::new();
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal().await;
-            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
-        });
-        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(material.server_config);
-        axum_server::bind_rustls(cfg.bind, rustls_cfg)
-            .handle(handle)
-            .serve(make_service)
-            .await?;
-    } else {
-        let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
-        axum::serve(listener, make_service)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
-    }
-    Ok(())
+    let handle = crate::embed::run_embedded(cfg, &passphrase, shutdown).await?;
+    handle.wait().await
 }
 
 /// Create a directory (and any parents) with the given mode, OR if
@@ -281,7 +161,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 /// and `wallets/`.
 ///
 /// Mode is honored only on Unix.
-fn ensure_dir(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
+pub(crate) fn ensure_dir(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
     if path.exists() {
         if !path.is_dir() {
             anyhow::bail!("{} exists but is not a directory", path.display());
@@ -319,7 +199,11 @@ fn ensure_dir(path: &std::path::Path, mode: u32) -> anyhow::Result<()> {
 
 /// Read the token at `path`, or generate + persist a fresh one and
 /// print it prominently to stderr the first time we mint it.
-fn ensure_token_file(path: &std::path::Path, scope: &str) -> anyhow::Result<String> {
+///
+/// `pub(crate)` so the embedded entry point ([`crate::embed::run_embedded`])
+/// can reuse the same precedence + side effects without re-implementing
+/// them.
+pub(crate) fn ensure_token_file(path: &std::path::Path, scope: &str) -> anyhow::Result<String> {
     if let Ok(s) = fs::read_to_string(path) {
         let trimmed = s.trim().to_string();
         if !trimmed.is_empty() {
@@ -355,16 +239,14 @@ fn ensure_token_file(path: &std::path::Path, scope: &str) -> anyhow::Result<Stri
     Ok(token)
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
-}
-
 /// Print the freshly-generated BIP-39 mnemonic to stderr exactly once
 /// (only after a brand-new keystore was initialised). Matches the style
 /// of `ensure_token_file` so first-run output reads as one boxed
 /// section.
-fn print_fresh_mnemonic(words: &[String]) {
+///
+/// `pub(crate)` so [`crate::embed::run_embedded`] can call it on the
+/// same fresh-init signal.
+pub(crate) fn print_fresh_mnemonic(words: &[String]) {
     eprintln!();
     eprintln!("  ┌─ first run: HD seed ──────────────────────────────────────────────────");
     eprintln!("  │ A new BIP-39 mnemonic has been generated and the seed has been");

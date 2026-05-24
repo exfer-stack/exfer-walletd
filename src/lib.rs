@@ -54,6 +54,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod embed;
 pub mod error;
 pub mod idempotency;
 pub mod inflight;
@@ -63,4 +64,5 @@ pub mod tls;
 pub mod tx;
 pub mod upstream;
 
+pub use embed::{run_embedded, EmbeddedTokens, ServerHandle};
 pub use error::{Error, Result};

@@ -59,7 +59,7 @@ READ=$(cat ~/.exfer-walletd/token-read)
 |---|---|
 | `read` | `ping`, `validate_address`, `get_balance`, `get_wallet_balance`, `get_block_height`, `get_block_by_id`, `get_block_by_height`, `get_block_id_at_height`, `get_transaction`, `get_address_utxos`, `get_script_utxos`, `get_status`, `list_addresses`, `verify_message` |
 | `manage` | `generate_address`, `abandon_transfer` |
-| `spend` | `transfer`, `send_raw_transaction`, `sign_message` |
+| `spend` | `transfer`, `send_raw_transaction`, `sign_message`, `reveal_mnemonic`, `reveal_private_key` |
 
 `spend` ⊇ `manage` ⊇ `read`. A token at a higher scope satisfies every
 lower scope.
@@ -484,6 +484,55 @@ Verify an Ed25519 message signature. Pure crypto, no wallet access.
 `pubkey`, so a verifier sees what the key actually hashes to even on
 `valid: false`. If the optional request `address` is supplied, `valid`
 is true iff signature verifies AND `H(DS_ADDR || pubkey) == address`.
+
+---
+
+## `reveal_mnemonic`
+
+Re-supply the keystore passphrase and receive the 24-word BIP-39
+mnemonic that produced this keystore. **Sensitive — only call after a
+deliberate user action.**
+
+| | |
+|---|---|
+| **Scope** | spend |
+| **Params** | `{ passphrase: string }` |
+| **Returns** | `{ mnemonic: string[] }` (24 lowercase BIP-39 words) |
+
+The passphrase is verified by re-unsealing `seed.enc` with it. Wrong
+passphrase surfaces as [`-32012` Keystore locked](./errors.md). The
+in-memory passphrase from daemon start is **not** reused — clients
+must pass it freshly, which mirrors standard wallet
+"type your password to reveal" gating.
+
+Walletd's HD path is `m/44'/9527'/0'/0'/i'`, so the returned mnemonic
+is **not** directly portable to most third-party wallets (their default
+coin-type-44 derivation uses a different `coin_type` slot). It is the
+canonical recovery secret for re-running walletd against the same
+keystore.
+
+---
+
+## `reveal_private_key`
+
+Re-supply the keystore passphrase and receive the raw 32-byte ed25519
+secret for a single managed address. **Sensitive — only call after a
+deliberate user action.**
+
+| | |
+|---|---|
+| **Scope** | spend |
+| **Params** | `{ address: hex64, passphrase: string }` |
+| **Returns** | `{ address: hex64, secret_hex: hex64 }` |
+
+Works for HD-derived addresses (re-derives from the just-unsealed
+seed) and for imported addresses (re-unseals the per-key file with the
+same passphrase). Wrong passphrase → `-32012 Keystore locked`. Address
+not in this keystore → `-32010 Wallet not found`.
+
+The returned `secret_hex` is a 32-byte ed25519 private key in
+lowercase hex, the same secret format consumed by
+[`exfer-walletd migrate --from <dir>`](./keystore.md#imported-non-derived-addresses).
 
 ---
 

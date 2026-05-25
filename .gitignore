@@ -13,3 +13,4 @@ docs/book/
 .replay-perf-bench/
 
 .claude/
+.gstack/

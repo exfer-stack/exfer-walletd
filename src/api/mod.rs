@@ -220,6 +220,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "sign_message" => signmsg::sign_message(state, req.params).await,
         "verify_message" => signmsg::verify_message(state, req.params).await,
 
+        // ---- sensitive recovery export (passphrase-gated, spend-scope) ----
+        "reveal_mnemonic" => reveal_mnemonic(state, req.params).await,
+        "reveal_private_key" => reveal_private_key(state, req.params).await,
+
         // ---- wallet-side conveniences ----
         "validate_address" => validate_address(req.params).await,
         "get_wallet_balance" => get_wallet_balance(state).await,
@@ -475,6 +479,50 @@ async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> 
     ensure_hex(&p.tx_hex)?;
     let r = state.node.send_raw_transaction(&p.tx_hex).await?;
     serde_json::to_value(&r).map_err(|e| Error::Internal(e.to_string()))
+}
+
+#[derive(serde::Deserialize)]
+struct RevealMnemonicParams {
+    passphrase: String,
+}
+
+async fn reveal_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
+    let p: RevealMnemonicParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("reveal_mnemonic params: {e}")))?;
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let words = tokio::task::spawn_blocking(move || store.reveal_mnemonic(pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(count = words.len(), "reveal_mnemonic served — sensitive output");
+    Ok(serde_json::json!({ "mnemonic": words }))
+}
+
+#[derive(serde::Deserialize)]
+struct RevealPrivateKeyParams {
+    address: String,
+    passphrase: String,
+}
+
+async fn reveal_private_key(state: &ApiState, params: Value) -> Result<Value> {
+    let p: RevealPrivateKeyParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("reveal_private_key params: {e}")))?;
+    ensure_64_hex(&p.address)?;
+    let address = p.address.to_ascii_lowercase();
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let addr_for_blocking = address.clone();
+    let secret = tokio::task::spawn_blocking(move || {
+        store.reveal_secret(&addr_for_blocking, pass.as_bytes())
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    let secret_hex = hex::encode(secret.as_ref());
+    tracing::warn!(address = %address, "reveal_private_key served — sensitive output");
+    Ok(serde_json::json!({
+        "address":    address,
+        "secret_hex": secret_hex,
+    }))
 }
 
 // ----------------------------------------------------------------------------

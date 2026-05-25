@@ -205,6 +205,111 @@ impl HdSeedStore {
         );
         Signer::from_secret_bytes(&secret)
     }
+
+    /// Verify `passphrase` matches the at-rest KEK by re-unsealing the
+    /// seed file, then return the 24-word BIP-39 mnemonic that
+    /// produced this keystore.
+    ///
+    /// **The caller must pass the passphrase freshly** — we don't
+    /// reuse the in-memory copy on purpose, so this surface mirrors
+    /// MetaMask-style "type your password again to reveal" flows.
+    /// Wrong passphrase → [`Error::KeystoreLocked`].
+    pub fn reveal_mnemonic(&self, passphrase: &[u8]) -> Result<Vec<String>> {
+        let entropy = self.unseal_entropy(passphrase)?;
+        let mnemonic = Mnemonic::from_entropy(entropy.as_ref())
+            .map_err(|e| Error::Internal(format!("mnemonic from entropy: {e}")))?;
+        // entropy is dropped here; bip39 made an internal copy into
+        // `mnemonic`, but the only externally-observable output is
+        // the public word list.
+        let _ = entropy; // keep zeroize until scope end
+        Ok(mnemonic.words().map(|w| w.to_string()).collect())
+    }
+
+    /// Verify `passphrase` and return the raw 32-byte ed25519 secret
+    /// for `address_hex`. Works for HD-derived addresses (re-derive
+    /// from the seed) and for imported addresses (re-unseal the
+    /// per-key file with the same passphrase).
+    ///
+    /// Wrong passphrase → [`Error::KeystoreLocked`]. Address not in
+    /// this keystore → [`Error::WalletNotFound`].
+    pub fn reveal_secret(
+        &self,
+        address_hex: &str,
+        passphrase: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        let address_hex = address_hex.to_ascii_lowercase();
+
+        // Verify the passphrase by re-unsealing the seed first. For
+        // imported keys we also unseal the per-key file with the same
+        // passphrase (a successful seed unseal proves the passphrase is
+        // right; a failure on the imported key would mean the imported
+        // key was sealed with a different passphrase, which today
+        // shouldn't happen but the error path remains correct).
+        let entropy = self.unseal_entropy(passphrase)?;
+
+        let kind = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = state.derived.get(&address_hex) {
+                Some(("derived", Some(*i)))
+            } else if state.imported.contains(&address_hex) {
+                Some(("imported", None))
+            } else {
+                None
+            }
+        };
+        let kind = kind.ok_or(Error::WalletNotFound(address_hex.clone()))?;
+
+        let secret = match kind {
+            ("derived", Some(idx)) => {
+                let entropy_arr: [u8; 32] = *entropy;
+                let seed64 = entropy_to_seed64(&entropy_arr);
+                let raw = slip10_ed25519::derive_ed25519_private_key(
+                    &seed64,
+                    &[44, EXFER_COIN_TYPE, 0, 0, idx],
+                );
+                // seed64 is on-stack; explicit zeroize.
+                let mut s = seed64;
+                s.zeroize();
+                raw
+            }
+            ("imported", None) => {
+                let blob = std::fs::read(
+                    self.root
+                        .join(IMPORTED_DIR)
+                        .join(format!("{address_hex}.key.enc")),
+                )?;
+                let secret_vec = sealed::unseal(passphrase, IMPORTED_AAD, &blob)
+                    .map_err(|_| Error::KeystoreLocked("wrong passphrase".into()))?;
+                let arr: [u8; 32] = secret_vec.as_slice().try_into().map_err(|_| {
+                    Error::KeystoreLocked(format!(
+                        "imported key for {address_hex} has wrong length ({} bytes, expected 32)",
+                        secret_vec.len()
+                    ))
+                })?;
+                arr
+            }
+            _ => unreachable!(),
+        };
+        let _ = entropy;
+        Ok(Zeroizing::new(secret))
+    }
+
+    /// Internal: re-unseal `seed.enc` with a freshly-supplied
+    /// passphrase. Returns the 32-byte BIP-39 entropy as a zeroizing
+    /// buffer. Wrong passphrase → [`Error::KeystoreLocked`].
+    fn unseal_entropy(&self, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        let seed_path = self.root.join(SEED_FILE);
+        let blob = std::fs::read(&seed_path)?;
+        let entropy_vec = sealed::unseal(passphrase, SEED_AAD, &blob)
+            .map_err(|_| Error::KeystoreLocked("wrong passphrase".into()))?;
+        let arr: [u8; 32] = entropy_vec.as_slice().try_into().map_err(|_| {
+            Error::Internal(format!(
+                "sealed entropy was {} bytes; expected 32",
+                entropy_vec.len()
+            ))
+        })?;
+        Ok(Zeroizing::new(arr))
+    }
 }
 
 /// BIP-39 seed: PBKDF2-HMAC-SHA512(mnemonic_phrase, "mnemonic" || ""),
@@ -371,6 +476,18 @@ impl WalletStore for HdSeedStore {
         let lower = address_hex.to_ascii_lowercase();
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.derived.contains_key(&lower) || state.imported.contains(&lower)
+    }
+
+    fn reveal_mnemonic(&self, passphrase: &[u8]) -> Result<Vec<String>> {
+        Self::reveal_mnemonic(self, passphrase)
+    }
+
+    fn reveal_secret(
+        &self,
+        address_hex: &str,
+        passphrase: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        Self::reveal_secret(self, address_hex, passphrase)
     }
 }
 

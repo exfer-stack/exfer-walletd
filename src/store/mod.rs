@@ -125,4 +125,21 @@ pub trait WalletStore: Send + Sync + 'static {
 
     /// Whether an address is known to this store.
     fn exists(&self, address_hex: &str) -> bool;
+
+    /// Verify `passphrase` matches the at-rest KEK and return the
+    /// 24-word BIP-39 mnemonic that produced the keystore. Wrong
+    /// passphrase MUST surface as `Error::KeystoreLocked`. Sensitive
+    /// — only call when the user has explicitly opted in.
+    fn reveal_mnemonic(&self, passphrase: &[u8]) -> Result<Vec<String>>;
+
+    /// Verify `passphrase` and return the raw 32-byte ed25519 secret
+    /// for a managed address (HD-derived or imported). Wrong
+    /// passphrase → `KeystoreLocked`. Unknown address →
+    /// `WalletNotFound`. Sensitive — only call when the user has
+    /// explicitly opted in.
+    fn reveal_secret(
+        &self,
+        address_hex: &str,
+        passphrase: &[u8],
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>>;
 }

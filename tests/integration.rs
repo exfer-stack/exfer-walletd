@@ -1304,6 +1304,48 @@ async fn get_wallet_balance_aggregates_per_address() {
         .unwrap();
     assert_eq!(result["total"], 10_000);
     assert_eq!(result["entries"].as_array().unwrap().len(), 2);
+    // Default includes per-address utxo_count.
+    assert!(result["entries"][0].get("utxo_count").is_some());
+}
+
+#[tokio::test]
+async fn get_wallet_balance_skips_utxos_when_disabled() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let a = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Only get_balance is wired up — get_address_utxos is intentionally
+    // NOT mounted, so the call would 404 if it were made.
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({ "method": "get_balance", "params": {"address": a.clone()} }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "address": a, "balance": 4_200 },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let result = dispatch(
+        &state,
+        rpc("get_wallet_balance", json!({ "utxos": false })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["total"], 4_200);
+    let entry = &result["entries"][0];
+    assert_eq!(entry["balance"], 4_200);
+    // utxo_count / truncated are omitted when utxos == false.
+    assert!(entry.get("utxo_count").is_none());
+    assert!(entry.get("truncated").is_none());
 }
 
 // --- abandon_transfer -----------------------------------------------------

@@ -134,18 +134,22 @@ type AddressEntry = {
 
 Aggregate confirmed balance across every managed address.
 
-For each known address, walletd calls upstream `get_balance` and
-`get_address_utxos` so it can return both `balance` and `utxo_count`.
-That is **2 upstream scan RPCs per address**, executed concurrently
-with cap 8. On public/community nodes with per-IP scan quotas, large
-wallets can hit upstream rate limits; use `list_addresses` plus paced
-per-address reads if you need quota-safe polling until upstream batch
-balance lookup exists.
+For each known address, walletd calls upstream `get_balance` and (by
+default) `get_address_utxos`, so it can return both `balance` and
+`utxo_count`. That is **2 upstream scan RPCs per address**, executed
+concurrently with cap 8. On public/community nodes with per-IP scan
+quotas, large wallets can hit upstream rate limits.
+
+Pass `{ "utxos": false }` to skip the per-address `get_address_utxos`
+call: this returns balances only (**1 scan RPC per address**) and omits
+`utxo_count` / `truncated`. Use it for frequent balance polling (e.g. a
+live deposit watcher) and fetch UTXO counts on demand when you actually
+need them.
 
 | | |
 |---|---|
 | **Scope** | read |
-| **Params** | `{}` |
+| **Params** | `{ utxos?: bool }` — `utxos` defaults to `true` |
 | **Returns** | `{ entries: WalletEntry[], total: u64 }` |
 
 ```ts
@@ -155,8 +159,8 @@ type WalletEntry = {
   label?: string,
   imported: bool,
   balance: u64,
-  utxo_count: u32,
-  truncated: bool,  // upstream UTXO list was clipped at 1000
+  utxo_count?: u32,  // omitted when called with { utxos: false }
+  truncated?: bool,  // upstream UTXO list was clipped at 1000
 };
 ```
 

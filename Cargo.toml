@@ -1,6 +1,6 @@
 [package]
 name        = "exfer-walletd"
-version     = "1.4.0"
+version     = "1.5.0"
 edition     = "2021"
 description = "Exfer Wallet Daemon — independent wallet service that exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes"
 license     = "MIT"

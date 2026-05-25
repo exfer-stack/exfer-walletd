@@ -226,7 +226,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
 
         // ---- wallet-side conveniences ----
         "validate_address" => validate_address(req.params).await,
-        "get_wallet_balance" => get_wallet_balance(state).await,
+        "get_wallet_balance" => get_wallet_balance(state, req.params).await,
         "get_status" => get_status(state).await,
         "abandon_transfer" => abandon_transfer(state, req.params).await,
 
@@ -549,8 +549,19 @@ async fn validate_address(params: Value) -> Result<Value> {
 
 /// `get_wallet_balance` — aggregate balance across every managed
 /// address. Fans out `get_balance` calls concurrently (cap 8).
-async fn get_wallet_balance(state: &ApiState) -> Result<Value> {
+///
+/// Optional param `utxos` (bool, default `true`): when `false`, the
+/// per-address `get_address_utxos` call is skipped and `utxo_count` /
+/// `truncated` are omitted. Clients that poll only for balance (e.g. a
+/// live deposit watcher) pass `false` to halve upstream address scans
+/// and stay further under the public node's rate limit.
+async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
     use futures::stream::{self, StreamExt, TryStreamExt};
+
+    let include_utxos = params
+        .get("utxos")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     let store = state.store.clone();
     let entries = tokio::task::spawn_blocking(move || store.list())
@@ -563,16 +574,20 @@ async fn get_wallet_balance(state: &ApiState) -> Result<Value> {
             let node = node.clone();
             async move {
                 let bal = node.get_balance(&entry.address).await?;
-                let utxos = node.get_address_utxos(&entry.address).await?;
-                Ok::<Value, Error>(serde_json::json!({
+                let mut row = serde_json::json!({
                     "address": entry.address,
                     "index": entry.index,
                     "label": entry.label,
                     "imported": entry.imported,
                     "balance": bal.balance,
-                    "utxo_count": utxos.utxos.len(),
-                    "truncated": utxos.truncated,
-                }))
+                });
+                if include_utxos {
+                    let utxos = node.get_address_utxos(&entry.address).await?;
+                    let obj = row.as_object_mut().expect("row is an object");
+                    obj.insert("utxo_count".into(), serde_json::json!(utxos.utxos.len()));
+                    obj.insert("truncated".into(), serde_json::json!(utxos.truncated));
+                }
+                Ok::<Value, Error>(row)
             }
         })
         .buffer_unordered(8)

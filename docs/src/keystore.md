@@ -97,15 +97,26 @@ out-of-band on first run (paper, password manager, hardware backup).
 
 ## Recovery
 
-Today: the only recovery is "restart with the same `seed.enc` + same
-`WALLETD_KEYSTORE_PASSPHRASE`". A first-class "restore from mnemonic"
-CLI shipping `--from-mnemonic <words>` is on the v1.1 roadmap.
+Two paths:
 
-For now, if you lose `seed.enc` but kept the mnemonic, re-importing
-is a manual procedure: write a 32-byte entropy file derived from
-your mnemonic, then arrange for it to be at `<wallet_dir>/seed.enc`
-in walletd's sealed format. (Open an issue if you need this and we'll
-prioritise the proper CLI.)
+1. **Same `seed.enc` + same `WALLETD_KEYSTORE_PASSPHRASE`** — drop the
+   sealed seed back in `<wallet_dir>/` and start with the original
+   passphrase.
+2. **Restore from the 24-word mnemonic** (v1.4.0+) —
+   [`HdSeedStore::init_from_mnemonic(wallet_dir, passphrase, phrase)`](https://github.com/exfer-stack/exfer-walletd/blob/main/src/store/hd.rs)
+   validates the phrase, seals its entropy to a **clean**
+   `<wallet_dir>/seed.enc` under a (possibly new) passphrase, and writes
+   a default `state.json`. Open the store afterward and the addresses
+   re-derive deterministically (`generate_address` for index 0, 1, …
+   reproduces the same addresses). Refuses if a seed already exists, so
+   it can't clobber a live keystore. The desktop app exposes this as
+   "Restore from recovery phrase" on first run.
+
+The mnemonic restores **into another exfer-walletd** (same SLIP-0010
+`m/44'/9527'/0'/0'/i'` derivation). It does **not** restore your
+addresses in other wallets — including `exfer.dev`'s "Import Mnemonic",
+which derives a different key. To move a single address elsewhere,
+export that address's key instead.
 
 ## Imported (non-derived) addresses
 

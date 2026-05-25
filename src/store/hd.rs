@@ -184,6 +184,52 @@ impl HdSeedStore {
         })
     }
 
+    /// Restore a keystore from an existing 24-word BIP-39 mnemonic:
+    /// validate the phrase, seal its entropy to `<wallet_dir>/seed.enc`
+    /// (same WDV1 format as a fresh init), and persist a default
+    /// `state.json`. Refuses if a seed already exists — restore targets a
+    /// clean datadir so it can't clobber live keys.
+    ///
+    /// After this returns, open the store normally with
+    /// [`open_or_init_fresh`](Self::open_or_init_fresh) + the same
+    /// passphrase; addresses re-derive deterministically from the seed.
+    pub fn init_from_mnemonic(
+        root: impl Into<PathBuf>,
+        passphrase: &[u8],
+        phrase: &str,
+    ) -> Result<()> {
+        let root: PathBuf = root.into();
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(root.join(IMPORTED_DIR))?;
+
+        let seed_path = root.join(SEED_FILE);
+        if seed_path.exists() {
+            return Err(Error::WalletAlreadyExists(
+                "a seed already exists in this wallet directory; refusing to overwrite".into(),
+            ));
+        }
+
+        let mnemonic = Mnemonic::parse_in(Language::English, phrase.trim())
+            .map_err(|e| Error::BadParams(format!("invalid recovery phrase: {e}")))?;
+        let mut entropy = mnemonic.to_entropy();
+        if entropy.len() != 32 {
+            return Err(Error::BadParams(format!(
+                "recovery phrase must be 24 words (256-bit); got {}-byte entropy",
+                entropy.len()
+            )));
+        }
+        let mut entropy_arr = [0u8; 32];
+        entropy_arr.copy_from_slice(&entropy);
+        entropy.zeroize();
+        let blob = sealed::seal(passphrase, SEED_AAD, &entropy_arr)?;
+        entropy_arr.zeroize();
+        atomic_write_0600(&seed_path, &blob)?;
+
+        // Fresh state — addresses are re-derived by the caller.
+        State::default().save_atomic(&root.join(STATE_FILE))?;
+        Ok(())
+    }
+
     /// On first run only: take the freshly-generated 24-word mnemonic out
     /// of the store. Subsequent calls (and every call against an existing
     /// keystore) return `None`. Caller must persist these words OUT OF

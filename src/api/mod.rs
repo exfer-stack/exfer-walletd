@@ -555,6 +555,13 @@ async fn validate_address(params: Value) -> Result<Value> {
 /// `truncated` are omitted. Clients that poll only for balance (e.g. a
 /// live deposit watcher) pass `false` to halve upstream address scans
 /// and stay further under the public node's rate limit.
+///
+/// Optional param `addresses` (hex string array): when present, only
+/// these managed addresses are scanned (others are ignored). Lets a
+/// client poll a subset — e.g. skip addresses the user has hidden — so
+/// the scan count, and thus the achievable poll rate, tracks how many
+/// addresses are actually on screen. Unknown addresses are silently
+/// dropped. Absent ⇒ every managed address (current behaviour).
 async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
     use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -563,10 +570,28 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
+    let address_filter: Option<std::collections::HashSet<String>> = params
+        .get("addresses")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.to_lowercase())
+                .collect()
+        });
+
     let store = state.store.clone();
     let entries = tokio::task::spawn_blocking(move || store.list())
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+
+    let entries: Vec<_> = match &address_filter {
+        Some(set) => entries
+            .into_iter()
+            .filter(|e| set.contains(&e.address.to_lowercase()))
+            .collect(),
+        None => entries,
+    };
 
     let node = state.node.clone();
     let rows: Vec<Value> = stream::iter(entries.clone())

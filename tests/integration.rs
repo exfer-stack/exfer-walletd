@@ -1348,6 +1348,56 @@ async fn get_wallet_balance_skips_utxos_when_disabled() {
     assert!(entry.get("truncated").is_none());
 }
 
+#[tokio::test]
+async fn get_wallet_balance_filters_to_given_addresses() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let a = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Only address `a` gets a get_balance mock. If the filter leaks and
+    // `b` is scanned, the call 404s and the whole request fails.
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({ "method": "get_balance", "params": {"address": a.clone()} }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result":  { "address": a, "balance": 7_000 },
+            "id": 1
+        })))
+        .mount(&mock)
+        .await;
+
+    let result = dispatch(
+        &state,
+        rpc(
+            "get_wallet_balance",
+            json!({ "utxos": false, "addresses": [a.clone()] }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Only `a` is scanned and returned; `b` is excluded entirely.
+    let entries = result["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["address"], a);
+    assert_eq!(result["total"], 7_000);
+    assert!(!entries.iter().any(|e| e["address"] == b));
+}
+
 // --- abandon_transfer -----------------------------------------------------
 
 #[tokio::test]

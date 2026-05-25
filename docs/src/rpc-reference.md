@@ -146,11 +146,17 @@ call: this returns balances only (**1 scan RPC per address**) and omits
 live deposit watcher) and fetch UTXO counts on demand when you actually
 need them.
 
+Pass `{ "addresses": [hex64, …] }` to scan only a subset of managed
+addresses (unknown addresses are ignored). The scan count then tracks
+how many addresses you actually poll, so a client can skip hidden
+addresses and poll a single visible address far more often without
+tripping the node's rate limit. Absent ⇒ every managed address.
+
 | | |
 |---|---|
 | **Scope** | read |
-| **Params** | `{ utxos?: bool }` — `utxos` defaults to `true` |
-| **Returns** | `{ entries: WalletEntry[], total: u64 }` |
+| **Params** | `{ utxos?: bool, addresses?: hex64[] }` — `utxos` defaults to `true`; `addresses` defaults to all |
+| **Returns** | `{ entries: WalletEntry[], total: u64 }` (only the scanned addresses; `total` sums them) |
 
 ```ts
 type WalletEntry = {

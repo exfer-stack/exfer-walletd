@@ -494,7 +494,10 @@ async fn reveal_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
     let words = tokio::task::spawn_blocking(move || store.reveal_mnemonic(pass.as_bytes()))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
-    tracing::warn!(count = words.len(), "reveal_mnemonic served — sensitive output");
+    tracing::warn!(
+        count = words.len(),
+        "reveal_mnemonic served — sensitive output"
+    );
     Ok(serde_json::json!({ "mnemonic": words }))
 }
 
@@ -565,10 +568,7 @@ async fn validate_address(params: Value) -> Result<Value> {
 async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
     use futures::stream::{self, StreamExt, TryStreamExt};
 
-    let include_utxos = params
-        .get("utxos")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
+    let include_utxos = params.get("utxos").and_then(Value::as_bool).unwrap_or(true);
 
     let address_filter: Option<std::collections::HashSet<String>> = params
         .get("addresses")

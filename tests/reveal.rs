@@ -43,13 +43,17 @@ fn reveal_mnemonic_rejects_wrong_passphrase() {
 fn reveal_secret_hd_addr_round_trips_to_valid_signer() {
     let (_dir, store) = fresh_store();
     let d = store.create(None).expect("derive");
-    let raw = store.reveal_secret(&d.address, PASS).expect("reveal secret");
+    let raw = store
+        .reveal_secret(&d.address, PASS)
+        .expect("reveal secret");
 
     // Re-derive a SigningKey from the revealed secret and check that
     // its address matches the one the store derived.
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&raw);
     let pubkey = signing_key.verifying_key().to_bytes();
-    let address = hex::encode(exfer::types::transaction::TxOutput::pubkey_hash_from_key(&pubkey));
+    let address = hex::encode(exfer::types::transaction::TxOutput::pubkey_hash_from_key(
+        &pubkey,
+    ));
     assert_eq!(address, d.address);
 
     // And the revealed key actually signs something the store can
@@ -95,7 +99,10 @@ fn restore_from_mnemonic_reproduces_addresses() {
     let b = HdSeedStore::open_or_init_fresh(dir_b.path(), b"different-pw").unwrap();
     let addrs_b: Vec<String> = (0..3).map(|_| b.create(None).unwrap().address).collect();
 
-    assert_eq!(addrs_a, addrs_b, "restored wallet must derive identical addresses");
+    assert_eq!(
+        addrs_a, addrs_b,
+        "restored wallet must derive identical addresses"
+    );
 }
 
 #[test]

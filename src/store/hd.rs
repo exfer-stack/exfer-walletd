@@ -528,11 +528,7 @@ impl WalletStore for HdSeedStore {
         Self::reveal_mnemonic(self, passphrase)
     }
 
-    fn reveal_secret(
-        &self,
-        address_hex: &str,
-        passphrase: &[u8],
-    ) -> Result<Zeroizing<[u8; 32]>> {
+    fn reveal_secret(&self, address_hex: &str, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
         Self::reveal_secret(self, address_hex, passphrase)
     }
 }

@@ -204,11 +204,8 @@ pub async fn run_embedded(
 
     let mut app = build_router(app_state);
     if let Some(material) = tls_material.as_ref() {
-        app = add_tls_bootstrap_routes(
-            app,
-            material.cert_pem.clone(),
-            material.fingerprint.clone(),
-        );
+        app =
+            add_tls_bootstrap_routes(app, material.cert_pem.clone(), material.fingerprint.clone());
     }
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
 
@@ -228,8 +225,7 @@ pub async fn run_embedded(
             handle_for_watcher.graceful_shutdown(Some(Duration::from_secs(5)));
         });
 
-        let rustls_cfg =
-            axum_server::tls_rustls::RustlsConfig::from_config(material.server_config);
+        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_config(material.server_config);
         let join = tokio::spawn(async move {
             axum_server::from_tcp_rustls(std_listener, rustls_cfg)
                 .handle(handle)
@@ -266,4 +262,3 @@ pub async fn run_embedded(
         join,
     })
 }
-

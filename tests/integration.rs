@@ -1334,12 +1334,9 @@ async fn get_wallet_balance_skips_utxos_when_disabled() {
         .mount(&mock)
         .await;
 
-    let result = dispatch(
-        &state,
-        rpc("get_wallet_balance", json!({ "utxos": false })),
-    )
-    .await
-    .unwrap();
+    let result = dispatch(&state, rpc("get_wallet_balance", json!({ "utxos": false })))
+        .await
+        .unwrap();
     assert_eq!(result["total"], 4_200);
     let entry = &result["entries"][0];
     assert_eq!(entry["balance"], 4_200);

@@ -111,9 +111,13 @@ async fn boots_with_tls_serves_healthz_and_shuts_down_cleanly() {
     let datadir = dir.path().to_path_buf();
 
     let shutdown = CancellationToken::new();
-    let handle = run_embedded(build_config(datadir.clone()), "test-passphrase", shutdown.clone())
-        .await
-        .expect("run_embedded should succeed");
+    let handle = run_embedded(
+        build_config(datadir.clone()),
+        "test-passphrase",
+        shutdown.clone(),
+    )
+    .await
+    .expect("run_embedded should succeed");
 
     // (1) OS assigned a real port, not 0.
     assert_ne!(

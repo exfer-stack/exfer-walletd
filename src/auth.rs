@@ -57,8 +57,11 @@ impl Scope {
     /// must not write.
     pub fn for_method(method: &str) -> Scope {
         match method {
-            "transfer" | "send_raw_transaction" | "sign_message"
-            | "reveal_mnemonic" | "reveal_private_key" => Scope::Spend,
+            "transfer"
+            | "send_raw_transaction"
+            | "sign_message"
+            | "reveal_mnemonic"
+            | "reveal_private_key" => Scope::Spend,
             "generate_address" | "abandon_transfer" => Scope::Manage,
             _ => Scope::Read,
         }

@@ -189,6 +189,79 @@ pub struct HeightParam {
     pub height: u64,
 }
 
+/// `htlc_lock` — fund an HTLC payable to `receiver` (a pubkey) against
+/// `hash_lock`, refundable to `from` after `timeout`. Fee handling
+/// mirrors `transfer` (`fee` xor `fee_rate`, `max_fee` cap).
+#[derive(Debug, Deserialize)]
+pub struct HtlcLockParams {
+    /// Sender wallet address (the wallet walletd funds + signs from).
+    pub from: String,
+    /// Receiver's 32-byte pubkey (64 hex) — the key that can claim with
+    /// the preimage.
+    pub receiver: String,
+    /// SHA-256 hash lock (64 hex).
+    pub hash_lock: String,
+    /// Refund timeout, as an absolute block height.
+    pub timeout: u64,
+    /// Amount to lock (exfers).
+    pub amount: u64,
+    #[serde(default)]
+    pub fee_rate: Option<u64>,
+    #[serde(default)]
+    pub fee: Option<u64>,
+    #[serde(default)]
+    pub max_fee: Option<u64>,
+}
+
+/// `htlc_claim` — spend an HTLC output via the hashlock arm by revealing
+/// `preimage`. `from` is the receiver wallet.
+#[derive(Debug, Deserialize)]
+pub struct HtlcClaimParams {
+    /// Receiver wallet address (claims and receives the funds).
+    pub from: String,
+    /// Lock transaction id (64 hex).
+    pub lock_tx_id: String,
+    /// Output index of the HTLC output in the lock tx (default 0).
+    #[serde(default)]
+    pub output_index: u32,
+    /// Preimage whose SHA-256 equals the lock's hash (hex, any length).
+    pub preimage: String,
+    /// Sender's 32-byte pubkey (64 hex) — needed to reconstruct the script.
+    pub sender: String,
+    /// The lock's timeout height — needed to reconstruct the script.
+    pub timeout: u64,
+    /// Absolute fee (exfers). Defaults to the consensus minimum.
+    #[serde(default)]
+    pub fee: Option<u64>,
+}
+
+/// `htlc_reclaim` — spend an HTLC output via the refund arm after
+/// `timeout`. `from` is the original sender wallet.
+#[derive(Debug, Deserialize)]
+pub struct HtlcReclaimParams {
+    /// Sender wallet address (reclaims the funds).
+    pub from: String,
+    /// Lock transaction id (64 hex).
+    pub lock_tx_id: String,
+    /// Output index of the HTLC output in the lock tx (default 0).
+    #[serde(default)]
+    pub output_index: u32,
+    /// Receiver's 32-byte pubkey (64 hex) — needed to reconstruct the script.
+    pub receiver: String,
+    /// SHA-256 hash lock (64 hex) — needed to reconstruct the script.
+    pub hash_lock: String,
+    /// The lock's timeout height.
+    pub timeout: u64,
+    /// Absolute fee (exfers). Defaults to the consensus minimum.
+    #[serde(default)]
+    pub fee: Option<u64>,
+}
+
+/// Upper bound on accepted preimage length (bytes). A preimage is just
+/// the secret behind an HTLC; cap it so a malformed request can't make
+/// us hash megabytes.
+pub const MAX_PREIMAGE_BYTES: usize = 1024;
+
 // ============================================================================
 // Method dispatch
 // ============================================================================
@@ -202,6 +275,11 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
 
         // ---- transfer (wrapper-only) ----
         "transfer" => transfer_method(state, req.params).await,
+
+        // ---- htlc lifecycle (wrapper-only) ----
+        "htlc_lock" => htlc_lock_method(state, req.params).await,
+        "htlc_claim" => htlc_claim_method(state, req.params).await,
+        "htlc_reclaim" => htlc_reclaim_method(state, req.params).await,
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,
@@ -379,6 +457,116 @@ fn fingerprint_transfer(p: &TransferParams, fee_choice: &FeeChoice, max_fee: u64
     }
     max_fee.hash(&mut h);
     h.finish()
+}
+
+// ----------------------------------------------------------------------------
+// HTLC lifecycle (wrapper-only)
+// ----------------------------------------------------------------------------
+
+/// Load the signer for a managed address off the async runtime (keystore
+/// I/O is blocking). Shared by the htlc handlers and mirrors the pattern
+/// in `transfer_method`.
+async fn load_signer(state: &ApiState, address_hex: &str) -> Result<crate::store::Signer> {
+    let store = state.store.clone();
+    let from = address_hex.to_string();
+    tokio::task::spawn_blocking(move || store.load_by_address(&from))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))?
+}
+
+async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
+    let p: HtlcLockParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("htlc_lock params: {e}")))?;
+    ensure_64_hex(&p.from)?;
+    ensure_64_hex(&p.receiver)?;
+    ensure_64_hex(&p.hash_lock)?;
+    if p.fee.is_some() && p.fee_rate.is_some() {
+        return Err(Error::BadParams(
+            "htlc_lock: `fee` and `fee_rate` are mutually exclusive".into(),
+        ));
+    }
+    let fee_choice = match (p.fee, p.fee_rate) {
+        (Some(f), None) => FeeChoice::Absolute(f),
+        (None, Some(r)) => FeeChoice::Rate(r),
+        (None, None) => FeeChoice::Rate(1),
+        (Some(_), Some(_)) => unreachable!("guarded above"),
+    };
+    let max_fee = p.max_fee.unwrap_or(DEFAULT_MAX_FEE);
+
+    let receiver = crate::tx::decode_hash(&p.receiver)?;
+    let hash_lock = exfer::types::Hash256(crate::tx::decode_hash(&p.hash_lock)?);
+
+    let signer = load_signer(state, &p.from).await?;
+    let receipt = crate::tx::htlc::htlc_lock(
+        &signer,
+        receiver,
+        hash_lock,
+        p.timeout,
+        p.amount,
+        fee_choice,
+        max_fee,
+        &state.node,
+        &state.inflight,
+    )
+    .await?;
+    serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))
+}
+
+async fn htlc_claim_method(state: &ApiState, params: Value) -> Result<Value> {
+    let p: HtlcClaimParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("htlc_claim params: {e}")))?;
+    ensure_64_hex(&p.from)?;
+    ensure_64_hex(&p.lock_tx_id)?;
+    ensure_64_hex(&p.sender)?;
+    let preimage = hex::decode(&p.preimage).map_err(|e| Error::BadHex(e.to_string()))?;
+    if preimage.is_empty() || preimage.len() > MAX_PREIMAGE_BYTES {
+        return Err(Error::BadParams(format!(
+            "htlc_claim: preimage must be 1..={MAX_PREIMAGE_BYTES} bytes (got {})",
+            preimage.len()
+        )));
+    }
+    let lock_tx_id = exfer::types::Hash256(crate::tx::decode_hash(&p.lock_tx_id)?);
+    let sender = crate::tx::decode_hash(&p.sender)?;
+
+    let signer = load_signer(state, &p.from).await?;
+    let receipt = crate::tx::htlc::htlc_claim(
+        &signer,
+        lock_tx_id,
+        p.output_index,
+        preimage,
+        sender,
+        p.timeout,
+        p.fee,
+        &state.node,
+    )
+    .await?;
+    serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))
+}
+
+async fn htlc_reclaim_method(state: &ApiState, params: Value) -> Result<Value> {
+    let p: HtlcReclaimParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("htlc_reclaim params: {e}")))?;
+    ensure_64_hex(&p.from)?;
+    ensure_64_hex(&p.lock_tx_id)?;
+    ensure_64_hex(&p.receiver)?;
+    ensure_64_hex(&p.hash_lock)?;
+    let lock_tx_id = exfer::types::Hash256(crate::tx::decode_hash(&p.lock_tx_id)?);
+    let receiver = crate::tx::decode_hash(&p.receiver)?;
+    let hash_lock = exfer::types::Hash256(crate::tx::decode_hash(&p.hash_lock)?);
+
+    let signer = load_signer(state, &p.from).await?;
+    let receipt = crate::tx::htlc::htlc_reclaim(
+        &signer,
+        lock_tx_id,
+        p.output_index,
+        receiver,
+        hash_lock,
+        p.timeout,
+        p.fee,
+        &state.node,
+    )
+    .await?;
+    serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))
 }
 
 // ----------------------------------------------------------------------------

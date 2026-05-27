@@ -1,11 +1,13 @@
-//! Multi-output transfer engine.
+//! Transaction build/sign/broadcast engine.
 //!
-//! Builds, signs, and broadcasts a single Exfer transaction with one or
-//! more recipients. We bypass `exfer::wallet::wallet::Wallet::build_transaction`
-//! (which is hardcoded to single-recipient + single-change) and construct
-//! the [`Transaction`] ourselves so we can:
+//! Builds, signs, and broadcasts Exfer transactions. We bypass
+//! `exfer::wallet::wallet::Wallet::build_transaction` (which is hardcoded
+//! to single-recipient + single-change) and construct the [`Transaction`]
+//! ourselves so we can:
 //!
 //! - Pack up to [`crate::api::MAX_OUTPUTS`] recipients in one tx
+//! - Lock outputs behind arbitrary scripts (p2pkh transfer, or an HTLC
+//!   covenant — see [`htlc`])
 //! - Compute the fee from a `fee_rate` (exfers per cost-unit) using
 //!   the same `consensus::cost` model the chain enforces
 //! - Enforce a `max_fee` cap before broadcast (defensive against
@@ -14,7 +16,7 @@
 //!   created (including the auto-change), so callers reconcile without
 //!   a follow-up `get_transaction(tx_id)`
 //!
-//! Flow:
+//! Flow ([`build_sign_broadcast`]):
 //!
 //! ```text
 //!   list UTXOs ──► estimate fee for (1 input, N outputs + 1 change)
@@ -28,12 +30,10 @@
 //! Input values are taken directly from `get_address_utxos`. A dishonest
 //! upstream that lies about UTXO values can only cause the resulting tx
 //! to fail consensus on broadcast — funds aren't at risk because the
-//! signature is over what we built. We don't pre-verify against funding
-//! `tx_hex`: that traded one cheap broadcast-failure for N extra RPCs
-//! per transfer, which on rate-limited public nodes was the dominant
-//! failure mode.
+//! signature is over what we built.
 
 pub mod decode;
+pub mod htlc;
 
 use ed25519_dalek::Signer as _;
 use exfer::consensus::cost::{min_fee, tx_cost};
@@ -62,6 +62,29 @@ pub enum FeeChoice {
     /// consensus min and `max_fee` cap). `rate = 1` reproduces the
     /// consensus floor.
     Rate(u64),
+}
+
+/// A single non-change output: an arbitrary locking script + value.
+/// p2pkh transfers pass the 32-byte recipient address as the script;
+/// `htlc_lock` passes a serialized HTLC program.
+#[derive(Debug, Clone)]
+pub(crate) struct CoreOutput {
+    pub script: Vec<u8>,
+    pub value: u64,
+}
+
+/// Outcome of [`build_sign_broadcast`] — enough for any caller to build
+/// its own receipt shape without re-deriving anything.
+pub(crate) struct CoreReceipt {
+    pub tx_id_hex: String,
+    pub size: u64,
+    pub effective_fee: u64,
+    pub fee_rate: u64,
+    pub built_at_height: u64,
+    /// (outpoint, value) for every input consumed.
+    pub selected: Vec<(OutPoint, u64)>,
+    pub change_value: u64,
+    pub has_change: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +118,9 @@ pub struct ReceiptOutput {
     pub is_change: bool,
 }
 
+/// Multi-output p2pkh transfer. Thin wrapper over [`build_sign_broadcast`]
+/// that maps each recipient address to a 32-byte locking script and
+/// assembles a [`TransferReceipt`].
 pub async fn transfer(
     signer: &Signer,
     recipients: Vec<(Hash256, u64)>,
@@ -103,36 +129,91 @@ pub async fn transfer(
     node: &ExferNode,
     inflight: &InFlightUtxos,
 ) -> Result<TransferReceipt> {
-    // ---- input validation (envelope-level checks live in api/mod.rs,
-    //      but engine guards too so misuse from non-RPC callers is safe).
     if recipients.is_empty() {
         return Err(Error::TxBuild(
             "transfer: recipients must not be empty".into(),
         ));
     }
-    for (_, amt) in &recipients {
-        if *amt < DUST_THRESHOLD {
+    let outputs: Vec<CoreOutput> = recipients
+        .iter()
+        .map(|(addr, value)| CoreOutput {
+            script: addr.as_bytes().to_vec(),
+            value: *value,
+        })
+        .collect();
+
+    let core = build_sign_broadcast(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+
+    let mut outputs_receipt: Vec<ReceiptOutput> = recipients
+        .iter()
+        .map(|(addr, value)| ReceiptOutput {
+            to: hex::encode(addr.as_bytes()),
+            amount: *value,
+            is_change: false,
+        })
+        .collect();
+    if core.has_change {
+        outputs_receipt.push(ReceiptOutput {
+            to: signer.address_hex(),
+            amount: core.change_value,
+            is_change: true,
+        });
+    }
+
+    Ok(TransferReceipt {
+        tx_id: core.tx_id_hex,
+        size: core.size,
+        fee: core.effective_fee,
+        fee_rate: core.fee_rate,
+        inputs: core
+            .selected
+            .iter()
+            .map(|(op, value)| ReceiptInput {
+                tx_id: hex::encode(op.tx_id.as_bytes()),
+                output_index: op.output_index,
+                value: *value,
+            })
+            .collect(),
+        outputs: outputs_receipt,
+        built_at_height: core.built_at_height,
+    })
+}
+
+/// Fund, build, sign, and broadcast a transaction that creates the given
+/// `outputs` (arbitrary locking scripts), with auto-change back to the
+/// signer. Shared by [`transfer`] and [`htlc::htlc_lock`].
+pub(crate) async fn build_sign_broadcast(
+    signer: &Signer,
+    outputs: Vec<CoreOutput>,
+    fee_choice: FeeChoice,
+    max_fee: u64,
+    node: &ExferNode,
+    inflight: &InFlightUtxos,
+) -> Result<CoreReceipt> {
+    // ---- input validation -------------------------------------------
+    if outputs.is_empty() {
+        return Err(Error::TxBuild("outputs must not be empty".into()));
+    }
+    for o in &outputs {
+        if o.value < DUST_THRESHOLD {
             return Err(Error::DustOutput {
-                amount: *amt,
+                amount: o.value,
                 dust_threshold: DUST_THRESHOLD,
             });
         }
     }
 
-    let total_amount: u64 = recipients.iter().try_fold(0u64, |acc, (_, a)| {
-        acc.checked_add(*a)
-            .ok_or_else(|| Error::TxBuild("sum(outputs.amount) overflows u64".into()))
+    let total_amount: u64 = outputs.iter().try_fold(0u64, |acc, o| {
+        acc.checked_add(o.value)
+            .ok_or_else(|| Error::TxBuild("sum(outputs.value) overflows u64".into()))
     })?;
 
-    let sender_addr_hex = signer.address_hex();
     let wallet_script: Vec<u8> = signer.address().as_bytes().to_vec();
 
     // ---- 1. fetch sender UTXOs once ---------------------------------
-    let utxos = node.get_address_utxos(&sender_addr_hex).await?;
+    let utxos = node.get_address_utxos(&signer.address_hex()).await?;
     let tip_height = utxos.tip_height;
 
-    // Materialise candidate list in largest-value-first order — used
-    // by every selection pass below.
     let mut candidates: Vec<(OutPoint, crate::upstream::UtxoEntry)> =
         Vec::with_capacity(utxos.utxos.len());
     for entry in &utxos.utxos {
@@ -146,12 +227,9 @@ pub async fn transfer(
     candidates.sort_by_key(|c| std::cmp::Reverse(c.1.value));
 
     // ---- 2. iterative fee-aware UTXO selection ----------------------
-    // Start with a fee estimate for a representative tx (1 input,
-    // N outputs + 1 change). Re-select if adding inputs bumps min_fee
-    // above what we covered. Bounded by FEE_ESTIMATE_MAX_ITERS.
     let mut estimated_fee = match fee_choice {
         FeeChoice::Absolute(f) => f,
-        FeeChoice::Rate(r) => estimate_fee_for_template(&recipients, 1, r, &wallet_script)?,
+        FeeChoice::Rate(r) => estimate_fee_for_template(&outputs, 1, r, &wallet_script)?,
     };
 
     let (guard, selected) = {
@@ -200,30 +278,22 @@ pub async fn transfer(
 
             let (guard, selected) = result?;
 
-            // Re-estimate fee for the actual input count and check if
-            // the estimate is still sufficient.
             let new_estimate = match fee_choice {
                 FeeChoice::Absolute(f) => f,
                 FeeChoice::Rate(r) => {
-                    estimate_fee_for_template(&recipients, selected.len(), r, &wallet_script)?
+                    estimate_fee_for_template(&outputs, selected.len(), r, &wallet_script)?
                 }
             };
 
             if new_estimate <= estimated_fee || iters >= FEE_ESTIMATE_MAX_ITERS {
                 break (guard, selected);
             }
-            // Fee grew; release the claim and re-select with the
-            // higher estimate.
             drop(guard);
             estimated_fee = new_estimate;
         }
     };
 
-    // ---- 3. assemble outputs, then iteratively settle on the fee.
-    //         Values are trusted as the node reported them; a lying node
-    //         can only cause broadcast to fail consensus, not move funds.
-    //         We may need to redo the assembly if min_fee on the actual
-    //         tx exceeds the estimated_fee we covered.
+    // ---- 3. assemble outputs, then settle on the fee ----------------
     let total_in: u64 = selected.iter().map(|(_, e)| e.value).sum();
     let inputs: Vec<TxInput> = selected
         .iter()
@@ -233,25 +303,23 @@ pub async fn transfer(
         })
         .collect();
 
-    let mut outputs: Vec<TxOutput> = recipients
+    let mut tx_outputs: Vec<TxOutput> = outputs
         .iter()
-        .map(|(addr, value)| TxOutput {
-            value: *value,
-            script: addr.as_bytes().to_vec(),
+        .map(|o| TxOutput {
+            value: o.value,
+            script: o.script.clone(),
             datum: None,
             datum_hash: None,
         })
         .collect();
 
-    // Compute consensus min_fee on the actual tx shape (with placeholder
-    // change so the cost includes it).
-    let placeholder_change = TxOutput {
+    // Placeholder change so the cost model includes it.
+    tx_outputs.push(TxOutput {
         value: 0,
         script: wallet_script.clone(),
         datum: None,
         datum_hash: None,
-    };
-    outputs.push(placeholder_change);
+    });
     let witnesses_template: Vec<TxWitness> = inputs
         .iter()
         .map(|_| TxWitness {
@@ -261,7 +329,7 @@ pub async fn transfer(
         .collect();
     let tx_template = Transaction {
         inputs: inputs.clone(),
-        outputs: outputs.clone(),
+        outputs: tx_outputs.clone(),
         witnesses: witnesses_template.clone(),
     };
     let consensus_min = min_fee(&tx_template).ok_or_else(|| {
@@ -274,7 +342,6 @@ pub async fn transfer(
     let mut chosen_fee = match fee_choice {
         FeeChoice::Absolute(f) => f,
         FeeChoice::Rate(r) => {
-            // fee = ceil(tx_cost * r / MIN_FEE_DIVISOR), then floor at consensus min.
             let num = (tx_cost_actual as u128).saturating_mul(r as u128);
             let div = MIN_FEE_DIVISOR as u128;
             (num.div_ceil(div)) as u64
@@ -290,14 +357,10 @@ pub async fn transfer(
         });
     }
 
-    // Verify the inputs cover (total_amount + chosen_fee). If not, the
-    // earlier selection was too small (rare: chosen_fee > estimated_fee
-    // and the residual didn't absorb it).
     let needed_total = total_amount
         .checked_add(chosen_fee)
         .ok_or_else(|| Error::TxBuild("amount + chosen_fee overflows u64".into()))?;
     if total_in < needed_total {
-        // Release inflight claim and surface insufficient-balance.
         drop(guard);
         return Err(Error::InsufficientBalance {
             needed: needed_total,
@@ -308,14 +371,12 @@ pub async fn transfer(
         });
     }
 
-    // Replace placeholder change with actual change, or drop it if
-    // sub-dust (folded into fee).
     let change_value = total_in - total_amount - chosen_fee;
-    let pop_placeholder = outputs.pop();
+    let pop_placeholder = tx_outputs.pop();
     debug_assert!(pop_placeholder.is_some());
     let mut has_change = false;
     if change_value >= DUST_THRESHOLD {
-        outputs.push(TxOutput {
+        tx_outputs.push(TxOutput {
             value: change_value,
             script: wallet_script.clone(),
             datum: None,
@@ -323,9 +384,7 @@ pub async fn transfer(
         });
         has_change = true;
     }
-    // Effective fee after dust folding (may exceed chosen_fee by up to
-    // DUST_THRESHOLD-1).
-    let effective_fee = total_in - outputs.iter().map(|o| o.value).sum::<u64>();
+    let effective_fee = total_in - tx_outputs.iter().map(|o| o.value).sum::<u64>();
     if effective_fee > max_fee {
         return Err(Error::FeeTooHigh {
             fee: effective_fee,
@@ -333,10 +392,10 @@ pub async fn transfer(
         });
     }
 
-    // ---- 4. sign locally ----
+    // ---- 4. sign locally --------------------------------------------
     let mut tx = Transaction {
         inputs,
-        outputs,
+        outputs: tx_outputs,
         witnesses: witnesses_template,
     };
     let sig_msg = tx
@@ -351,7 +410,6 @@ pub async fn transfer(
         w.witness = blob;
     }
 
-    // Re-verify min_fee on the final tx (change may have changed cost).
     let final_min =
         min_fee(&tx).ok_or_else(|| Error::TxBuild("min_fee on final tx overflowed".into()))?;
     if effective_fee < final_min {
@@ -367,7 +425,7 @@ pub async fn transfer(
         .serialize()
         .map_err(|e| Error::TxSerialize(format!("{e:?}")))?;
 
-    // ---- 5. broadcast ----
+    // ---- 5. broadcast -----------------------------------------------
     let tx_hex = hex::encode(&serialized);
     let sent = node.send_raw_transaction(&tx_hex).await?;
     let our_tx_id_hex = hex::encode(tx_id.as_bytes());
@@ -379,33 +437,6 @@ pub async fn transfer(
     }
     guard.commit();
 
-    // ---- 6. assemble receipt ----
-    let receipt_inputs: Vec<ReceiptInput> = selected
-        .iter()
-        .map(|(op, e)| ReceiptInput {
-            tx_id: hex::encode(op.tx_id.as_bytes()),
-            output_index: op.output_index,
-            value: e.value,
-        })
-        .collect();
-    let mut receipt_outputs: Vec<ReceiptOutput> = recipients
-        .iter()
-        .map(|(addr, value)| ReceiptOutput {
-            to: hex::encode(addr.as_bytes()),
-            amount: *value,
-            is_change: false,
-        })
-        .collect();
-    if has_change {
-        receipt_outputs.push(ReceiptOutput {
-            to: sender_addr_hex.clone(),
-            amount: change_value,
-            is_change: true,
-        });
-    }
-
-    // fee_rate reported back: effective_fee / tx_cost × MIN_FEE_DIVISOR
-    // (re-derived from the final tx).
     let final_cost =
         tx_cost(&tx).ok_or_else(|| Error::TxBuild("tx_cost on final tx overflowed".into()))?;
     let reported_rate = if final_cost == 0 {
@@ -415,23 +446,23 @@ pub async fn transfer(
             as u64
     };
 
-    Ok(TransferReceipt {
-        tx_id: our_tx_id_hex,
+    Ok(CoreReceipt {
+        tx_id_hex: our_tx_id_hex,
         size: serialized.len() as u64,
-        fee: effective_fee,
+        effective_fee,
         fee_rate: reported_rate,
-        inputs: receipt_inputs,
-        outputs: receipt_outputs,
         built_at_height: tip_height,
+        selected: selected.iter().map(|(op, e)| (*op, e.value)).collect(),
+        change_value,
+        has_change,
     })
 }
 
-/// Estimate the consensus minimum fee for a transfer template with
-/// `input_count` placeholder inputs + the requested recipients + 1
-/// placeholder change output. Used to size UTXO selection before we
-/// know the real input count.
+/// Estimate the consensus minimum fee for a template with `input_count`
+/// placeholder inputs + the requested `outputs` + 1 placeholder change.
+/// Used to size UTXO selection before we know the real input count.
 fn estimate_fee_for_template(
-    recipients: &[(Hash256, u64)],
+    outputs: &[CoreOutput],
     input_count: usize,
     fee_rate: u64,
     change_script: &[u8],
@@ -442,16 +473,16 @@ fn estimate_fee_for_template(
             output_index: i as u32,
         })
         .collect();
-    let mut outputs: Vec<TxOutput> = recipients
+    let mut tx_outputs: Vec<TxOutput> = outputs
         .iter()
-        .map(|(addr, v)| TxOutput {
-            value: *v,
-            script: addr.as_bytes().to_vec(),
+        .map(|o| TxOutput {
+            value: o.value,
+            script: o.script.clone(),
             datum: None,
             datum_hash: None,
         })
         .collect();
-    outputs.push(TxOutput {
+    tx_outputs.push(TxOutput {
         value: DUST_THRESHOLD, // placeholder change
         script: change_script.to_vec(),
         datum: None,
@@ -466,18 +497,17 @@ fn estimate_fee_for_template(
         .collect();
     let tx = Transaction {
         inputs,
-        outputs,
+        outputs: tx_outputs,
         witnesses,
     };
     let cost = tx_cost(&tx)
         .ok_or_else(|| Error::TxBuild("tx_cost overflowed during fee estimate".into()))?;
-    // fee = ceil(cost × rate / MIN_FEE_DIVISOR)
     let num = (cost as u128).saturating_mul(fee_rate as u128);
     let div = MIN_FEE_DIVISOR as u128;
     Ok(num.div_ceil(div) as u64)
 }
 
-fn decode_hash(s: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_hash(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s).map_err(|e| Error::BadHex(e.to_string()))?;
     if bytes.len() != 32 {
         return Err(Error::BadAddressLen(bytes.len()));

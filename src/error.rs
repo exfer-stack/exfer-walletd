@@ -124,6 +124,16 @@ pub enum Error {
     #[error("idempotency token {token:?} was used with different parameters")]
     IdempotencyConflict { token: String },
 
+    /// An htlc claim/reclaim named an on-chain output that did not match
+    /// the locally reconstructed HTLC script (or could not be parsed) —
+    /// guards against a malicious node feeding a phantom output to spend.
+    #[error("htlc output authentication failed: {0}")]
+    HtlcOutputAuth(String),
+
+    /// htlc reclaim attempted before the refund timeout height.
+    #[error("htlc timeout not reached: current height {current_height} <= timeout {timeout}")]
+    TimeoutNotReached { current_height: u64, timeout: u64 },
+
     // ---- auth -----------------------------------------------------------
     #[error("authentication required")]
     Unauthorized,
@@ -161,6 +171,8 @@ impl Error {
             Error::DustOutput { .. } => -32033,
             Error::TooManyOutputs { .. } => -32034,
             Error::IdempotencyConflict { .. } => -32035,
+            Error::HtlcOutputAuth(_) => -32036,
+            Error::TimeoutNotReached { .. } => -32037,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
         }
     }

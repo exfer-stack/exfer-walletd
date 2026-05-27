@@ -58,6 +58,9 @@ impl Scope {
     pub fn for_method(method: &str) -> Scope {
         match method {
             "transfer"
+            | "htlc_lock"
+            | "htlc_claim"
+            | "htlc_reclaim"
             | "send_raw_transaction"
             | "sign_message"
             | "reveal_mnemonic"
@@ -527,6 +530,9 @@ mod tests {
     #[test]
     fn method_scope_mapping_is_strict() {
         assert_eq!(Scope::for_method("transfer"), Scope::Spend);
+        assert_eq!(Scope::for_method("htlc_lock"), Scope::Spend);
+        assert_eq!(Scope::for_method("htlc_claim"), Scope::Spend);
+        assert_eq!(Scope::for_method("htlc_reclaim"), Scope::Spend);
         assert_eq!(Scope::for_method("send_raw_transaction"), Scope::Spend);
         assert_eq!(Scope::for_method("sign_message"), Scope::Spend);
         assert_eq!(Scope::for_method("generate_address"), Scope::Manage);

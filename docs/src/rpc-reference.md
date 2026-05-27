@@ -59,7 +59,7 @@ READ=$(cat ~/.exfer-walletd/token-read)
 |---|---|
 | `read` | `ping`, `validate_address`, `get_balance`, `get_wallet_balance`, `get_block_height`, `get_block_by_id`, `get_block_by_height`, `get_block_id_at_height`, `get_transaction`, `get_address_utxos`, `get_script_utxos`, `get_status`, `list_addresses`, `verify_message` |
 | `manage` | `generate_address`, `abandon_transfer` |
-| `spend` | `transfer`, `send_raw_transaction`, `sign_message`, `reveal_mnemonic`, `reveal_private_key` |
+| `spend` | `transfer`, `htlc_lock`, `htlc_claim`, `htlc_reclaim`, `send_raw_transaction`, `sign_message`, `reveal_mnemonic`, `reveal_private_key` |
 
 `spend` ⊇ `manage` ⊇ `read`. A token at a higher scope satisfies every
 lower scope.
@@ -427,6 +427,156 @@ params → `-32035 IdempotencyConflict`.
 | `-32033` | An `outputs[].amount` is below dust. |
 | `-32034` | `outputs[]` longer than 16. |
 | `-32035` | Same `client_token` used with different params. |
+
+---
+
+## HTLC methods
+
+Hash time-locked contracts over JSON-RPC, so an agent can run HTLC
+payments (atomic swaps, escrow, conditional settlement) without
+re-implementing Exfer Script or the signing transcript in its own
+language. walletd builds and signs in-process and broadcasts via the
+node — identical wire output to the `exfer script htlc-*` CLI.
+
+The HTLC script has two spend arms:
+- **hashlock** — the receiver claims by revealing a preimage `p` with
+  `sha256(p) == hash_lock`, plus the receiver's signature.
+- **refund** — after `timeout` (an absolute block height), the sender
+  reclaims with their signature.
+
+**Lifecycle** (receiver B claims; otherwise sender A reclaims):
+
+1. B picks a secret, shares `hash_lock = sha256(secret)` with A.
+2. A: `htlc_lock { from: A_addr, receiver: B_pubkey, hash_lock, timeout: H+N, amount }` → `tx_id`.
+3a. B: `htlc_claim { from: B_addr, lock_tx_id: tx_id, preimage: secret, sender: A_pubkey, timeout: H+N }`.
+3b. or, if B never claims, after height `H+N` — A: `htlc_reclaim { from: A_addr, lock_tx_id: tx_id, receiver: B_pubkey, hash_lock, timeout: H+N }`.
+
+For a cross-chain atomic swap, the same preimage unlocks the mirror HTLC
+on the other chain — `htlc_claim` reveals it on-chain in plaintext.
+
+> **Fee note.** `htlc_claim`/`htlc_reclaim` spend a *script* input, which
+> the node prices with the spent script's evaluation cost
+> (`min_fee_with_script_cost`), so their minimum fee is higher than a
+> plain `transfer`. walletd computes it automatically when `fee` is
+> omitted; pass `fee` only to override (it must still clear the minimum).
+
+---
+
+## `htlc_lock`
+
+Fund an HTLC output payable to `receiver` against `hash_lock`,
+refundable to `from` after `timeout`. Funds from `from`'s UTXOs exactly
+like `transfer` (auto-change, same fee handling).
+
+| | |
+|---|---|
+| **Scope** | spend |
+
+**Params**
+
+| Field       | Type  | Required | Description |
+| ----------- | ----- | -------- | ----------- |
+| `from`      | hex64 | yes      | Sender wallet address (funds + signs). |
+| `receiver`  | hex64 | yes      | Receiver's 32-byte **pubkey** (the key that can claim). |
+| `hash_lock` | hex64 | yes      | `sha256(preimage)`. |
+| `timeout`   | u64   | yes      | Absolute block height after which `from` may reclaim. |
+| `amount`    | u64   | yes      | Amount to lock (exfers), ≥ DUST_THRESHOLD (200). |
+| `fee_rate`  | u64   | no       | exfers per cost-unit. Mutually exclusive with `fee`. |
+| `fee`       | u64   | no       | Absolute fee. Mutually exclusive with `fee_rate`. |
+| `max_fee`   | u64   | no       | Cap; default **2_000_000**. |
+
+**Returns**
+
+```ts
+{
+  tx_id:             hex64,
+  htlc_output_index: u32,   // always 0 (change, if any, is output 1)
+  amount:            u64,
+  hash_lock:         hex64,
+  timeout:           u64,
+  receiver:          hex64,
+  size:              u64,
+  fee:               u64,
+  fee_rate:          u64,
+  built_at_height:   u64,
+  change?:           u64,   // present iff change was returned to `from`
+}
+```
+
+**Common errors**: `-32001`, `-32602`, `-32010` (`from` unknown),
+`-32020`, `-32031` (insufficient balance), `-32032` (fee > `max_fee`),
+`-32033` (`amount` < dust).
+
+---
+
+## `htlc_claim`
+
+Claim an HTLC's hashlock arm by revealing the preimage. `from` is the
+**receiver** wallet (also where the funds land).
+
+| | |
+|---|---|
+| **Scope** | spend |
+
+**Params**
+
+| Field          | Type                 | Required | Description |
+| -------------- | -------------------- | -------- | ----------- |
+| `from`         | hex64                | yes      | Receiver wallet address (claims + receives). |
+| `lock_tx_id`   | hex64                | yes      | The `htlc_lock` transaction id. |
+| `output_index` | u32                  | no       | HTLC output index in the lock tx (default `0`). |
+| `preimage`     | hex (1..=1024 bytes) | yes      | Secret whose `sha256` equals the lock's `hash_lock`. |
+| `sender`       | hex64                | yes      | Sender's **pubkey** — reconstructs the script. |
+| `timeout`      | u64                  | yes      | The lock's timeout — reconstructs the script. |
+| `fee`          | u64                  | no       | Absolute fee. Default = script-aware consensus minimum. |
+
+**Returns**
+
+```ts
+{ tx_id: hex64, kind: "claim", value: u64, fee: u64,
+  lock_tx_id: hex64, output_index: u32, size: u64 }
+```
+`value` is paid to `from` (`htlc_value − fee`).
+
+walletd reconstructs the HTLC script from (`sender`, `from`'s pubkey,
+`sha256(preimage)`, `timeout`) and **authenticates the on-chain output
+against it** before spending — a wrong `preimage`/`sender`/`timeout` (or
+a lying node) yields `-32036` and nothing is broadcast.
+
+**Common errors**: `-32001`, `-32602`, `-32010`, `-32020`,
+`-32036` (output auth / script mismatch), `-32030`, `-32603`.
+
+---
+
+## `htlc_reclaim`
+
+Reclaim an HTLC's refund arm after `timeout`. `from` is the original
+**sender** wallet.
+
+| | |
+|---|---|
+| **Scope** | spend |
+
+**Params**
+
+| Field          | Type  | Required | Description |
+| -------------- | ----- | -------- | ----------- |
+| `from`         | hex64 | yes      | Sender wallet address (reclaims). |
+| `lock_tx_id`   | hex64 | yes      | The `htlc_lock` transaction id. |
+| `output_index` | u32   | no       | HTLC output index (default `0`). |
+| `receiver`     | hex64 | yes      | Receiver's **pubkey** — reconstructs the script. |
+| `hash_lock`    | hex64 | yes      | The lock's `hash_lock` — reconstructs the script. |
+| `timeout`      | u64   | yes      | The lock's timeout height. |
+| `fee`          | u64   | no       | Absolute fee. Default = script-aware consensus minimum. |
+
+**Returns**: same shape as `htlc_claim`, with `kind: "reclaim"`.
+
+walletd checks `get_block_height` first and rejects with `-32037`
+(timeout not reached) when `current_height ≤ timeout`, before building
+anything. Output authentication (`-32036`) applies as in `htlc_claim`.
+
+**Common errors**: `-32001`, `-32602`, `-32010`, `-32020`,
+`-32037` (timeout not reached), `-32036` (output auth), `-32030`.
 
 ---
 

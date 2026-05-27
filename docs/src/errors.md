@@ -37,6 +37,8 @@ high digit:
 | `-32033` | 200  | Dust output           | An `outputs[].amount` < DUST_THRESHOLD (200 exfers).                     |
 | `-32034` | 200  | Too many outputs      | `transfer.outputs[]` longer than the hard cap (16).                      |
 | `-32035` | 200  | Idempotency conflict  | `transfer.client_token` reused with different params.                    |
+| `-32036` | 200  | HTLC output auth      | On `htlc_claim`/`htlc_reclaim`, the on-chain output doesn't match the locally reconstructed HTLC script (wrong preimage/sender/receiver/hash/timeout, or a lying node). Nothing is broadcast. |
+| `-32037` | 200  | Timeout not reached   | `htlc_reclaim` attempted before the refund timeout (`current_height ≤ timeout`).             |
 
 ## `-32031` insufficient balance
 

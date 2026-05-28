@@ -57,6 +57,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod idempotency;
+pub mod index;
 pub mod inflight;
 pub mod payment_uri;
 pub mod server;

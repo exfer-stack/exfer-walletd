@@ -178,6 +178,27 @@ pub async fn run_embedded(
     );
     let _follower_task = follower.spawn();
 
+    // Optional indexer delegation — only lights up when --indexer-rpc
+    // (or WALLETD_INDEXER_RPC) is set. Methods that need data outside
+    // the wallet's owned keys (`list_settlements`, `contract_stats`,
+    // `get_address_history`, `htlc_lookup_by_hashlock`,
+    // `get_output_spent_by`) proxy through this client; when unset
+    // they return -32041 IndexerNotConfigured.
+    let indexer = match cfg.indexer_rpc.as_deref() {
+        Some(urls) => {
+            let timeout = std::time::Duration::from_secs(
+                cfg.indexer_timeout_secs.unwrap_or(cfg.upstream_timeout_secs),
+            );
+            tracing::info!(indexer_rpc = %urls, "indexer delegation enabled");
+            Some(crate::indexer::IndexerClient::new(
+                urls,
+                cfg.indexer_token.as_deref(),
+                timeout,
+            )?)
+        }
+        None => None,
+    };
+
     let api = ApiState {
         store,
         node,
@@ -185,6 +206,7 @@ pub async fn run_embedded(
         idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer,
     };
     let app_state = AppState {
         api,

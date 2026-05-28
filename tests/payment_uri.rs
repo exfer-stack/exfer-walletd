@@ -28,6 +28,7 @@ fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tem
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer: None,
     };
     (state, wallet_dir)
 }

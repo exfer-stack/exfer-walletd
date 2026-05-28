@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use crate::error::{Error, Result};
 use crate::idempotency::IdempotencyCache;
 use crate::index::Index;
+use crate::indexer::IndexerClient;
 use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
 use crate::tx::{FeeChoice, TransferReceipt};
@@ -48,6 +49,12 @@ pub struct ApiState {
     /// observation is the height the follower has finished
     /// processing. `wait_for_tx` subscribes to this to avoid polling.
     pub tip_rx: watch::Receiver<u64>,
+    /// Optional upstream indexer client. When `Some`, methods that
+    /// need data outside the wallet's owned keys (HTLCs we never
+    /// locked, settlement history of other addresses, etc.) delegate
+    /// to this client transparently. When `None`, those queries
+    /// return `-32041 IndexerNotConfigured`.
+    pub indexer: Option<IndexerClient>,
 }
 
 // ============================================================================
@@ -310,6 +317,21 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "get_follower_status" => htlc::get_follower_status_method(state, req.params).await,
         "wait_for_tx" => htlc::wait_for_tx_method(state, req.params).await,
 
+        // ---- Indexer-delegated methods (v1.9.1+, --indexer-rpc) ----
+        //
+        // These four methods are *only* answerable by a multi-tenant
+        // indexer — they ask about addresses walletd does not own
+        // keys for. When --indexer-rpc is unset, every method here
+        // returns -32041 IndexerNotConfigured and the operator knows
+        // to wire one up.
+        "list_settlements" => proxy_to_indexer(state, "list_settlements", req.params).await,
+        "contract_stats" => proxy_to_indexer(state, "contract_stats", req.params).await,
+        "get_address_history" => proxy_to_indexer(state, "get_address_history", req.params).await,
+        "htlc_lookup_by_hashlock" => {
+            proxy_to_indexer(state, "htlc_lookup_by_hashlock", req.params).await
+        }
+        "get_output_spent_by" => proxy_to_indexer(state, "get_output_spent_by", req.params).await,
+
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,
         "get_block_by_id" => get_block_by_id(state, req.params).await,
@@ -341,6 +363,15 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "ping" => Ok(serde_json::json!({ "ok": true })),
 
         unknown => Err(Error::UnknownMethod(unknown.to_string())),
+    }
+}
+
+/// Forward a request to the configured `--indexer-rpc` upstream, or
+/// return `IndexerNotConfigured` if no indexer is configured.
+async fn proxy_to_indexer(state: &ApiState, method: &str, params: Value) -> Result<Value> {
+    match state.indexer.as_ref() {
+        Some(client) => client.call(method, params).await,
+        None => Err(Error::IndexerNotConfigured),
     }
 }
 

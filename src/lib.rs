@@ -59,6 +59,7 @@ pub mod error;
 pub mod idempotency;
 pub mod follower;
 pub mod index;
+pub mod indexer;
 pub mod inflight;
 pub mod payment_uri;
 pub mod server;

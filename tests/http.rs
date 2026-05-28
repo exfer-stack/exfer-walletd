@@ -31,6 +31,7 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -166,6 +167,7 @@ async fn boot_scoped(
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -324,6 +326,7 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

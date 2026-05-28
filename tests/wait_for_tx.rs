@@ -40,6 +40,7 @@ fn make_ctx(mock_uri: String, initial_tip: u64) -> Ctx {
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer: None,
     };
     Ctx { state, tip_tx, dir }
 }

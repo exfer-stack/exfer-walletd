@@ -102,6 +102,9 @@ fn build_config(datadir: std::path::PathBuf) -> Config {
         upstream_timeout_secs: 1,
         upstream_attempts: 1,
         upstream_retry_backoff_ms: 0,
+        indexer_rpc: None,
+        indexer_token: None,
+        indexer_timeout_secs: None,
     }
 }
 

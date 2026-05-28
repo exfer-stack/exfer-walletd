@@ -147,6 +147,13 @@ pub enum Error {
         elapsed_secs: u64,
     },
 
+    /// The query requested data outside this wallet's owned keys, but
+    /// `--indexer-rpc` is not configured. Walletd's local index only
+    /// covers HTLCs paying its own keys; set the indexer flag to
+    /// answer multi-tenant queries.
+    #[error("indexer not configured: this query requires an --indexer-rpc upstream")]
+    IndexerNotConfigured,
+
     // ---- auth -----------------------------------------------------------
     #[error("authentication required")]
     Unauthorized,
@@ -187,6 +194,7 @@ impl Error {
             Error::HtlcOutputAuth(_) => -32036,
             Error::TimeoutNotReached { .. } => -32037,
             Error::WaitTimeout { .. } => -32040,
+            Error::IndexerNotConfigured => -32041,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
         }
     }

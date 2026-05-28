@@ -171,6 +171,34 @@ pub struct Config {
     /// disables the sleep between attempts.
     #[arg(long, env = "WALLETD_UPSTREAM_RETRY_BACKOFF_MS", default_value_t = 500)]
     pub upstream_retry_backoff_ms: u64,
+
+    /// Optional URL of an exfer-indexer service. When set, the
+    /// observability methods that need data outside this wallet's
+    /// owned keys (`htlc_status` on an unknown lock_tx_id,
+    /// `htlc_list` with an explicit non-owned `address`, plus the
+    /// new `list_settlements` / `contract_stats` /
+    /// `get_address_history` / `htlc_lookup_by_hashlock` proxies)
+    /// transparently delegate to the indexer.
+    ///
+    /// When unset, queries for non-owned data return
+    /// `-32007 IndexerNotConfigured`. Queries for owned data continue
+    /// to work entirely from walletd's local index.
+    ///
+    /// Multiple comma-separated URLs are accepted; the indexer client
+    /// round-robins across them with the same retry semantics as the
+    /// node-RPC fan-out.
+    #[arg(long, env = "WALLETD_INDEXER_RPC")]
+    pub indexer_rpc: Option<String>,
+
+    /// Bearer token for the indexer (matches the indexer's
+    /// `--auth-token`). Only meaningful when `--indexer-rpc` is set.
+    #[arg(long, env = "WALLETD_INDEXER_TOKEN")]
+    pub indexer_token: Option<String>,
+
+    /// Request timeout for indexer calls (seconds). Defaults to the
+    /// upstream-node timeout.
+    #[arg(long, env = "WALLETD_INDEXER_TIMEOUT_SECS")]
+    pub indexer_timeout_secs: Option<u64>,
 }
 
 impl Config {
@@ -261,6 +289,9 @@ mod tests {
             upstream_timeout_secs: 30,
             upstream_attempts: 4,
             upstream_retry_backoff_ms: 500,
+            indexer_rpc: None,
+            indexer_token: None,
+            indexer_timeout_secs: None,
         }
     }
 

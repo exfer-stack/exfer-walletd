@@ -43,6 +43,7 @@ fn make_state_with_retry(
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
+        indexer: None,
     };
     (state, wallet_dir)
 }

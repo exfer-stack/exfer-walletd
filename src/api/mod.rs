@@ -271,6 +271,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
     match req.method.as_str() {
         // ---- generate / list (wrapper-only) ----
         "generate_address" => generate_address(state, req.params).await,
+        "import_private_key" => import_private_key(state, req.params).await,
         "list_addresses" => list_addresses(state).await,
 
         // ---- transfer (wrapper-only) ----
@@ -342,6 +343,50 @@ async fn list_addresses(state: &ApiState) -> Result<Value> {
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     Ok(serde_json::json!({ "addresses": entries }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportPrivateKeyParams {
+    /// Raw 32-byte ed25519 secret, hex-encoded (64 chars).
+    secret_hex: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `import_private_key` — register an externally-supplied ed25519 secret
+/// as a non-derived ("imported") address. The secret is sealed at rest
+/// with the keystore passphrase, same as HD-derived keys. Returns the
+/// resulting address. Errors with `WalletAlreadyExists` if the address
+/// is already managed by this keystore.
+///
+/// Manage-scope: this writes persistent state but does not spend funds.
+/// The caller already holds the secret being imported, so the auth
+/// requirement matches `generate_address`, not `reveal_private_key`.
+async fn import_private_key(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ImportPrivateKeyParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("import_private_key params: {e}")))?;
+    if p.secret_hex.len() != 64 {
+        return Err(Error::BadParams(format!(
+            "import_private_key: secret_hex must be 64 hex chars (got {})",
+            p.secret_hex.len()
+        )));
+    }
+    let mut secret = [0u8; 32];
+    hex::decode_to_slice(&p.secret_hex, &mut secret)
+        .map_err(|e| Error::BadHex(format!("import_private_key secret_hex: {e}")))?;
+    let store = state.store.clone();
+    let label = p.label.clone();
+    let address = tokio::task::spawn_blocking(move || {
+        let r = store.import(&secret, label);
+        // Best-effort scrub of the local copy. The caller's hex string
+        // remains in the request body until the request guard drops it.
+        secret.fill(0);
+        r
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::info!(address = %address, "imported private key");
+    Ok(serde_json::json!({ "address": address, "imported": true }))
 }
 
 async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {

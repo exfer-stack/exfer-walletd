@@ -1,4 +1,4 @@
-# RPC reference (v1.0)
+# RPC reference (v1.9)
 
 JSON-RPC 2.0 over `POST /`. `GET /healthz` is unauthenticated and
 returns `ok` for liveness probes.
@@ -693,6 +693,281 @@ not in this keystore → `-32010 Wallet not found`.
 The returned `secret_hex` is a 32-byte ed25519 private key in
 lowercase hex, the same secret format consumed by
 [`exfer-walletd migrate --from <dir>`](./keystore.md#imported-non-derived-addresses).
+
+---
+
+## Cost simulation (v1.9)
+
+Read-scope dry-runs of the corresponding spend methods. Same fee
+estimation, same UTXO selection, same builder — but never broadcasts
+and never moves funds. Use them to prove a cost ceiling holds before
+committing to spend.
+
+### `simulate_transfer`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params** — identical to [`transfer`](#transfer) **except** `client_token` is not
+accepted (there's nothing to deduplicate when no tx is broadcast):
+
+| Field      | Type  | Required | Description |
+| ---------- | ----- | -------- | ----------- |
+| `from`     | hex64 | yes      | Sender address. |
+| `outputs`  | array | yes      | 1..=16 `{to: hex64, amount: u64}`. |
+| `fee_rate` | u64   | no       | Same as `transfer`. |
+| `fee`      | u64   | no       | Same as `transfer`. |
+| `max_fee`  | u64   | no       | Same as `transfer`. |
+
+**Returns**
+
+```ts
+{
+  size:             u64,
+  fee:              u64,
+  fee_rate:         u64,
+  inputs:           [{tx_id, output_index, value}],
+  outputs:          [{to, amount, is_change}],
+  total_in:         u64,   // sum of inputs.value
+  total_out:        u64,   // sum of outputs.amount
+  change:           u64,   // 0 if no change output
+  built_at_height:  u64,
+}
+```
+
+`tx_id` is intentionally omitted — nothing was broadcast.
+`total_in = total_out + fee` is invariant for a well-formed result.
+
+### `simulate_htlc_lock`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+Same params as [`htlc_lock`](#htlc_lock). Returns the same fee /
+size / change shape as `simulate_transfer`, plus the HTLC-specific
+fields:
+
+```ts
+{
+  size, fee, fee_rate,
+  htlc_output_index: u32,
+  amount:            u64,
+  hash_lock:         hex64,
+  timeout:           u64,
+  receiver:          hex64,
+  total_in:          u64,
+  change:            u64,
+  built_at_height:   u64,
+}
+```
+
+---
+
+## HTLC observability (v1.9)
+
+The block follower watches every accepted block, identifies HTLC
+outputs paying any owned key, and tracks their lifecycle in a local
+index. These methods read that index.
+
+### `htlc_status`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params**
+
+| Field          | Type  | Required | Description |
+| -------------- | ----- | -------- | ----------- |
+| `lock_tx_id`   | hex64 | yes      | The lock transaction's id. |
+| `output_index` | u32   | no       | Default `0`. |
+
+**Returns** — full `HtlcRecord` (see [`htlc_list`](#htlc_list) for the
+shape).
+
+**Errors** — `-32010 WalletNotFound` if the index has no record for
+that outpoint.
+
+### `htlc_list`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params** — every field optional:
+
+| Field          | Type | Description |
+| -------------- | ---- | ----------- |
+| `role`         | enum | `sender` / `receiver` / `both` / `any` (default). |
+| `state`        | enum / array of enum | Filter to one or more of `locked` / `locked_expired` / `claimed` / `reclaimed` / `unknown`. |
+| `since_height` | u64  | Only entries with `lock_block_height ≥ this`. |
+| `limit`        | u32  | Default `100`, capped at `1000`. |
+| `cursor`       | str  | Opaque cursor from a previous response. |
+| `address`      | hex64 | Reserved for the indexer integration (v1.9.1+). |
+
+**Returns**
+
+```ts
+{
+  htlcs: [
+    {
+      lock_tx_id:           hex64,
+      output_index:         u32,
+      params: {
+        sender:         hex64,   // pubkey
+        receiver:       hex64,   // pubkey
+        hash_lock:      hex64,
+        timeout_height: u64,
+      },
+      amount:               u64,
+      lock_block_height:    u64 | null,
+      state:                "locked"|"locked_expired"|"claimed"|"reclaimed"|"unknown",
+      claim:                { tx_id, preimage, block_height, input_index } | null,
+      reclaim:              { tx_id, block_height, input_index } | null,
+      role:                 "sender"|"receiver"|"both"|"observer",
+      last_indexed_height:  u64,
+    },
+    ...
+  ],
+  next_cursor?: str,
+}
+```
+
+Records are returned in ascending `(lock_block_height, lock_tx_id,
+output_index)` order. If `next_cursor` is present, pass it back as
+`cursor` to fetch the next page.
+
+### `htlc_forget`
+
+| | |
+|---|---|
+| **Scope** | manage |
+
+Remove a settled (Claimed / Reclaimed) HTLC from the local index.
+Refuses to forget still-Locked entries — an active wallet must not
+silently lose track of an open obligation.
+
+**Params**
+
+| Field          | Type  | Required | Description |
+| -------------- | ----- | -------- | ----------- |
+| `lock_tx_id`   | hex64 | yes      | |
+| `output_index` | u32   | no       | Default `0`. |
+
+**Returns**
+
+```ts
+{ removed: bool }
+```
+
+`removed = false` when no such record existed.
+
+**Errors** — `-32602 BadParams` for a non-settled record.
+
+### `get_follower_status`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+Operator / agent dashboard for "how caught up is the follower."
+
+**Params** — `{}`.
+
+**Returns**
+
+```ts
+{
+  last_indexed_height:   u64,
+  last_indexed_block_id: hex64,
+  tip_height:            u64,
+  lag:                   i64,   // = tip_height - last_indexed_height
+  indexed_htlc_count:    u64,
+  follower_started_at:   u64,   // unix seconds
+  full_scan_complete:    bool,
+}
+```
+
+### `wait_for_tx`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+Subscribes to the follower's tip channel and returns as soon as the
+named transaction has at least `min_confirmations` blocks behind it.
+No client-side polling required.
+
+**Params**
+
+| Field               | Type  | Required | Default | Description |
+| ------------------- | ----- | -------- | ------- | ----------- |
+| `tx_id`             | hex64 | yes      |         | The transaction id. |
+| `min_confirmations` | u32   | no       | `1`     | Block depth required. |
+| `timeout_secs`      | u64   | no       | `60`    | Max wait, capped at `600`. |
+
+**Returns**
+
+```ts
+{
+  tx_id:         hex64,
+  block_id:      hex64,
+  block_height:  u64,
+  confirmations: u64,   // ≥ min_confirmations on success
+}
+```
+
+**Errors** — `-32040 WaitTimeout` if the budget expires before the
+transaction reaches `min_confirmations`. The error's `data` payload
+includes `{tx_id, min_confirmations, elapsed_secs}` so a client can
+retry or escalate programmatically.
+
+Unknown-tx and `in_mempool=true` responses from the node are treated
+as "not yet visible" — `wait_for_tx` keeps waiting up to the timeout.
+
+---
+
+## Payment URI codec (v1.9)
+
+Pure functions — no upstream calls, no key access. Round-trip
+payment requests through a canonical BIP21-style string:
+
+```
+exfer:<address>[?amount=N&memo=...&hash_lock=...&timeout=N&label=...]
+```
+
+### `payment_uri_encode`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params**
+
+| Field       | Type  | Required | Description |
+| ----------- | ----- | -------- | ----------- |
+| `address`   | hex64 | yes      | Recipient address. |
+| `amount`    | u64   | no       | Base units (exfers). |
+| `memo`      | str   | no       | Free-form, percent-encoded. |
+| `hash_lock` | hex64 | no       | For HTLC requests. |
+| `timeout`   | u64   | no       | Pair with `hash_lock`. |
+| `label`     | str   | no       | Short payee label. |
+
+**Returns** — `{ uri: str }`.
+
+### `payment_uri_decode`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+**Params** — `{ uri: str }`.
+
+**Returns** — the same shape as `payment_uri_encode`'s input.
+Unknown query keys are silently dropped (forward-compatible).
+Address / hash_lock are normalised to lowercase hex.
 
 ---
 

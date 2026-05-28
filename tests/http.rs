@@ -21,8 +21,7 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
 
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
-    let index =
-        Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
+    let index = Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
     let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let api = ApiState {
         store: Arc::new(store),
@@ -157,8 +156,7 @@ async fn boot_scoped(
     let dir = tempfile::tempdir().unwrap();
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
-    let index =
-        Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
+    let index = Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
     let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let api = ApiState {
         store: Arc::new(store),
@@ -316,8 +314,7 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
     let dir = tempfile::tempdir().unwrap();
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
-    let index =
-        Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
+    let index = Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
     let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let api = ApiState {
         store: Arc::new(store),

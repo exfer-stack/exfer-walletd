@@ -187,7 +187,8 @@ pub async fn run_embedded(
     let indexer = match cfg.indexer_rpc.as_deref() {
         Some(urls) => {
             let timeout = std::time::Duration::from_secs(
-                cfg.indexer_timeout_secs.unwrap_or(cfg.upstream_timeout_secs),
+                cfg.indexer_timeout_secs
+                    .unwrap_or(cfg.upstream_timeout_secs),
             );
             tracing::info!(indexer_rpc = %urls, "indexer delegation enabled");
             Some(crate::indexer::IndexerClient::new(

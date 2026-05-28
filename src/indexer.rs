@@ -110,10 +110,8 @@ impl IndexerClient {
                         }
                     };
                     if let Some(err) = v.get("error") {
-                        let code = err
-                            .get("code")
-                            .and_then(|c| c.as_i64())
-                            .unwrap_or(-32603) as i32;
+                        let code =
+                            err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32603) as i32;
                         let message = err
                             .get("message")
                             .and_then(|m| m.as_str())

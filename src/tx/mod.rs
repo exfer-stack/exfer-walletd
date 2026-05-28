@@ -314,8 +314,7 @@ pub(crate) async fn build_sign_broadcast(
     node: &ExferNode,
     inflight: &InFlightUtxos,
 ) -> Result<CoreReceipt> {
-    let (built, guard) =
-        build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    let (built, guard) = build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
     broadcast_built(node, &built).await?;
     guard.commit();
     Ok(CoreReceipt {

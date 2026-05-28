@@ -191,11 +191,10 @@ impl Follower {
             }
             let store_clone = self.store.clone();
             let addr_hex = entry.address.clone();
-            let signer = tokio::task::spawn_blocking(move || {
-                store_clone.load_by_address(&addr_hex)
-            })
-            .await
-            .map_err(|e| Error::Internal(format!("follower: load panicked: {e}")))??;
+            let signer =
+                tokio::task::spawn_blocking(move || store_clone.load_by_address(&addr_hex))
+                    .await
+                    .map_err(|e| Error::Internal(format!("follower: load panicked: {e}")))??;
             let pubkey = signer.pubkey();
             let addr_bytes = decode_hex32(&entry.address)?;
 
@@ -297,11 +296,10 @@ impl Follower {
     async fn process_block(&self, height: u64, block: &BlockSummary) -> Result<()> {
         for tx_id_hex in &block.transactions {
             let tx_status = self.node.get_transaction(tx_id_hex).await?;
-            let tx_bytes = hex::decode(&tx_status.tx_hex)
-                .map_err(|e| Error::BadHex(e.to_string()))?;
-            let (tx, _consumed) = Transaction::deserialize(&tx_bytes).map_err(|e| {
-                Error::Internal(format!("follower: decode tx {tx_id_hex}: {e:?}"))
-            })?;
+            let tx_bytes =
+                hex::decode(&tx_status.tx_hex).map_err(|e| Error::BadHex(e.to_string()))?;
+            let (tx, _consumed) = Transaction::deserialize(&tx_bytes)
+                .map_err(|e| Error::Internal(format!("follower: decode tx {tx_id_hex}: {e:?}")))?;
             let tx_id_bytes = decode_hex32(tx_id_hex)?;
             self.process_outputs(&tx, tx_id_bytes, height).await?;
             self.process_inputs(&tx, tx_id_bytes, height).await?;
@@ -309,12 +307,7 @@ impl Follower {
         Ok(())
     }
 
-    async fn process_outputs(
-        &self,
-        tx: &Transaction,
-        tx_id: [u8; 32],
-        height: u64,
-    ) -> Result<()> {
+    async fn process_outputs(&self, tx: &Transaction, tx_id: [u8; 32], height: u64) -> Result<()> {
         for (vout, output) in tx.outputs.iter().enumerate() {
             if output.script.len() < MIN_HTLC_SCRIPT_BYTES {
                 continue;
@@ -369,12 +362,7 @@ impl Follower {
         Ok(())
     }
 
-    async fn process_inputs(
-        &self,
-        tx: &Transaction,
-        tx_id: [u8; 32],
-        height: u64,
-    ) -> Result<()> {
+    async fn process_inputs(&self, tx: &Transaction, tx_id: [u8; 32], height: u64) -> Result<()> {
         for (vin, input) in tx.inputs.iter().enumerate() {
             let prev_tx_id = input.prev_tx_id.0;
             let prev_vout = input.output_index;
@@ -382,10 +370,7 @@ impl Follower {
                 continue;
             };
             // Idempotent: already-classified records aren't re-visited.
-            if matches!(
-                existing.state,
-                HtlcState::Claimed | HtlcState::Reclaimed
-            ) {
+            if matches!(existing.state, HtlcState::Claimed | HtlcState::Reclaimed) {
                 continue;
             }
 
@@ -474,30 +459,25 @@ impl Follower {
         [0u8; 32]
     }
 
-    /// Walk backwards from `from_height` until we find a block whose
-    /// id matches on both this side and the node side. Genesis (height
-    /// 0) is the unconditional fallback.
+    /// Walk back one block on the node side from `from_height`.
+    ///
+    /// Stored block_id at height h is the `meta.last_indexed_block_id`
+    /// ONLY when `h == last_indexed_height`. To walk back further we'd
+    /// need to keep per-height block_ids around, which v1.9 does not.
+    /// Pragmatic v1.9 behaviour: walk back one block at a time and
+    /// accept whatever the node says at each height — the node is the
+    /// only source of truth for canonical block_ids; if it just
+    /// reorged, the new canonical ids are what we re-walk against.
+    ///
+    /// Genesis (height 0) is the unconditional fallback.
     async fn find_common_ancestor(&self, from_height: u64) -> Result<(u64, [u8; 32])> {
-        let mut h = from_height;
-        loop {
-            if h == 0 {
-                let block = self.node.get_block_by_height(0).await?;
-                return Ok((0, decode_hex32(&block.block_id)?));
-            }
-            // Stored block_id at height h is the meta.last_indexed_block_id
-            // ONLY when h == last_indexed_height. For walking back we
-            // need a way to verify older heights against what we stored
-            // … but we don't store per-height block_ids in v1.9.
-            //
-            // Pragmatic v1.9 behaviour: just walk back one block at a
-            // time on the node side and accept whatever the node says
-            // at each height. The node is the only source of truth for
-            // canonical block_ids; if it just reorged, the new
-            // canonical ids are what we re-walk against.
-            h -= 1;
-            let block = self.node.get_block_by_height(h).await?;
-            return Ok((h, decode_hex32(&block.block_id)?));
+        if from_height == 0 {
+            let block = self.node.get_block_by_height(0).await?;
+            return Ok((0, decode_hex32(&block.block_id)?));
         }
+        let h = from_height - 1;
+        let block = self.node.get_block_by_height(h).await?;
+        Ok((h, decode_hex32(&block.block_id)?))
     }
 
     /// Remove every tracked HTLC whose lock_block_height is greater
@@ -541,9 +521,7 @@ fn extract_claim_preimage(witness: &[u8]) -> Option<Vec<u8>> {
     if witness.len() < 7 {
         return None;
     }
-    if witness[0] != VALUE_TAG_LEFT
-        || witness[1] != VALUE_TAG_UNIT
-        || witness[2] != VALUE_TAG_BYTES
+    if witness[0] != VALUE_TAG_LEFT || witness[1] != VALUE_TAG_UNIT || witness[2] != VALUE_TAG_BYTES
     {
         return None;
     }

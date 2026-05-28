@@ -52,10 +52,7 @@ async fn list_settlements_returns_not_configured_without_indexer() {
     let (state, _dir) = make_state(node.uri(), None, tempfile::tempdir().unwrap());
     let err = dispatch(
         &state,
-        rpc(
-            "list_settlements",
-            json!({ "address": "55".repeat(32) }),
-        ),
+        rpc("list_settlements", json!({ "address": "55".repeat(32) })),
     )
     .await
     .unwrap_err();
@@ -82,10 +79,7 @@ async fn get_address_history_returns_not_configured_without_indexer() {
     let (state, _dir) = make_state(node.uri(), None, tempfile::tempdir().unwrap());
     let err = dispatch(
         &state,
-        rpc(
-            "get_address_history",
-            json!({ "address": "55".repeat(32) }),
-        ),
+        rpc("get_address_history", json!({ "address": "55".repeat(32) })),
     )
     .await
     .unwrap_err();
@@ -159,10 +153,7 @@ async fn list_settlements_proxies_when_indexer_configured() {
 
     let v = dispatch(
         &state,
-        rpc(
-            "list_settlements",
-            json!({ "address": "55".repeat(32) }),
-        ),
+        rpc("list_settlements", json!({ "address": "55".repeat(32) })),
     )
     .await
     .unwrap();
@@ -234,10 +225,7 @@ async fn indexer_rpc_errors_surface_with_original_code() {
 
     let err = dispatch(
         &state,
-        rpc(
-            "list_settlements",
-            json!({ "address": "55".repeat(32) }),
-        ),
+        rpc("list_settlements", json!({ "address": "55".repeat(32) })),
     )
     .await
     .unwrap_err();
@@ -260,10 +248,7 @@ async fn indexer_unreachable_surfaces_as_upstream_unreachable() {
     let (state, _dir) = make_state(node.uri(), Some(indexer), tempfile::tempdir().unwrap());
     let err = dispatch(
         &state,
-        rpc(
-            "list_settlements",
-            json!({ "address": "55".repeat(32) }),
-        ),
+        rpc("list_settlements", json!({ "address": "55".repeat(32) })),
     )
     .await
     .unwrap_err();

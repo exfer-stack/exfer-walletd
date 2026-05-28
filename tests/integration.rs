@@ -33,8 +33,7 @@ fn make_state_with_retry(
     // Tests don't run a follower; share the wallet_dir for the redb
     // file and create a dead tip_rx (sender dropped → receiver still
     // valid, just never updated).
-    let index =
-        Arc::new(exfer_walletd::index::Index::open(wallet_dir.path()).unwrap());
+    let index = Arc::new(exfer_walletd::index::Index::open(wallet_dir.path()).unwrap());
     let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let state = ApiState {
         store: Arc::new(store),

@@ -19,10 +19,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tempfile::TempDir) {
     let store = HdSeedStore::open_or_init_fresh(wallet_dir.path(), b"test-passphrase").unwrap();
-    let node =
-        ExferNode::with_retry_policy(node_url, Duration::from_secs(5), RetryPolicy::none()).unwrap();
-    let index =
-        Arc::new(exfer_walletd::index::Index::open(wallet_dir.path()).unwrap());
+    let node = ExferNode::with_retry_policy(node_url, Duration::from_secs(5), RetryPolicy::none())
+        .unwrap();
+    let index = Arc::new(exfer_walletd::index::Index::open(wallet_dir.path()).unwrap());
     let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let state = ApiState {
         store: Arc::new(store),
@@ -233,8 +232,8 @@ async fn simulate_transfer_happy_path_returns_built_receipt() {
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0]["to"].as_str().unwrap(), to);
     assert_eq!(outputs[0]["amount"].as_u64().unwrap(), 200_000);
-    assert_eq!(outputs[0]["is_change"].as_bool().unwrap(), false);
-    assert_eq!(outputs[1]["is_change"].as_bool().unwrap(), true);
+    assert!(!outputs[0]["is_change"].as_bool().unwrap());
+    assert!(outputs[1]["is_change"].as_bool().unwrap());
 
     // Conservation: total_in = total_out + fee.
     let total_in = receipt["total_in"].as_u64().unwrap();

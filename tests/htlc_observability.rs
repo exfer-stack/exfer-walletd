@@ -9,9 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use exfer::covenants::htlc::{
-    HtlcClaimRecord, HtlcParams, HtlcRecord, HtlcRole, HtlcState,
-};
+use exfer::covenants::htlc::{HtlcClaimRecord, HtlcParams, HtlcRecord, HtlcRole, HtlcState};
 use exfer_walletd::api::{dispatch, ApiState, RpcRequest};
 use exfer_walletd::error::Error;
 use exfer_walletd::index::Index;
@@ -31,9 +29,8 @@ struct Ctx {
 fn make_ctx(mock_uri: String) -> Ctx {
     let dir = tempfile::tempdir().unwrap();
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
-    let node =
-        ExferNode::with_retry_policy(mock_uri, Duration::from_secs(5), RetryPolicy::none())
-            .unwrap();
+    let node = ExferNode::with_retry_policy(mock_uri, Duration::from_secs(5), RetryPolicy::none())
+        .unwrap();
     let index = Arc::new(Index::open(dir.path()).unwrap());
     let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let state = ApiState {
@@ -153,7 +150,9 @@ async fn htlc_list_empty_index_returns_no_records() {
     let mock = MockServer::start().await;
     let ctx = make_ctx(mock.uri());
 
-    let resp = dispatch(&ctx.state, rpc("htlc_list", json!({}))).await.unwrap();
+    let resp = dispatch(&ctx.state, rpc("htlc_list", json!({})))
+        .await
+        .unwrap();
     assert_eq!(resp["htlcs"].as_array().unwrap().len(), 0);
     assert!(resp.get("next_cursor").is_none());
 }
@@ -170,7 +169,9 @@ async fn htlc_list_returns_sorted_records() {
         ctx.index.upsert_htlc(&rec, [0x11; 32]).unwrap();
     }
 
-    let resp = dispatch(&ctx.state, rpc("htlc_list", json!({}))).await.unwrap();
+    let resp = dispatch(&ctx.state, rpc("htlc_list", json!({})))
+        .await
+        .unwrap();
     let arr = resp["htlcs"].as_array().unwrap();
     assert_eq!(arr.len(), 3);
     let heights: Vec<u64> = arr
@@ -192,12 +193,9 @@ async fn htlc_list_filters_by_single_state() {
     ctx.index.upsert_htlc(&a, [0x11; 32]).unwrap();
     ctx.index.upsert_htlc(&b, [0x22; 32]).unwrap();
 
-    let resp = dispatch(
-        &ctx.state,
-        rpc("htlc_list", json!({ "state": "claimed" })),
-    )
-    .await
-    .unwrap();
+    let resp = dispatch(&ctx.state, rpc("htlc_list", json!({ "state": "claimed" })))
+        .await
+        .unwrap();
     let arr = resp["htlcs"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["state"].as_str().unwrap(), "claimed");
@@ -229,10 +227,7 @@ async fn htlc_list_filters_by_multiple_states() {
 
     let resp = dispatch(
         &ctx.state,
-        rpc(
-            "htlc_list",
-            json!({ "state": ["claimed", "reclaimed"] }),
-        ),
+        rpc("htlc_list", json!({ "state": ["claimed", "reclaimed"] })),
     )
     .await
     .unwrap();
@@ -258,12 +253,9 @@ async fn htlc_list_filters_by_role() {
         )
         .unwrap();
 
-    let resp = dispatch(
-        &ctx.state,
-        rpc("htlc_list", json!({ "role": "receiver" })),
-    )
-    .await
-    .unwrap();
+    let resp = dispatch(&ctx.state, rpc("htlc_list", json!({ "role": "receiver" })))
+        .await
+        .unwrap();
     let arr = resp["htlcs"].as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["role"].as_str().unwrap(), "receiver");
@@ -315,7 +307,10 @@ async fn htlc_list_pagination_advances_cursor() {
     let arr3 = page3["htlcs"].as_array().unwrap();
     assert_eq!(arr3.len(), 1);
     assert_eq!(arr3[0]["lock_block_height"], 50);
-    assert!(page3.get("next_cursor").is_none(), "final page must not advertise more");
+    assert!(
+        page3.get("next_cursor").is_none(),
+        "final page must not advertise more"
+    );
 }
 
 #[tokio::test]
@@ -373,7 +368,7 @@ async fn htlc_forget_removes_settled_record() {
     )
     .await
     .unwrap();
-    assert_eq!(resp["removed"].as_bool().unwrap(), true);
+    assert!(resp["removed"].as_bool().unwrap());
     // The record is actually gone.
     assert!(ctx.index.get_htlc(&[0xDD; 32], 1).unwrap().is_none());
 }
@@ -417,7 +412,7 @@ async fn htlc_forget_returns_false_for_unknown() {
     )
     .await
     .unwrap();
-    assert_eq!(resp["removed"].as_bool().unwrap(), false);
+    assert!(!resp["removed"].as_bool().unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +447,7 @@ async fn get_follower_status_empty_index() {
     assert_eq!(resp["tip_height"].as_u64().unwrap(), 0);
     assert_eq!(resp["lag"].as_i64().unwrap(), 0);
     assert_eq!(resp["indexed_htlc_count"].as_u64().unwrap(), 0);
-    assert_eq!(resp["full_scan_complete"].as_bool().unwrap(), false);
+    assert!(!resp["full_scan_complete"].as_bool().unwrap());
 }
 
 #[tokio::test]
@@ -486,7 +481,7 @@ async fn get_follower_status_reports_lag() {
     assert_eq!(resp["lag"].as_i64().unwrap(), 250);
     assert_eq!(resp["indexed_htlc_count"].as_u64().unwrap(), 1);
     assert_eq!(resp["follower_started_at"].as_u64().unwrap(), 1_700_000_000);
-    assert_eq!(resp["full_scan_complete"].as_bool().unwrap(), false);
+    assert!(!resp["full_scan_complete"].as_bool().unwrap());
     assert_eq!(
         resp["last_indexed_block_id"].as_str().unwrap(),
         "ab".repeat(32)
@@ -511,7 +506,7 @@ async fn get_follower_status_full_scan_done_reports_true() {
         .await
         .unwrap();
     assert_eq!(resp["lag"].as_i64().unwrap(), 0);
-    assert_eq!(resp["full_scan_complete"].as_bool().unwrap(), true);
+    assert!(resp["full_scan_complete"].as_bool().unwrap());
 }
 
 #[tokio::test]

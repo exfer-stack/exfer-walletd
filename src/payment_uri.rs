@@ -65,14 +65,10 @@ impl std::fmt::Display for PaymentUriError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
             PaymentUriError::WrongScheme => "URI does not start with `exfer:`",
-            PaymentUriError::BadAddress => {
-                "address must be 64 lowercase hex characters"
-            }
+            PaymentUriError::BadAddress => "address must be 64 lowercase hex characters",
             PaymentUriError::MalformedQuery => "malformed query string",
             PaymentUriError::BadAmount => "amount must be a non-negative integer",
-            PaymentUriError::BadHashLock => {
-                "hash_lock must be 64 lowercase hex characters"
-            }
+            PaymentUriError::BadHashLock => "hash_lock must be 64 lowercase hex characters",
             PaymentUriError::BadTimeout => "timeout must be a non-negative integer",
             PaymentUriError::InvalidUtf8 => "percent-decoded bytes are not valid UTF-8",
         };
@@ -291,8 +287,14 @@ mod tests {
         let uri = encode(&p);
         assert!(uri.starts_with(&format!("exfer:{}?amount=10&memo=hi&hash_lock=", addr())));
         let q = uri.split_once('?').unwrap().1;
-        let keys: Vec<&str> = q.split('&').map(|kv| kv.split('=').next().unwrap()).collect();
-        assert_eq!(keys, vec!["amount", "memo", "hash_lock", "timeout", "label"]);
+        let keys: Vec<&str> = q
+            .split('&')
+            .map(|kv| kv.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["amount", "memo", "hash_lock", "timeout", "label"]
+        );
     }
 
     #[test]
@@ -305,10 +307,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_scheme() {
-        assert_eq!(
-            decode("bitcoin:..."),
-            Err(PaymentUriError::WrongScheme)
-        );
+        assert_eq!(decode("bitcoin:..."), Err(PaymentUriError::WrongScheme));
         assert_eq!(decode("EXFER:foo"), Err(PaymentUriError::WrongScheme));
     }
 

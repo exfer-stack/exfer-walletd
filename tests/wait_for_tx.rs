@@ -132,7 +132,10 @@ async fn wait_for_tx_returns_immediately_when_already_confirmed() {
 
     let resp = dispatch(
         &ctx.state,
-        rpc("wait_for_tx", json!({ "tx_id": tx_id, "min_confirmations": 1 })),
+        rpc(
+            "wait_for_tx",
+            json!({ "tx_id": tx_id, "min_confirmations": 1 }),
+        ),
     )
     .await
     .unwrap();
@@ -155,7 +158,10 @@ async fn wait_for_tx_returns_after_tip_advances() {
     let waiter = tokio::spawn(async move {
         dispatch(
             &state,
-            rpc("wait_for_tx", json!({ "tx_id": tx_id_owned, "min_confirmations": 1 })),
+            rpc(
+                "wait_for_tx",
+                json!({ "tx_id": tx_id_owned, "min_confirmations": 1 }),
+            ),
         )
         .await
     });
@@ -182,7 +188,10 @@ async fn wait_for_tx_requires_min_confirmations_depth() {
     let waiter = tokio::spawn(async move {
         dispatch(
             &state,
-            rpc("wait_for_tx", json!({ "tx_id": tx_id_owned, "min_confirmations": 3 })),
+            rpc(
+                "wait_for_tx",
+                json!({ "tx_id": tx_id_owned, "min_confirmations": 3 }),
+            ),
         )
         .await
     });
@@ -241,10 +250,7 @@ async fn wait_for_tx_treats_not_found_as_pending() {
     // the upstream "not found".
     let err = dispatch(
         &ctx.state,
-        rpc(
-            "wait_for_tx",
-            json!({ "tx_id": tx_id, "timeout_secs": 1 }),
-        ),
+        rpc("wait_for_tx", json!({ "tx_id": tx_id, "timeout_secs": 1 })),
     )
     .await
     .unwrap_err();

@@ -79,7 +79,7 @@ fn role_byte(r: HtlcRole) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// Resumable checkpoint for the block follower.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct FollowerMeta {
     pub last_indexed_height: u64,
     pub last_indexed_block_id: [u8; 32],
@@ -87,17 +87,6 @@ pub struct FollowerMeta {
     /// Unix seconds when this follower first started indexing. Stable
     /// across restarts.
     pub started_at: u64,
-}
-
-impl Default for FollowerMeta {
-    fn default() -> Self {
-        FollowerMeta {
-            last_indexed_height: 0,
-            last_indexed_block_id: [0u8; 32],
-            full_scan_complete: false,
-            started_at: 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +286,12 @@ impl Index {
                 let mut t = write
                     .open_table(IDX_BY_STATE)
                     .map_err(|e| Error::Internal(format!("index: open by_state: {e}")))?;
-                let key = secondary_state_key(prev.state, prev_height, &prev.lock_tx_id, prev.output_index);
+                let key = secondary_state_key(
+                    prev.state,
+                    prev_height,
+                    &prev.lock_tx_id,
+                    prev.output_index,
+                );
                 let _ = t
                     .remove(key.as_slice())
                     .map_err(|e| Error::Internal(format!("index: remove by_state: {e}")))?;
@@ -306,7 +300,8 @@ impl Index {
                 let mut t = write
                     .open_table(IDX_BY_ROLE)
                     .map_err(|e| Error::Internal(format!("index: open by_role: {e}")))?;
-                let key = secondary_role_key(prev.role, prev_height, &prev.lock_tx_id, prev.output_index);
+                let key =
+                    secondary_role_key(prev.role, prev_height, &prev.lock_tx_id, prev.output_index);
                 let _ = t
                     .remove(key.as_slice())
                     .map_err(|e| Error::Internal(format!("index: remove by_role: {e}")))?;
@@ -409,11 +404,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn get_htlc(
-        &self,
-        lock_tx_id: &[u8; 32],
-        output_index: u32,
-    ) -> Result<Option<HtlcRecord>> {
+    pub fn get_htlc(&self, lock_tx_id: &[u8; 32], output_index: u32) -> Result<Option<HtlcRecord>> {
         let read = self
             .db
             .begin_read()
@@ -426,9 +417,11 @@ impl Index {
             .get(key.as_slice())
             .map_err(|e| Error::Internal(format!("index: get: {e}")))?
         {
-            Some(blob) => Ok(Some(bincode::deserialize(blob.value()).map_err(|e| {
-                Error::Internal(format!("index: decode htlc: {e}"))
-            })?)),
+            Some(blob) => {
+                Ok(Some(bincode::deserialize(blob.value()).map_err(|e| {
+                    Error::Internal(format!("index: decode htlc: {e}"))
+                })?))
+            }
             None => Ok(None),
         }
     }
@@ -468,9 +461,9 @@ impl Index {
                 None => {
                     // Nothing to do — commit the empty write txn and
                     // signal "no row removed" to the caller.
-                    write
-                        .commit()
-                        .map_err(|e| Error::Internal(format!("index: commit forget (noop): {e}")))?;
+                    write.commit().map_err(|e| {
+                        Error::Internal(format!("index: commit forget (noop): {e}"))
+                    })?;
                     return Ok(false);
                 }
             };
@@ -486,7 +479,8 @@ impl Index {
                 let mut t = write
                     .open_table(IDX_BY_STATE)
                     .map_err(|e| Error::Internal(format!("index: open by_state: {e}")))?;
-                let key = secondary_state_key(rec.state, lock_height, &rec.lock_tx_id, rec.output_index);
+                let key =
+                    secondary_state_key(rec.state, lock_height, &rec.lock_tx_id, rec.output_index);
                 let _ = t
                     .remove(key.as_slice())
                     .map_err(|e| Error::Internal(format!("index: remove by_state: {e}")))?;
@@ -495,7 +489,8 @@ impl Index {
                 let mut t = write
                     .open_table(IDX_BY_ROLE)
                     .map_err(|e| Error::Internal(format!("index: open by_role: {e}")))?;
-                let key = secondary_role_key(rec.role, lock_height, &rec.lock_tx_id, rec.output_index);
+                let key =
+                    secondary_role_key(rec.role, lock_height, &rec.lock_tx_id, rec.output_index);
                 let _ = t
                     .remove(key.as_slice())
                     .map_err(|e| Error::Internal(format!("index: remove by_role: {e}")))?;
@@ -586,8 +581,8 @@ impl Index {
                 .range(lo..=hi)
                 .map_err(|e| Error::Internal(format!("index: by_hashlock range: {e}")))?;
             for entry in range {
-                let (k, _) = entry
-                    .map_err(|e| Error::Internal(format!("index: by_hashlock iter: {e}")))?;
+                let (k, _) =
+                    entry.map_err(|e| Error::Internal(format!("index: by_hashlock iter: {e}")))?;
                 let bytes = k.value();
                 if bytes.len() != 68 {
                     continue;
@@ -657,8 +652,8 @@ impl Index {
                 .map_err(|e| Error::Internal(format!("index: iter tracked: {e}")))?;
             let mut v = Vec::new();
             for entry in iter {
-                let (_, value) = entry
-                    .map_err(|e| Error::Internal(format!("index: iter tracked: {e}")))?;
+                let (_, value) =
+                    entry.map_err(|e| Error::Internal(format!("index: iter tracked: {e}")))?;
                 v.push(value.value().to_vec());
             }
             v
@@ -967,7 +962,8 @@ mod tests {
         for h in [100, 200, 300] {
             let mut tx_id = [0u8; 32];
             tx_id[0] = h as u8;
-            idx.upsert_htlc(&fixed_record(tx_id, 0, h), [0xAA; 32]).unwrap();
+            idx.upsert_htlc(&fixed_record(tx_id, 0, h), [0xAA; 32])
+                .unwrap();
         }
         let f = HtlcFilter {
             since_height: Some(200),
@@ -986,7 +982,8 @@ mod tests {
         for h in [10, 20, 30, 40, 50] {
             let mut tx_id = [0u8; 32];
             tx_id[0] = h as u8;
-            idx.upsert_htlc(&fixed_record(tx_id, 0, h), [0xAA; 32]).unwrap();
+            idx.upsert_htlc(&fixed_record(tx_id, 0, h), [0xAA; 32])
+                .unwrap();
         }
         let (page1, cur) = idx.list_htlcs(&HtlcFilter::default(), 2, None).unwrap();
         assert_eq!(page1.len(), 2);
@@ -995,15 +992,15 @@ mod tests {
         let cur = cur.expect("must yield cursor for more pages");
         assert_eq!(cur.lock_height, 20);
 
-        let (page2, cur2) = idx.list_htlcs(&HtlcFilter::default(), 2, Some(cur)).unwrap();
+        let (page2, cur2) = idx
+            .list_htlcs(&HtlcFilter::default(), 2, Some(cur))
+            .unwrap();
         assert_eq!(page2.len(), 2);
         assert_eq!(page2[0].lock_block_height, Some(30));
         assert_eq!(page2[1].lock_block_height, Some(40));
         assert!(cur2.is_some());
 
-        let (page3, cur3) = idx
-            .list_htlcs(&HtlcFilter::default(), 2, cur2)
-            .unwrap();
+        let (page3, cur3) = idx.list_htlcs(&HtlcFilter::default(), 2, cur2).unwrap();
         assert_eq!(page3.len(), 1);
         assert_eq!(page3[0].lock_block_height, Some(50));
         assert!(cur3.is_none(), "final page must not advertise more");

@@ -133,7 +133,13 @@ async fn mount_block(mock: &MockServer, height: u64, block_id_hex: &str, tx_ids:
         .await;
 }
 
-async fn mount_tx(mock: &MockServer, tx_id_hex: &str, tx_hex: &str, block_height: u64, block_id_hex: &str) {
+async fn mount_tx(
+    mock: &MockServer,
+    tx_id_hex: &str,
+    tx_hex: &str,
+    block_height: u64,
+    block_id_hex: &str,
+) {
     Mock::given(method("POST"))
         .and(body_partial_json(json!({
             "method": "get_transaction",
@@ -231,7 +237,7 @@ async fn follower_indexes_lock_then_classifies_claim() {
 
     // ---- 6. Assert index contains a Locked record ------------------
     let rec = index
-        .get_htlc(lock_tx_id.as_bytes().try_into().unwrap(), 0)
+        .get_htlc(lock_tx_id.as_bytes(), 0)
         .unwrap()
         .expect("htlc must be indexed after lock");
     assert_eq!(rec.state, HtlcState::Locked, "fresh lock should be Locked");
@@ -272,7 +278,7 @@ async fn follower_indexes_lock_then_classifies_claim() {
 
     // ---- 8. Assert record transitioned to Claimed -------------------
     let rec2 = index
-        .get_htlc(lock_tx_id.as_bytes().try_into().unwrap(), 0)
+        .get_htlc(lock_tx_id.as_bytes(), 0)
         .unwrap()
         .expect("htlc record must still exist after claim");
     assert_eq!(
@@ -399,11 +405,11 @@ async fn follower_advances_meta_to_tip() {
 
     let meta = index.follower_meta().unwrap();
     assert_eq!(meta.last_indexed_height, 4);
-    assert_eq!(
-        hex::encode(meta.last_indexed_block_id),
-        block_ids[4]
+    assert_eq!(hex::encode(meta.last_indexed_block_id), block_ids[4]);
+    assert!(
+        meta.full_scan_complete,
+        "after reaching tip the flag must be set"
     );
-    assert!(meta.full_scan_complete, "after reaching tip the flag must be set");
 
     // The watch channel must have published the new tip.
     tip_rx.changed().await.ok();

@@ -139,11 +139,10 @@ pub async fn htlc_list_method(state: &ApiState, params: Value) -> Result<Value> 
     };
 
     let index = state.index.clone();
-    let (records, next_cur) = tokio::task::spawn_blocking(move || {
-        index.list_htlcs(&filter, limit, cursor)
-    })
-    .await
-    .map_err(|e| Error::Internal(format!("htlc_list: blocking task panicked: {e}")))??;
+    let (records, next_cur) =
+        tokio::task::spawn_blocking(move || index.list_htlcs(&filter, limit, cursor))
+            .await
+            .map_err(|e| Error::Internal(format!("htlc_list: blocking task panicked: {e}")))??;
 
     let resp = HtlcListResponse {
         htlcs: records,
@@ -179,9 +178,10 @@ pub async fn htlc_forget_method(state: &ApiState, params: Value) -> Result<Value
     // Only allow forgetting settled HTLCs. Look it up first so we can
     // reject pending ones with a useful error.
     let index_for_get = index.clone();
-    let existing = tokio::task::spawn_blocking(move || index_for_get.get_htlc(&tx_id, output_index))
-        .await
-        .map_err(|e| Error::Internal(format!("htlc_forget: blocking task panicked: {e}")))??;
+    let existing =
+        tokio::task::spawn_blocking(move || index_for_get.get_htlc(&tx_id, output_index))
+            .await
+            .map_err(|e| Error::Internal(format!("htlc_forget: blocking task panicked: {e}")))??;
     let Some(rec) = existing else {
         return Ok(serde_json::to_value(HtlcForgetResponse { removed: false }).unwrap());
     };
@@ -196,11 +196,10 @@ pub async fn htlc_forget_method(state: &ApiState, params: Value) -> Result<Value
     // primary-table row + every secondary entry derivable from the
     // record itself; only the by_owned secondary would need the addr,
     // and re-scanning by_owned with a sentinel address is just a noop.
-    let removed = tokio::task::spawn_blocking(move || {
-        index.forget_htlc(&tx_id, output_index, [0u8; 32])
-    })
-    .await
-    .map_err(|e| Error::Internal(format!("htlc_forget: blocking task panicked: {e}")))??;
+    let removed =
+        tokio::task::spawn_blocking(move || index.forget_htlc(&tx_id, output_index, [0u8; 32]))
+            .await
+            .map_err(|e| Error::Internal(format!("htlc_forget: blocking task panicked: {e}")))??;
     serde_json::to_value(HtlcForgetResponse { removed }).map_err(|e| Error::Internal(e.to_string()))
 }
 

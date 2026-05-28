@@ -29,6 +29,7 @@ use crate::store::WalletStore;
 use crate::tx::{FeeChoice, TransferReceipt};
 use crate::upstream::ExferNode;
 
+pub mod htlc;
 pub mod payment_uri;
 pub mod signmsg;
 pub mod simulate;
@@ -301,6 +302,12 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- payment URI codec (pure) ----
         "payment_uri_encode" => payment_uri::payment_uri_encode(req.params).await,
         "payment_uri_decode" => payment_uri::payment_uri_decode(req.params).await,
+
+        // ---- HTLC observability (index-backed) ----
+        "htlc_status" => htlc::htlc_status_method(state, req.params).await,
+        "htlc_list" => htlc::htlc_list_method(state, req.params).await,
+        "htlc_forget" => htlc::htlc_forget_method(state, req.params).await,
+        "get_follower_status" => htlc::get_follower_status_method(state, req.params).await,
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,

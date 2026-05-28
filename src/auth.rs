@@ -65,7 +65,9 @@ impl Scope {
             | "sign_message"
             | "reveal_mnemonic"
             | "reveal_private_key" => Scope::Spend,
-            "generate_address" | "import_private_key" | "abandon_transfer" => Scope::Manage,
+            "generate_address" | "import_private_key" | "abandon_transfer" | "htlc_forget" => {
+                Scope::Manage
+            }
             _ => Scope::Read,
         }
     }

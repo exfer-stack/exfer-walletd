@@ -308,6 +308,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "htlc_list" => htlc::htlc_list_method(state, req.params).await,
         "htlc_forget" => htlc::htlc_forget_method(state, req.params).await,
         "get_follower_status" => htlc::get_follower_status_method(state, req.params).await,
+        "wait_for_tx" => htlc::wait_for_tx_method(state, req.params).await,
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,

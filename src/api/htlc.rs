@@ -244,6 +244,97 @@ pub async fn get_follower_status_method(state: &ApiState, _params: Value) -> Res
 }
 
 // ---------------------------------------------------------------------------
+// wait_for_tx
+// ---------------------------------------------------------------------------
+
+/// Maximum permitted `timeout_secs`. Above this the API clamps the
+/// request rather than rejecting it.
+pub const WAIT_FOR_TX_MAX_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Debug, Deserialize)]
+pub struct WaitForTxParams {
+    pub tx_id: String,
+    #[serde(default = "default_min_confirmations")]
+    pub min_confirmations: u32,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_min_confirmations() -> u32 {
+    1
+}
+
+fn default_timeout_secs() -> u64 {
+    60
+}
+
+#[derive(Debug, Serialize)]
+pub struct WaitForTxResponse {
+    pub tx_id: String,
+    pub block_id: String,
+    pub block_height: u64,
+    pub confirmations: u64,
+}
+
+pub async fn wait_for_tx_method(state: &ApiState, params: Value) -> Result<Value> {
+    let p: WaitForTxParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("wait_for_tx params: {e}")))?;
+    ensure_64_hex(&p.tx_id)?;
+    let timeout_secs = p.timeout_secs.min(WAIT_FOR_TX_MAX_TIMEOUT_SECS);
+    let min_confs = p.min_confirmations.max(1);
+
+    let work = wait_for_tx_inner(state, p.tx_id.clone(), min_confs);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), work).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(Error::WaitTimeout {
+            tx_id: p.tx_id,
+            min_confirmations: min_confs,
+            elapsed_secs: timeout_secs,
+        }),
+    }
+}
+
+/// Polls `get_transaction` on each tip-channel tick until the tx is in
+/// a block with `min_confs` confirmations behind it. Upstream
+/// "not-found" responses are silently treated as "not yet visible"
+/// (the tx may still be propagating) and the loop continues.
+async fn wait_for_tx_inner(state: &ApiState, tx_id: String, min_confs: u32) -> Result<Value> {
+    let mut tip_rx = state.tip_rx.clone();
+    loop {
+        // Snapshot current observed state.
+        let lookup = state.node.get_transaction(&tx_id).await;
+        let block_height = match lookup {
+            Ok(s) => s.block_height,
+            Err(Error::UpstreamRpc { .. }) => None, // not visible yet
+            Err(e) => return Err(e),
+        };
+        if let Some(bh) = block_height {
+            let follower_height = *tip_rx.borrow();
+            let confirmations = follower_height.saturating_sub(bh).saturating_add(1);
+            if confirmations >= min_confs as u64 {
+                // Final fetch so we can return the canonical block_id.
+                let s = state.node.get_transaction(&tx_id).await?;
+                let resp = WaitForTxResponse {
+                    tx_id: s.tx_id,
+                    block_id: s.block_id.unwrap_or_default(),
+                    block_height: s.block_height.unwrap_or(bh),
+                    confirmations,
+                };
+                return serde_json::to_value(&resp).map_err(|e| Error::Internal(e.to_string()));
+            }
+        }
+        // Wait for tip to advance (or shutdown).
+        if tip_rx.changed().await.is_err() {
+            // Sender dropped — daemon is shutting down.
+            return Err(Error::Internal(
+                "wait_for_tx: follower channel closed".into(),
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

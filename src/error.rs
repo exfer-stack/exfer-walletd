@@ -134,6 +134,19 @@ pub enum Error {
     #[error("htlc timeout not reached: current height {current_height} <= timeout {timeout}")]
     TimeoutNotReached { current_height: u64, timeout: u64 },
 
+    /// `wait_for_tx` reached its `timeout_secs` before the transaction
+    /// accumulated enough confirmations. The caller may retry, and the
+    /// transaction may yet land — this only says "no result within the
+    /// budget you gave me."
+    #[error(
+        "wait_for_tx timed out after {elapsed_secs}s waiting for {min_confirmations} confirmation(s) on {tx_id}"
+    )]
+    WaitTimeout {
+        tx_id: String,
+        min_confirmations: u32,
+        elapsed_secs: u64,
+    },
+
     // ---- auth -----------------------------------------------------------
     #[error("authentication required")]
     Unauthorized,
@@ -173,6 +186,7 @@ impl Error {
             Error::IdempotencyConflict { .. } => -32035,
             Error::HtlcOutputAuth(_) => -32036,
             Error::TimeoutNotReached { .. } => -32037,
+            Error::WaitTimeout { .. } => -32040,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
         }
     }
@@ -225,6 +239,15 @@ impl Error {
             })),
             Error::IdempotencyConflict { token } => Some(json!({
                 "token": token,
+            })),
+            Error::WaitTimeout {
+                tx_id,
+                min_confirmations,
+                elapsed_secs,
+            } => Some(json!({
+                "tx_id": tx_id,
+                "min_confirmations": min_confirmations,
+                "elapsed_secs": elapsed_secs,
             })),
             _ => None,
         }

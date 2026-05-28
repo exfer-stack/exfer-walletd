@@ -42,7 +42,7 @@ use exfer::types::{Hash256, DUST_THRESHOLD, MIN_FEE_DIVISOR};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
-use crate::inflight::InFlightUtxos;
+use crate::inflight::{ClaimGuard, InFlightUtxos};
 use crate::store::Signer;
 use crate::upstream::ExferNode;
 
@@ -82,6 +82,33 @@ pub(crate) struct CoreReceipt {
     pub fee_rate: u64,
     pub built_at_height: u64,
     /// (outpoint, value) for every input consumed.
+    pub selected: Vec<(OutPoint, u64)>,
+    pub change_value: u64,
+    pub has_change: bool,
+}
+
+/// Outcome of [`build_only`] — a fully assembled, signed, but
+/// **un-broadcast** transaction together with the inflight reservation
+/// guard that holds its inputs.
+///
+/// Callers chain into [`broadcast_built`] (then `guard.commit()`) to send
+/// the tx, or drop both fields to discard the build (releasing the
+/// inflight claim) — the latter is what `simulate_*` methods do.
+///
+/// `tx_id`, `size`, and `effective_fee` are already correct at this
+/// point: tx_id is witness-independent and the signed witness blob is
+/// byte-for-byte the same length (96 bytes = 32-byte pubkey + 64-byte
+/// signature) as the placeholder used during fee estimation.
+pub(crate) struct BuiltTx {
+    /// The fully signed transaction, ready to serialize and broadcast.
+    pub tx: Transaction,
+    /// Witness-independent tx_id computed from `tx_header || tx_body`.
+    pub tx_id: Hash256,
+    /// Wire size in bytes (= serialized length).
+    pub size: u64,
+    pub effective_fee: u64,
+    pub fee_rate: u64,
+    pub built_at_height: u64,
     pub selected: Vec<(OutPoint, u64)>,
     pub change_value: u64,
     pub has_change: bool,
@@ -182,6 +209,9 @@ pub async fn transfer(
 /// Fund, build, sign, and broadcast a transaction that creates the given
 /// `outputs` (arbitrary locking scripts), with auto-change back to the
 /// signer. Shared by [`transfer`] and [`htlc::htlc_lock`].
+///
+/// Composed from [`build_only`] + [`broadcast_built`]; the inflight claim
+/// is committed on successful broadcast.
 pub(crate) async fn build_sign_broadcast(
     signer: &Signer,
     outputs: Vec<CoreOutput>,
@@ -190,6 +220,43 @@ pub(crate) async fn build_sign_broadcast(
     node: &ExferNode,
     inflight: &InFlightUtxos,
 ) -> Result<CoreReceipt> {
+    let (built, guard) =
+        build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    broadcast_built(node, &built).await?;
+    guard.commit();
+    Ok(CoreReceipt {
+        tx_id_hex: hex::encode(built.tx_id.as_bytes()),
+        size: built.size,
+        effective_fee: built.effective_fee,
+        fee_rate: built.fee_rate,
+        built_at_height: built.built_at_height,
+        selected: built.selected,
+        change_value: built.change_value,
+        has_change: built.has_change,
+    })
+}
+
+/// Build and sign a transaction without broadcasting.
+///
+/// Returns the assembled [`BuiltTx`] together with the [`ClaimGuard`]
+/// holding its inputs in the inflight set. Callers that proceed to
+/// broadcast should chain into [`broadcast_built`] and then call
+/// `guard.commit()`. Callers that just wanted a dry-run (i.e.
+/// `simulate_*`) drop the guard to release the inflight reservation.
+///
+/// The transaction is signed before this returns so the produced
+/// `tx_id`, `size`, and serialised form are exactly what would land
+/// on-chain if [`broadcast_built`] were called. (Signing is required to
+/// match the existing wire format; the placeholder-witness path is only
+/// used internally for fee estimation.)
+pub(crate) async fn build_only<'a>(
+    signer: &Signer,
+    outputs: Vec<CoreOutput>,
+    fee_choice: FeeChoice,
+    max_fee: u64,
+    node: &ExferNode,
+    inflight: &'a InFlightUtxos,
+) -> Result<(BuiltTx, ClaimGuard<'a>)> {
     // ---- input validation -------------------------------------------
     if outputs.is_empty() {
         return Err(Error::TxBuild("outputs must not be empty".into()));
@@ -425,18 +492,7 @@ pub(crate) async fn build_sign_broadcast(
         .serialize()
         .map_err(|e| Error::TxSerialize(format!("{e:?}")))?;
 
-    // ---- 5. broadcast -----------------------------------------------
-    let tx_hex = hex::encode(&serialized);
-    let sent = node.send_raw_transaction(&tx_hex).await?;
-    let our_tx_id_hex = hex::encode(tx_id.as_bytes());
-    if sent.tx_id != our_tx_id_hex {
-        return Err(Error::UpstreamUnexpected(format!(
-            "node returned tx_id {} but we computed {our_tx_id_hex}",
-            sent.tx_id
-        )));
-    }
-    guard.commit();
-
+    // ---- 5. (broadcast happens in broadcast_built) ------------------
     let final_cost =
         tx_cost(&tx).ok_or_else(|| Error::TxBuild("tx_cost on final tx overflowed".into()))?;
     let reported_rate = if final_cost == 0 {
@@ -446,16 +502,46 @@ pub(crate) async fn build_sign_broadcast(
             as u64
     };
 
-    Ok(CoreReceipt {
-        tx_id_hex: our_tx_id_hex,
-        size: serialized.len() as u64,
-        effective_fee,
-        fee_rate: reported_rate,
-        built_at_height: tip_height,
-        selected: selected.iter().map(|(op, e)| (*op, e.value)).collect(),
-        change_value,
-        has_change,
-    })
+    // `node` is intentionally part of the signature so the caller
+    // doesn't have to thread the upstream client through; only the
+    // UTXO query at the top of this function consumes it.
+    let _ = node;
+
+    let size = serialized.len() as u64;
+    Ok((
+        BuiltTx {
+            tx,
+            tx_id,
+            size,
+            effective_fee,
+            fee_rate: reported_rate,
+            built_at_height: tip_height,
+            selected: selected.iter().map(|(op, e)| (*op, e.value)).collect(),
+            change_value,
+            has_change,
+        },
+        guard,
+    ))
+}
+
+/// Broadcast a previously built transaction and verify the node's
+/// returned tx_id matches what we computed locally. Caller is
+/// responsible for `guard.commit()` on success.
+pub(crate) async fn broadcast_built(node: &ExferNode, built: &BuiltTx) -> Result<()> {
+    let serialized = built
+        .tx
+        .serialize()
+        .map_err(|e| Error::TxSerialize(format!("{e:?}")))?;
+    let tx_hex = hex::encode(&serialized);
+    let sent = node.send_raw_transaction(&tx_hex).await?;
+    let our_tx_id_hex = hex::encode(built.tx_id.as_bytes());
+    if sent.tx_id != our_tx_id_hex {
+        return Err(Error::UpstreamUnexpected(format!(
+            "node returned tx_id {} but we computed {our_tx_id_hex}",
+            sent.tx_id
+        )));
+    }
+    Ok(())
 }
 
 /// Estimate the consensus minimum fee for a template with `input_count`

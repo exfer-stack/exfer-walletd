@@ -27,6 +27,7 @@ use crate::store::WalletStore;
 use crate::tx::{FeeChoice, TransferReceipt};
 use crate::upstream::ExferNode;
 
+pub mod payment_uri;
 pub mod signmsg;
 pub mod simulate;
 
@@ -286,6 +287,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- dry-run cost simulation ----
         "simulate_transfer" => simulate::simulate_transfer_method(state, req.params).await,
         "simulate_htlc_lock" => simulate::simulate_htlc_lock_method(state, req.params).await,
+
+        // ---- payment URI codec (pure) ----
+        "payment_uri_encode" => payment_uri::payment_uri_encode(req.params).await,
+        "payment_uri_decode" => payment_uri::payment_uri_decode(req.params).await,
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,

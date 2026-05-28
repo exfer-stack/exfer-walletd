@@ -58,6 +58,7 @@ pub mod embed;
 pub mod error;
 pub mod idempotency;
 pub mod inflight;
+pub mod payment_uri;
 pub mod server;
 pub mod store;
 pub mod tls;

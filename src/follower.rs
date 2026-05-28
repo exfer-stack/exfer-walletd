@@ -171,7 +171,11 @@ impl Follower {
     /// Refresh the in-memory owned-key cache from the wallet store.
     /// Loads each unseen address via the expensive `load_by_address`
     /// path exactly once; already-known addresses are skipped.
-    async fn refresh_owned(&self) -> Result<()> {
+    ///
+    /// Exposed publicly so callers that drive the follower manually
+    /// (e.g. integration tests, embedded apps that opt out of the
+    /// background task) can prime the cache before calling `tick`.
+    pub async fn refresh_owned(&self) -> Result<()> {
         let store = self.store.clone();
         let entries = tokio::task::spawn_blocking(move || store.list())
             .await
@@ -204,7 +208,11 @@ impl Follower {
 
     /// One iteration of the run loop. Handles reorg detection, the
     /// forward walk, the lifecycle sweep, and the tip-channel update.
-    async fn tick(self: &Arc<Self>) -> Result<()> {
+    ///
+    /// Exposed publicly so callers that drive the follower manually
+    /// (typically tests, but also embedders that prefer their own
+    /// scheduling) can step the index forward one tick at a time.
+    pub async fn tick(self: &Arc<Self>) -> Result<()> {
         let tip_resp = self.node.get_block_height().await?;
         let tip_height = tip_resp.height;
 

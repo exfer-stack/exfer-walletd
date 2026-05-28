@@ -31,7 +31,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::inflight::InFlightUtxos;
 use crate::store::Signer;
-use crate::tx::{build_sign_broadcast, CoreOutput, FeeChoice};
+use crate::tx::{build_only, build_sign_broadcast, CoreOutput, FeeChoice};
 use crate::upstream::ExferNode;
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,6 +49,24 @@ pub struct HtlcLockReceipt {
     pub built_at_height: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change: Option<u64>,
+}
+
+/// Result of [`simulate_htlc_lock`] — exactly what [`htlc_lock`] would
+/// build, minus broadcast. `total_in` is included so an agent can
+/// double-check its cost ceiling without re-summing the inputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulateHtlcLockReceipt {
+    pub size: u64,
+    pub fee: u64,
+    pub fee_rate: u64,
+    pub htlc_output_index: u32,
+    pub amount: u64,
+    pub hash_lock: String,
+    pub timeout: u64,
+    pub receiver: String,
+    pub total_in: u64,
+    pub change: u64,
+    pub built_at_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +120,49 @@ pub async fn htlc_lock(
         } else {
             None
         },
+    })
+}
+
+/// Dry-run sibling of [`htlc_lock`]. Builds and signs the lock
+/// transaction the same way [`htlc_lock`] does, then discards the tx
+/// and the inflight reservation. Returns a
+/// [`SimulateHtlcLockReceipt`] suitable for cost-ceiling commitments.
+#[allow(clippy::too_many_arguments)]
+pub async fn simulate_htlc_lock(
+    signer: &Signer,
+    receiver_pubkey: [u8; 32],
+    hash_lock: Hash256,
+    timeout: u64,
+    amount: u64,
+    fee_choice: FeeChoice,
+    max_fee: u64,
+    node: &ExferNode,
+    inflight: &InFlightUtxos,
+) -> Result<SimulateHtlcLockReceipt> {
+    let program = build_htlc_program(&signer.pubkey(), &receiver_pubkey, &hash_lock, timeout);
+    let script = serialize_program(&program);
+    let outputs = vec![CoreOutput {
+        script,
+        value: amount,
+    }];
+    let (built, _guard) = build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    let total_in: u64 = built.selected.iter().map(|(_, v)| v).sum();
+    Ok(SimulateHtlcLockReceipt {
+        size: built.size,
+        fee: built.effective_fee,
+        fee_rate: built.fee_rate,
+        htlc_output_index: 0,
+        amount,
+        hash_lock: hex::encode(hash_lock.as_bytes()),
+        timeout,
+        receiver: hex::encode(receiver_pubkey),
+        total_in,
+        change: if built.has_change {
+            built.change_value
+        } else {
+            0
+        },
+        built_at_height: built.built_at_height,
     })
 }
 

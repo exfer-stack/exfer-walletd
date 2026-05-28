@@ -145,6 +145,23 @@ pub struct ReceiptOutput {
     pub is_change: bool,
 }
 
+/// Result of [`simulate_transfer`] — the same shape as [`TransferReceipt`]
+/// minus `tx_id` (nothing was broadcast), plus the helpful aggregates
+/// `total_in` / `total_out` so agents can verify their cost ceiling
+/// against the simulation result without re-summing.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulateTransferReceipt {
+    pub size: u64,
+    pub fee: u64,
+    pub fee_rate: u64,
+    pub inputs: Vec<ReceiptInput>,
+    pub outputs: Vec<ReceiptOutput>,
+    pub total_in: u64,
+    pub total_out: u64,
+    pub change: u64,
+    pub built_at_height: u64,
+}
+
 /// Multi-output p2pkh transfer. Thin wrapper over [`build_sign_broadcast`]
 /// that maps each recipient address to a 32-byte locking script and
 /// assembles a [`TransferReceipt`].
@@ -203,6 +220,83 @@ pub async fn transfer(
             .collect(),
         outputs: outputs_receipt,
         built_at_height: core.built_at_height,
+    })
+}
+
+/// Dry-run sibling of [`transfer`]. Builds and signs exactly what
+/// [`transfer`] would broadcast, then **discards** both the transaction
+/// and the inflight reservation. Returns a [`SimulateTransferReceipt`]
+/// the caller can use to pre-commit cost ceilings against a real
+/// transfer.
+///
+/// Read scope: this loads the keystore (so it knows the change
+/// address) but never sends anything on the wire and never moves
+/// funds.
+pub async fn simulate_transfer(
+    signer: &Signer,
+    recipients: Vec<(Hash256, u64)>,
+    fee_choice: FeeChoice,
+    max_fee: u64,
+    node: &ExferNode,
+    inflight: &InFlightUtxos,
+) -> Result<SimulateTransferReceipt> {
+    if recipients.is_empty() {
+        return Err(Error::TxBuild(
+            "simulate_transfer: recipients must not be empty".into(),
+        ));
+    }
+    let outputs: Vec<CoreOutput> = recipients
+        .iter()
+        .map(|(addr, value)| CoreOutput {
+            script: addr.as_bytes().to_vec(),
+            value: *value,
+        })
+        .collect();
+
+    let (built, _guard) = build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    // Dropping `_guard` releases the inflight UTXO reservation — the
+    // simulated build was a snapshot, not a commitment.
+
+    let total_in: u64 = built.selected.iter().map(|(_, v)| v).sum();
+    let mut outputs_receipt: Vec<ReceiptOutput> = recipients
+        .iter()
+        .map(|(addr, value)| ReceiptOutput {
+            to: hex::encode(addr.as_bytes()),
+            amount: *value,
+            is_change: false,
+        })
+        .collect();
+    if built.has_change {
+        outputs_receipt.push(ReceiptOutput {
+            to: signer.address_hex(),
+            amount: built.change_value,
+            is_change: true,
+        });
+    }
+    let total_out: u64 = outputs_receipt.iter().map(|o| o.amount).sum();
+
+    Ok(SimulateTransferReceipt {
+        size: built.size,
+        fee: built.effective_fee,
+        fee_rate: built.fee_rate,
+        inputs: built
+            .selected
+            .iter()
+            .map(|(op, value)| ReceiptInput {
+                tx_id: hex::encode(op.tx_id.as_bytes()),
+                output_index: op.output_index,
+                value: *value,
+            })
+            .collect(),
+        outputs: outputs_receipt,
+        total_in,
+        total_out,
+        change: if built.has_change {
+            built.change_value
+        } else {
+            0
+        },
+        built_at_height: built.built_at_height,
     })
 }
 

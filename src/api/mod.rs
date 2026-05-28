@@ -28,6 +28,7 @@ use crate::tx::{FeeChoice, TransferReceipt};
 use crate::upstream::ExferNode;
 
 pub mod signmsg;
+pub mod simulate;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -281,6 +282,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "htlc_lock" => htlc_lock_method(state, req.params).await,
         "htlc_claim" => htlc_claim_method(state, req.params).await,
         "htlc_reclaim" => htlc_reclaim_method(state, req.params).await,
+
+        // ---- dry-run cost simulation ----
+        "simulate_transfer" => simulate::simulate_transfer_method(state, req.params).await,
+        "simulate_htlc_lock" => simulate::simulate_htlc_lock_method(state, req.params).await,
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,

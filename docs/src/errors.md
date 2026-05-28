@@ -17,7 +17,8 @@ high digit:
 - `-32010..-32019`: wallet / keystore
 - `-32020..-32029`: upstream
 - `-32030..-32039`: transaction / fee
-- `-32040..`: reserved
+- `-32040..-32049`: async waits (`wait_for_tx`)
+- `-32050..`: reserved
 
 | Code     | HTTP (single/top-level) | Name                  | Meaning                                                                  |
 | -------- | ----------------------- | --------------------- | ------------------------------------------------------------------------ |
@@ -39,6 +40,7 @@ high digit:
 | `-32035` | 200  | Idempotency conflict  | `transfer.client_token` reused with different params.                    |
 | `-32036` | 200  | HTLC output auth      | On `htlc_claim`/`htlc_reclaim`, the on-chain output doesn't match the locally reconstructed HTLC script (wrong preimage/sender/receiver/hash/timeout, or a lying node). Nothing is broadcast. |
 | `-32037` | 200  | Timeout not reached   | `htlc_reclaim` attempted before the refund timeout (`current_height ≤ timeout`).             |
+| `-32040` | 200  | Wait timeout          | `wait_for_tx` budget expired before the tx reached `min_confirmations`. `data` carries `{tx_id, min_confirmations, elapsed_secs}`. Retry is safe. |
 
 ## `-32031` insufficient balance
 

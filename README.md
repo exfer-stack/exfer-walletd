@@ -13,6 +13,15 @@ wallet keypairs and exposes higher-level RPC methods
 > argon2id + ChaCha20-Poly1305; three scoped tokens (`read` /
 > `manage` / `spend`); JSON-RPC 2.0 batch support; spec-correct
 > `-32700` / `-32600` / `-32602` boundaries.
+>
+> **v1.9 adds HTLC observability.** A background block follower
+> indexes every HTLC paying any owned key; new methods `htlc_status`
+> / `htlc_list` / `htlc_forget` / `get_follower_status` expose the
+> lifecycle, `wait_for_tx` async-waits for confirmations off the
+> follower's tip channel, `simulate_transfer` / `simulate_htlc_lock`
+> answer "what would this cost?" without broadcasting, and
+> `payment_uri_encode` / `_decode` round-trip a BIP21-style
+> `exfer:<address>?amount=...` string.
 
 Same pattern as
 [`cardano-wallet`](https://github.com/cardano-foundation/cardano-wallet)

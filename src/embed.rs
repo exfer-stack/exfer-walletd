@@ -163,11 +163,28 @@ pub async fn run_embedded(
         Duration::from_secs(cfg.upstream_timeout_secs),
         retry,
     )?;
+    let store = Arc::new(store);
+    let node = Arc::new(node);
+    let index = Arc::new(crate::index::Index::open(&datadir)?);
+
+    // Spawn the block follower. It runs forever (until the process
+    // exits); the returned `tip_rx` is what `wait_for_tx` will
+    // subscribe to.
+    let (follower, tip_rx) = crate::follower::Follower::new(
+        store.clone(),
+        node.clone(),
+        index.clone(),
+        crate::follower::FollowerConfig::default(),
+    );
+    let _follower_task = follower.spawn();
+
     let api = ApiState {
-        store: Arc::new(store),
-        node: Arc::new(node),
+        store,
+        node,
         inflight: Arc::new(InFlightUtxos::new()),
         idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
+        index,
+        tip_rx,
     };
     let app_state = AppState {
         api,

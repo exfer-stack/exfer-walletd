@@ -21,11 +21,16 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
 
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
+    let index =
+        Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
+    let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
+        index,
+        tip_rx,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,11 +156,16 @@ async fn boot_scoped(
     let dir = tempfile::tempdir().unwrap();
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
+    let index =
+        Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
+    let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
+        index,
+        tip_rx,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -304,11 +314,16 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
     let dir = tempfile::tempdir().unwrap();
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
     let node = ExferNode::new(mock.uri(), Duration::from_secs(5)).unwrap();
+    let index =
+        Arc::new(exfer_walletd::index::Index::open(dir.path()).unwrap());
+    let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let api = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
+        index,
+        tip_rx,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -21,11 +21,16 @@ fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tem
     let store = HdSeedStore::open_or_init_fresh(wallet_dir.path(), b"test-passphrase").unwrap();
     let node =
         ExferNode::with_retry_policy(node_url, Duration::from_secs(5), RetryPolicy::none()).unwrap();
+    let index =
+        Arc::new(exfer_walletd::index::Index::open(wallet_dir.path()).unwrap());
+    let (_tip_tx, tip_rx) = tokio::sync::watch::channel(0u64);
     let state = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
         inflight: Arc::new(exfer_walletd::inflight::InFlightUtxos::new()),
         idempotency: Arc::new(exfer_walletd::idempotency::IdempotencyCache::new()),
+        index,
+        tip_rx,
     };
     (state, wallet_dir)
 }

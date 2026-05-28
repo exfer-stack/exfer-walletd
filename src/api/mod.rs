@@ -19,9 +19,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::watch;
 
 use crate::error::{Error, Result};
 use crate::idempotency::IdempotencyCache;
+use crate::index::Index;
 use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
 use crate::tx::{FeeChoice, TransferReceipt};
@@ -37,6 +39,14 @@ pub struct ApiState {
     pub node: Arc<ExferNode>,
     pub inflight: Arc<InFlightUtxos>,
     pub idempotency: Arc<IdempotencyCache>,
+    /// HTLC observability index. Populated by the block follower at
+    /// boot and updated every poll cycle; read by `htlc_status` /
+    /// `htlc_list` / `get_follower_status` (v1.9 +).
+    pub index: Arc<Index>,
+    /// Receiver end of the follower's tip-height watch channel. Each
+    /// observation is the height the follower has finished
+    /// processing. `wait_for_tx` subscribes to this to avoid polling.
+    pub tip_rx: watch::Receiver<u64>,
 }
 
 // ============================================================================

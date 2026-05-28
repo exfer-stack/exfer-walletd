@@ -519,10 +519,26 @@ impl Follower {
     }
 }
 
-fn extract_claim_preimage(witness: &[u8]) -> Option<[u8; 32]> {
-    // Layout: 0x01 0x00 0x05 len_u32_le preimage(32) 0x05 len_u32_le sig(64)
-    //         ^L  ^U  ^B   ^len        ^32          ^B  ^len        ^64
-    if witness.len() < 7 + 32 {
+/// Pull the preimage bytes out of a hash-arm (claim) witness.
+///
+/// Layout (see `exfer-walletd::tx::htlc::htlc_claim`):
+///
+/// ```text
+///   0x01 0x00            Left(Unit)             — arm selector
+///   0x05 len_u32_le      Value::Bytes header    — preimage
+///   <preimage bytes>
+///   0x05 len_u32_le      Value::Bytes header    — signature
+///   <signature bytes>
+/// ```
+///
+/// The preimage is **variable length** — the script's hash arm reads
+/// `Value::Bytes(preimage)` and SHA-256s it with no length constraint,
+/// so any byte string whose digest matches the lock is valid. A
+/// fixed-width return type here would silently drop every non-32-byte
+/// claim, including the in-tree 29-byte test vector.
+fn extract_claim_preimage(witness: &[u8]) -> Option<Vec<u8>> {
+    // Need at least: 2 (Left+Unit) + 1 (Bytes tag) + 4 (len) = 7 bytes.
+    if witness.len() < 7 {
         return None;
     }
     if witness[0] != VALUE_TAG_LEFT
@@ -531,13 +547,11 @@ fn extract_claim_preimage(witness: &[u8]) -> Option<[u8; 32]> {
     {
         return None;
     }
-    let len = u32::from_le_bytes(witness[3..7].try_into().ok()?);
-    if len != 32 {
+    let len = u32::from_le_bytes(witness[3..7].try_into().ok()?) as usize;
+    if witness.len() < 7 + len {
         return None;
     }
-    let mut preimage = [0u8; 32];
-    preimage.copy_from_slice(&witness[7..7 + 32]);
-    Some(preimage)
+    Some(witness[7..7 + len].to_vec())
 }
 
 fn decode_hex32(s: &str) -> Result<[u8; 32]> {
@@ -594,10 +608,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_claim_preimage_rejects_non_32_length() {
-        // Build a malformed claim with a 16-byte "preimage".
+    fn extract_claim_preimage_accepts_arbitrary_length() {
+        // The hash arm has no length constraint on the preimage.
+        // Confirm we recover preimages of 1, 5, 29, 32, and 100 bytes
+        // identically.
+        for len in [1usize, 5, 29, 32, 100] {
+            use exfer::script::value::Value;
+            let preimage: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let mut w = Value::Left(Box::new(Value::Unit)).serialize();
+            w.extend_from_slice(&Value::Bytes(preimage.clone()).serialize());
+            w.extend_from_slice(&Value::Bytes(vec![0u8; 64]).serialize());
+            let got = extract_claim_preimage(&w).expect("must parse for any length");
+            assert_eq!(got, preimage, "round trip failed at length {len}");
+        }
+    }
+
+    #[test]
+    fn extract_claim_preimage_rejects_truncated_payload() {
+        // Header claims len=32 but only 16 bytes follow.
         let mut w = vec![0x01, 0x00, 0x05];
-        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&32u32.to_le_bytes());
         w.extend_from_slice(&[0u8; 16]);
         assert_eq!(extract_claim_preimage(&w), None);
     }

@@ -357,7 +357,7 @@ async fn htlc_forget_removes_settled_record() {
     let mut rec = make_record([0xDD; 32], 1, 100, HtlcState::Claimed, HtlcRole::Receiver);
     rec.claim = Some(HtlcClaimRecord {
         tx_id: [0xEE; 32],
-        preimage: [0x99; 32],
+        preimage: [0x99; 32].to_vec(),
         block_height: 101,
         input_index: 0,
     });

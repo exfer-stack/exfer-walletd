@@ -291,7 +291,12 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
     match req.method.as_str() {
         // ---- generate / list (wrapper-only) ----
         "generate_address" => generate_address(state, req.params).await,
+        "generate_independent_address" => {
+            generate_independent_address(state, req.params).await
+        }
         "import_private_key" => import_private_key(state, req.params).await,
+        "export_vault" => export_vault(state, req.params).await,
+        "import_vault" => import_vault(state, req.params).await,
         "list_addresses" => list_addresses(state).await,
 
         // ---- transfer (wrapper-only) ----
@@ -395,6 +400,67 @@ async fn generate_address(state: &ApiState, params: Value) -> Result<Value> {
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     tracing::info!(address = %derived.address, index = derived.index, "generated new address");
     serde_json::to_value(&derived).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// `generate_independent_address` — a fresh address whose key is its own
+/// (1:1), not derived from the shared HD seed. Individually exportable; a
+/// leak of one key doesn't touch the others.
+async fn generate_independent_address(state: &ApiState, params: Value) -> Result<Value> {
+    let p: GenerateAddressParams = if params.is_null() {
+        GenerateAddressParams::default()
+    } else {
+        serde_json::from_value(params)
+            .map_err(|e| Error::BadParams(format!("generate_independent_address params: {e}")))?
+    };
+    let store = state.store.clone();
+    let label = p.label.clone();
+    let (address, pubkey) =
+        tokio::task::spawn_blocking(move || store.create_independent(label))
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::info!(address = %address, "generated independent (1:1) address");
+    Ok(serde_json::json!({ "address": address, "pubkey": pubkey, "imported": true }))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultExportParams {
+    passphrase: String,
+}
+
+/// `export_vault` — one passphrase-sealed blob backing up EVERY key in the
+/// wallet (a single-file backup that doesn't hinge on a mnemonic). Sensitive:
+/// the blob decrypts to every private key. Spend-scoped.
+async fn export_vault(state: &ApiState, params: Value) -> Result<Value> {
+    let p: VaultExportParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("export_vault params: {e}")))?;
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let blob = tokio::task::spawn_blocking(move || store.export_vault(pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(bytes = blob.len(), "vault exported — sensitive output (all keys)");
+    Ok(serde_json::json!({ "vault_hex": hex::encode(&blob) }))
+}
+
+#[derive(serde::Deserialize)]
+struct VaultImportParams {
+    vault_hex: String,
+    passphrase: String,
+}
+
+/// `import_vault` — restore keys from an `export_vault` blob, each as an
+/// independent key. Already-present addresses are skipped.
+async fn import_vault(state: &ApiState, params: Value) -> Result<Value> {
+    let p: VaultImportParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("import_vault params: {e}")))?;
+    let blob = hex::decode(&p.vault_hex).map_err(|e| Error::BadHex(format!("vault_hex: {e}")))?;
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let imported = tokio::task::spawn_blocking(move || store.import_vault(&blob, pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::info!(count = imported.len(), "vault imported");
+    Ok(serde_json::json!({ "imported": imported }))
 }
 
 async fn list_addresses(state: &ApiState) -> Result<Value> {

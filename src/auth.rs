@@ -64,10 +64,16 @@ impl Scope {
             | "send_raw_transaction"
             | "sign_message"
             | "reveal_mnemonic"
-            | "reveal_private_key" => Scope::Spend,
-            "generate_address" | "import_private_key" | "abandon_transfer" | "htlc_forget" => {
-                Scope::Manage
-            }
+            | "reveal_private_key"
+            // Vault export/import move raw key material; gate at the
+            // highest scope.
+            | "export_vault"
+            | "import_vault" => Scope::Spend,
+            "generate_address"
+            | "generate_independent_address"
+            | "import_private_key"
+            | "abandon_transfer"
+            | "htlc_forget" => Scope::Manage,
             _ => Scope::Read,
         }
     }

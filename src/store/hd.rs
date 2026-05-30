@@ -44,6 +44,7 @@ const STATE_FILE: &str = "state.json";
 const IMPORTED_DIR: &str = "imported";
 const SEED_AAD: &[u8] = b"exfer-walletd/v1/seed";
 const IMPORTED_AAD: &[u8] = b"exfer-walletd/v1/imported";
+const VAULT_AAD: &[u8] = b"exfer-walletd/v1/vault";
 
 // ============================================================================
 // Persisted state
@@ -531,6 +532,75 @@ impl WalletStore for HdSeedStore {
     fn reveal_secret(&self, address_hex: &str, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
         Self::reveal_secret(self, address_hex, passphrase)
     }
+
+    fn create_independent(&self, label: Option<String>) -> Result<(String, String)> {
+        use rand::RngCore;
+        // Fresh CSPRNG key — its own sealed file via the import path, with no
+        // tie to the HD seed. Any 32 random bytes are a valid ed25519 secret.
+        let mut secret = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut *secret);
+        let signer = Signer::from_secret_bytes(&secret);
+        let pubkey_hex = hex::encode(signer.pubkey());
+        let addr = self.import(&secret, label)?;
+        Ok((addr, pubkey_hex))
+    }
+
+    fn export_vault(&self, passphrase: &[u8]) -> Result<Vec<u8>> {
+        let entries = WalletStore::list(self)?;
+        // Verify the passphrase once (one argon2id) rather than per key:
+        // reveal_secret errors on a wrong passphrase. Secrets themselves are
+        // then read from the already-unlocked keystore.
+        if let Some(first) = entries.first() {
+            let _ = self.reveal_secret(&first.address, passphrase)?;
+        }
+        let mut keys = Vec::with_capacity(entries.len());
+        for e in &entries {
+            let signer = self.load_by_address(&e.address)?;
+            let secret = Zeroizing::new(signer.signing_key().to_bytes());
+            keys.push(serde_json::json!({
+                "address": e.address,
+                "secret_hex": hex::encode(&*secret),
+                "label": e.label,
+            }));
+        }
+        let doc = serde_json::json!({ "version": 1, "keys": keys });
+        let bytes = serde_json::to_vec(&doc)
+            .map_err(|e| Error::Internal(format!("vault serialize: {e}")))?;
+        sealed::seal(passphrase, VAULT_AAD, &bytes)
+    }
+
+    fn import_vault(&self, blob: &[u8], passphrase: &[u8]) -> Result<Vec<String>> {
+        let bytes = sealed::unseal(passphrase, VAULT_AAD, blob)?;
+        let doc: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Error::ParseError(format!("vault: {e}")))?;
+        let keys = doc
+            .get("keys")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| Error::ParseError("vault: missing `keys`".into()))?;
+        let mut imported = Vec::new();
+        for k in keys {
+            let secret_hex = k
+                .get("secret_hex")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::ParseError("vault: key missing `secret_hex`".into()))?;
+            let label = k
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let raw = hex::decode(secret_hex)
+                .map_err(|e| Error::BadHex(format!("vault secret: {e}")))?;
+            let secret: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::ParseError("vault: secret not 32 bytes".into()))?;
+            let addr = Signer::from_secret_bytes(&secret).address_hex();
+            if self.exists(&addr) {
+                continue;
+            }
+            imported.push(self.import(&secret, label)?);
+        }
+        Ok(imported)
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +688,40 @@ mod tests {
         let row = list.iter().find(|e| e.address == addr).unwrap();
         assert!(row.imported);
         assert_eq!(row.label.as_deref(), Some("legacy"));
+    }
+
+    #[test]
+    fn vault_export_import_roundtrip() {
+        // Source wallet: two independent (1:1) keys + one HD-derived.
+        let src_dir = temp();
+        let src = HdSeedStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
+        let _ = src.take_fresh_mnemonic();
+        let (a, _) = src.create_independent(Some("savings".into())).unwrap();
+        let (b, _) = src.create_independent(None).unwrap();
+        let c = src.create(Some("hd-0".into())).unwrap().address;
+
+        let blob = src.export_vault(b"pw").unwrap();
+        assert!(!blob.is_empty());
+        // Wrong passphrase must not decrypt.
+        let dst_dir = temp();
+        let dst = HdSeedStore::open_or_init_fresh(dst_dir.path(), b"pw2").unwrap();
+        assert!(dst.import_vault(&blob, b"wrong").is_err());
+
+        // Restore into the fresh wallet.
+        let imported = dst.import_vault(&blob, b"pw").unwrap();
+        assert_eq!(imported.len(), 3);
+        for addr in [&a, &b, &c] {
+            assert!(dst.exists(addr), "restored wallet missing {addr}");
+            // Same address ⇒ same key ⇒ same pubkey, and it signs.
+            let s = dst.load_by_address(addr).unwrap();
+            assert_eq!(s.address_hex(), *addr);
+        }
+        // The label rode along in the vault.
+        let row = dst.list().unwrap();
+        assert_eq!(
+            row.iter().find(|e| &e.address == &a).unwrap().label.as_deref(),
+            Some("savings"),
+        );
     }
 
     #[test]

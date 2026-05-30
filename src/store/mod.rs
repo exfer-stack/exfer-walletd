@@ -123,6 +123,25 @@ pub trait WalletStore: Send + Sync + 'static {
     /// Returns the derived address (hex).
     fn import(&self, secret: &[u8; 32], label: Option<String>) -> Result<String>;
 
+    /// Generate a fresh, independent ed25519 key and store it like an
+    /// import (its own sealed file, NOT derived from the shared HD seed).
+    /// This is the 1:1 model: every address has its own key, individually
+    /// exportable, with no single secret controlling the whole wallet.
+    /// Returns `(address_hex, pubkey_hex)`.
+    fn create_independent(&self, label: Option<String>) -> Result<(String, String)>;
+
+    /// Seal every managed key (HD-derived re-derived + imported) into one
+    /// passphrase-encrypted vault blob — a single-file backup of the whole
+    /// wallet that doesn't hinge on a single mnemonic. `passphrase` is
+    /// verified against the keystore (wrong → `KeystoreLocked`) and also
+    /// encrypts the blob. Sensitive — gate behind explicit user opt-in.
+    fn export_vault(&self, passphrase: &[u8]) -> Result<Vec<u8>>;
+
+    /// Restore keys from a vault blob, importing each as an independent
+    /// key. Wrong passphrase → `KeystoreLocked`. Returns the addresses
+    /// newly imported (already-present ones are skipped).
+    fn import_vault(&self, blob: &[u8], passphrase: &[u8]) -> Result<Vec<String>>;
+
     /// Whether an address is known to this store.
     fn exists(&self, address_hex: &str) -> bool;
 

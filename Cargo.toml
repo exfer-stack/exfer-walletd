@@ -13,14 +13,16 @@ path = "src/main.rs"
 
 [dependencies]
 # Reuse Exfer's wallet + transaction crypto so signing is byte-for-byte
-# identical to the upstream CLI. Pinned to a release tag for
-# reproducible builds; bump as new versions ship.
+# identical to the upstream CLI. Pinned to a fork commit (not a branch)
+# for reproducible builds.
 #
-# TEMPORARY: until ahuman-exfer/exfer PR #20 (HtlcRecord wire types +
-# try_parse_htlc, slated for v1.12.0) merges, point at the fork's
-# branch so the v1.9 observability work can build. Revert to a tag pin
-# (`tag = "v1.12.0"`) before release.
-exfer = { git = "https://github.com/exfer-stack/exfer.git", branch = "feat/htlc-observability-types" }
+# The fork's main is upstream main + the canonical HTLC observability
+# types (HtlcRecord / HtlcState / HtlcRole / HtlcClaimRecord /
+# HtlcReclaimRecord) that this daemon's follower + index + JSON-RPC
+# surface consume. The types are awaiting re-land in ahuman-exfer/exfer
+# (PR #23). Once that PR merges, this can switch to a tag pin on the
+# upstream release that contains them.
+exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "c97b7f0132f08cef7169b2ee5e0fb1eb748edc22" }
 
 axum            = { version = "0.7", features = ["macros"] }
 

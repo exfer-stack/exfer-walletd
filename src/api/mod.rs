@@ -341,6 +341,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "get_balance" => get_balance(state, req.params).await,
         "get_address_utxos" => get_address_utxos(state, req.params).await,
         "get_script_utxos" => get_script_utxos(state, req.params).await,
+        "get_address_mempool" => get_address_mempool(state, req.params).await,
 
         // ---- broadcast passthrough ----
         "send_raw_transaction" => send_raw_transaction(state, req.params).await,
@@ -765,6 +766,18 @@ async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
     serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
 }
 
+/// `get_address_mempool` — thin passthrough exposing the node's
+/// unconfirmed view of one address (pending incoming/outgoing with
+/// amounts). Lets a deposit watcher show "+X pending" the moment a
+/// transfer hits the mempool, ahead of confirmation.
+async fn get_address_mempool(state: &ApiState, params: Value) -> Result<Value> {
+    let p: AddressParam = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("get_address_mempool params: {e}")))?;
+    ensure_64_hex(&p.address)?;
+    let m = state.node.get_address_mempool(&p.address).await?;
+    serde_json::to_value(&m).map_err(|e| Error::Internal(e.to_string()))
+}
+
 async fn send_raw_transaction(state: &ApiState, params: Value) -> Result<Value> {
     let p: TxHexParam = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("send_raw_transaction params: {e}")))?;
@@ -857,10 +870,24 @@ async fn validate_address(params: Value) -> Result<Value> {
 /// the scan count, and thus the achievable poll rate, tracks how many
 /// addresses are actually on screen. Unknown addresses are silently
 /// dropped. Absent ⇒ every managed address (current behaviour).
+///
+/// Optional param `pending` (bool, default `false`): when `true`, also
+/// fans out `get_address_mempool` per address and adds the unconfirmed
+/// `pending_received` / `pending_spent` to each row plus wallet-level
+/// `pending_received_total` / `pending_spent_total` / `projected_total`
+/// (confirmed + received − spent). This is the receiver-side pending
+/// signal — incoming funds become visible the moment they hit the
+/// mempool, seconds ahead of confirmation, instead of only after a
+/// block. Costs one extra scan-budget slot per address (same envelope
+/// as `utxos`), so it's opt-in.
 async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
     use futures::stream::{self, StreamExt, TryStreamExt};
 
     let include_utxos = params.get("utxos").and_then(Value::as_bool).unwrap_or(true);
+    let include_pending = params
+        .get("pending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let address_filter: Option<std::collections::HashSet<String>> = params
         .get("addresses")
@@ -904,6 +931,25 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
                     obj.insert("utxo_count".into(), serde_json::json!(utxos.utxos.len()));
                     obj.insert("truncated".into(), serde_json::json!(utxos.truncated));
                 }
+                if include_pending {
+                    // Tolerant variant: an upstream predating
+                    // get_address_mempool (node v1.11.3) answers -32601,
+                    // mapped to None here. The row then carries no
+                    // pending_* fields and the wallet-level
+                    // `pending_supported` flag goes false (decided after
+                    // collection) rather than failing the whole call.
+                    if let Some(mp) = node.get_address_mempool_opt(&entry.address).await? {
+                        let obj = row.as_object_mut().expect("row is an object");
+                        obj.insert(
+                            "pending_received".into(),
+                            serde_json::json!(mp.pending_received()),
+                        );
+                        obj.insert(
+                            "pending_spent".into(),
+                            serde_json::json!(mp.pending_spent()),
+                        );
+                    }
+                }
                 Ok::<Value, Error>(row)
             }
         })
@@ -927,10 +973,57 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
         .iter()
         .map(|r| r["balance"].as_u64().unwrap_or(0))
         .sum();
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "entries": rows,
         "total": total,
-    }))
+    });
+    if include_pending {
+        // Compute everything off an immutable borrow first, then mutate
+        // `out` — the two borrows can't overlap.
+        //
+        // Every row carries pending_* only if its upstream answered
+        // get_address_mempool. A row missing them means that scan hit a
+        // node predating the method (-32601). If any row is missing, the
+        // aggregate can't be trusted — report pending_supported:false and
+        // omit the totals rather than publish a partial, misleading
+        // projected balance.
+        let (pending_supported, pending_received_total, pending_spent_total) = {
+            let entries = out["entries"].as_array().unwrap();
+            let supported = entries.iter().all(|r| r.get("pending_received").is_some());
+            let recv: u64 = entries
+                .iter()
+                .map(|r| r["pending_received"].as_u64().unwrap_or(0))
+                .sum();
+            let spent: u64 = entries
+                .iter()
+                .map(|r| r["pending_spent"].as_u64().unwrap_or(0))
+                .sum();
+            (supported, recv, spent)
+        };
+        let obj = out.as_object_mut().expect("out is an object");
+        obj.insert(
+            "pending_supported".into(),
+            serde_json::json!(pending_supported),
+        );
+        if pending_supported {
+            // Projected = confirmed + unconfirmed credit − unconfirmed
+            // debit. Saturating so a mempool spend the confirmed set
+            // hasn't dropped yet can't underflow the displayed number.
+            let projected_total = total
+                .saturating_add(pending_received_total)
+                .saturating_sub(pending_spent_total);
+            obj.insert(
+                "pending_received_total".into(),
+                serde_json::json!(pending_received_total),
+            );
+            obj.insert(
+                "pending_spent_total".into(),
+                serde_json::json!(pending_spent_total),
+            );
+            obj.insert("projected_total".into(), serde_json::json!(projected_total));
+        }
+    }
+    Ok(out)
 }
 
 /// `get_status` — single round-trip operator dashboard. Includes the

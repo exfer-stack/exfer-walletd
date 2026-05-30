@@ -284,6 +284,43 @@ impl ExferNode {
         serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
     }
 
+    /// `get_address_mempool` — the unconfirmed (mempool) view of an
+    /// address. Returns the txs currently in the node's mempool that
+    /// credit (`received`) or debit (`spent`) this address, with
+    /// amounts. This is the receiver-side "pending" signal that
+    /// `get_balance` (confirmed-only) can't give: incoming funds show
+    /// up here the moment the tx is admitted to the mempool, seconds
+    /// ahead of confirmation. Node-side it counts toward the 30/min
+    /// scan budget, so callers should treat it as opt-in.
+    pub async fn get_address_mempool(&self, address_hex: &str) -> Result<AddressMempoolResponse> {
+        let v = self
+            .call(
+                "get_address_mempool",
+                serde_json::json!({ "address": address_hex }),
+            )
+            .await?;
+        serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
+    }
+
+    /// Like [`Self::get_address_mempool`] but tolerant of upstreams that
+    /// predate the method (added node-side in v1.11.3). A node that
+    /// doesn't know the method answers `-32601 Method not found`; since
+    /// walletd fails over round-robin across several upstreams, a mixed
+    /// fleet (some upgraded, some not) is the realistic state during a
+    /// rollout. Mapping that one code to `Ok(None)` lets a pending-aware
+    /// caller degrade to "no pending signal here" instead of failing the
+    /// whole request. Every other error still propagates.
+    pub async fn get_address_mempool_opt(
+        &self,
+        address_hex: &str,
+    ) -> Result<Option<AddressMempoolResponse>> {
+        match self.get_address_mempool(address_hex).await {
+            Ok(r) => Ok(Some(r)),
+            Err(Error::UpstreamRpc { code: -32601, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn send_raw_transaction(&self, tx_hex: &str) -> Result<SendRawResponse> {
         let v = self
             .call(
@@ -372,4 +409,114 @@ pub struct UtxoListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendRawResponse {
     pub tx_id: String,
+}
+
+/// One mempool tx as seen through an address-scoped lens: the outputs
+/// it creates that pay *this* address (`received`) and the prior
+/// outputs of *this* address it spends (`spent`). Mirrors the node's
+/// `get_address_mempool` per-tx shape exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolTx {
+    pub tx_id: String,
+    #[serde(default)]
+    pub received: Vec<MempoolReceived>,
+    #[serde(default)]
+    pub spent: Vec<MempoolSpent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolReceived {
+    pub output_index: u32,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolSpent {
+    pub tx_id: String,
+    pub output_index: u32,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressMempoolResponse {
+    pub address: String,
+    pub tip_height: u64,
+    #[serde(default)]
+    pub mempool: Vec<MempoolTx>,
+}
+
+impl AddressMempoolResponse {
+    /// Total value of mempool outputs paying this address (incoming,
+    /// unconfirmed credit).
+    pub fn pending_received(&self) -> u64 {
+        self.mempool
+            .iter()
+            .flat_map(|t| t.received.iter())
+            .map(|r| r.value)
+            .sum()
+    }
+
+    /// Total value of this address's outputs being spent in the
+    /// mempool (outgoing, unconfirmed debit).
+    pub fn pending_spent(&self) -> u64 {
+        self.mempool
+            .iter()
+            .flat_map(|t| t.spent.iter())
+            .map(|s| s.value)
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The node's `get_address_mempool` JSON, captured verbatim, must
+    // round-trip into AddressMempoolResponse and the pending sums must
+    // match: one tx crediting 0.1 + 0.05 and debiting 0.2.
+    #[test]
+    fn address_mempool_round_trips_and_sums() {
+        let raw = serde_json::json!({
+            "address": "ab".repeat(32),
+            "tip_height": 12345,
+            "mempool": [{
+                "tx_id": "11".repeat(32),
+                "received": [
+                    {"output_index": 0, "value": 100_000},
+                    {"output_index": 2, "value":  50_000}
+                ],
+                "spent": [
+                    {"tx_id": "22".repeat(32), "output_index": 1, "value": 200_000}
+                ]
+            }]
+        });
+        let r: AddressMempoolResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(r.tip_height, 12345);
+        assert_eq!(r.mempool.len(), 1);
+        assert_eq!(r.pending_received(), 150_000);
+        assert_eq!(r.pending_spent(), 200_000);
+    }
+
+    // Empty mempool (no pending tx touching the address) → zero sums,
+    // and a tx with omitted `received`/`spent` arrays defaults clean.
+    #[test]
+    fn address_mempool_empty_and_partial_default() {
+        let empty: AddressMempoolResponse = serde_json::from_value(serde_json::json!({
+            "address": "cd".repeat(32),
+            "tip_height": 1,
+            "mempool": []
+        }))
+        .unwrap();
+        assert_eq!(empty.pending_received(), 0);
+        assert_eq!(empty.pending_spent(), 0);
+
+        let partial: AddressMempoolResponse = serde_json::from_value(serde_json::json!({
+            "address": "cd".repeat(32),
+            "tip_height": 1,
+            "mempool": [{ "tx_id": "33".repeat(32), "received": [{"output_index": 0, "value": 7}] }]
+        }))
+        .unwrap();
+        assert_eq!(partial.pending_received(), 7);
+        assert_eq!(partial.pending_spent(), 0);
+    }
 }

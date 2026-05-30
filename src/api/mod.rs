@@ -751,11 +751,126 @@ async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
 }
 
 async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
+    // Opt-in per-UTXO availability annotation (default off → unchanged
+    // shape + no extra mempool scan). Read before `params` is consumed.
+    let with_status = params
+        .get("status")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("get_address_utxos params: {e}")))?;
     ensure_64_hex(&p.address)?;
     let u = state.node.get_address_utxos(&p.address).await?;
-    serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))
+    let mut out = serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))?;
+    if with_status {
+        annotate_utxo_status(state, &p.address, u.tip_height, &mut out).await?;
+    }
+    Ok(out)
+}
+
+/// Tag each UTXO in a `get_address_utxos` response with an availability
+/// `status`, and add response-level `available_value` + `status_supported`.
+///
+/// `get_address_utxos` is the node's *confirmed* UTXO set with no
+/// per-output state — a UTXO can be listed yet not actually spendable.
+/// This reconciles three signals the bare list can't:
+///
+/// - `immature`  — a coinbase output younger than `COINBASE_MATURITY`.
+/// - `reserved`  — claimed by an in-flight transfer *this* daemon is
+///   broadcasting (ephemeral, in-memory; see [`crate::inflight`]).
+/// - `spending`  — being spent by a tx already in the node's mempool
+///   (from `get_address_mempool`'s spent set) — covers spends by another
+///   wallet, or this wallet's own after a restart dropped the in-flight
+///   set. Without the node method (pre-v1.11.3) this can't be detected;
+///   `status_supported` then reports `false` and no row is marked
+///   `spending`.
+/// - `available` — none of the above.
+///
+/// Priority when several apply: immature > reserved > spending >
+/// available.
+/// Pure UTXO availability classification. Priority: immature > reserved
+/// > spending > available.
+fn classify_utxo_status(
+    is_coinbase: bool,
+    height: u64,
+    tip_height: u64,
+    reserved: bool,
+    spending: bool,
+) -> &'static str {
+    if is_coinbase && tip_height.saturating_sub(height) < exfer::types::COINBASE_MATURITY {
+        "immature"
+    } else if reserved {
+        "reserved"
+    } else if spending {
+        "spending"
+    } else {
+        "available"
+    }
+}
+
+async fn annotate_utxo_status(
+    state: &ApiState,
+    address: &str,
+    tip_height: u64,
+    out: &mut Value,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    // Reserved: this daemon's in-flight claims, keyed (tx_id hex, vout).
+    let reserved: HashSet<(String, u32)> = state
+        .inflight
+        .pending()
+        .into_iter()
+        .map(|op| (hex::encode(op.tx_id.as_bytes()), op.output_index))
+        .collect();
+
+    // Spending: outpoints of this address being spent in the mempool.
+    // None ⇒ upstream predates get_address_mempool; spending unknown.
+    let mempool = state.node.get_address_mempool_opt(address).await?;
+    let status_supported = mempool.is_some();
+    let spending: HashSet<(String, u32)> = mempool
+        .map(|m| {
+            m.mempool
+                .iter()
+                .flat_map(|t| t.spent.iter())
+                .map(|s| (s.tx_id.clone(), s.output_index))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut available_value: u64 = 0;
+    if let Some(arr) = out.get_mut("utxos").and_then(Value::as_array_mut) {
+        for entry in arr.iter_mut() {
+            let txid = entry["tx_id"].as_str().unwrap_or_default().to_string();
+            let vout = entry["output_index"].as_u64().unwrap_or(0) as u32;
+            let value = entry["value"].as_u64().unwrap_or(0);
+            let is_coinbase = entry["is_coinbase"].as_bool().unwrap_or(false);
+            let height = entry["height"].as_u64().unwrap_or(0);
+            let key = (txid, vout);
+
+            let status = classify_utxo_status(
+                is_coinbase,
+                height,
+                tip_height,
+                reserved.contains(&key),
+                spending.contains(&key),
+            );
+            if status == "available" {
+                available_value += value;
+            }
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("status".into(), serde_json::json!(status));
+            }
+        }
+    }
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("available_value".into(), serde_json::json!(available_value));
+        obj.insert(
+            "status_supported".into(),
+            serde_json::json!(status_supported),
+        );
+    }
+    Ok(())
 }
 
 async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
@@ -1139,6 +1254,32 @@ fn ensure_hex(s: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn utxo_status_classification_priority() {
+        let tip = 1000;
+        // immature coinbase wins over everything (even if also flagged).
+        assert_eq!(classify_utxo_status(true, 700, tip, true, true), "immature");
+        // mature coinbase is not immature.
+        assert_eq!(
+            classify_utxo_status(true, 600, tip, false, false),
+            "available"
+        );
+        // non-coinbase never immature regardless of height.
+        assert_eq!(
+            classify_utxo_status(false, 999, tip, false, false),
+            "available"
+        );
+        // reserved beats spending.
+        assert_eq!(classify_utxo_status(false, 0, tip, true, true), "reserved");
+        // spending when only mempool-spent.
+        assert_eq!(classify_utxo_status(false, 0, tip, false, true), "spending");
+        // plain available.
+        assert_eq!(
+            classify_utxo_status(false, 0, tip, false, false),
+            "available"
+        );
+    }
 
     #[test]
     fn rpc_error_envelope_carries_structured_data_for_insufficient_balance() {

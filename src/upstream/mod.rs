@@ -325,7 +325,10 @@ impl ExferNode {
     /// call (and one scan-rate slot). Node v1.11.3+ (issue #15 Tier 1).
     pub async fn get_balances(&self, addresses: &[String]) -> Result<Vec<BalanceResponse>> {
         let v = self
-            .call("get_balances", serde_json::json!({ "addresses": addresses }))
+            .call(
+                "get_balances",
+                serde_json::json!({ "addresses": addresses }),
+            )
             .await?;
         let parsed: BalancesResponse =
             serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))?;

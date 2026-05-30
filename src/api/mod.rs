@@ -291,12 +291,13 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
     match req.method.as_str() {
         // ---- generate / list (wrapper-only) ----
         "generate_address" => generate_address(state, req.params).await,
-        "generate_independent_address" => {
-            generate_independent_address(state, req.params).await
-        }
+        "generate_independent_address" => generate_independent_address(state, req.params).await,
         "import_private_key" => import_private_key(state, req.params).await,
         "export_vault" => export_vault(state, req.params).await,
         "import_vault" => import_vault(state, req.params).await,
+        "export_address" => export_address(state, req.params).await,
+        "import_mnemonic" => import_mnemonic(state, req.params).await,
+        "delete_address" => delete_address(state, req.params).await,
         "list_addresses" => list_addresses(state).await,
 
         // ---- transfer (wrapper-only) ----
@@ -358,6 +359,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- sensitive recovery export (passphrase-gated, spend-scope) ----
         "reveal_mnemonic" => reveal_mnemonic(state, req.params).await,
         "reveal_private_key" => reveal_private_key(state, req.params).await,
+        "reveal_address_mnemonic" => reveal_address_mnemonic(state, req.params).await,
 
         // ---- wallet-side conveniences ----
         "validate_address" => validate_address(req.params).await,
@@ -414,10 +416,9 @@ async fn generate_independent_address(state: &ApiState, params: Value) -> Result
     };
     let store = state.store.clone();
     let label = p.label.clone();
-    let (address, pubkey) =
-        tokio::task::spawn_blocking(move || store.create_independent(label))
-            .await
-            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    let (address, pubkey) = tokio::task::spawn_blocking(move || store.create_independent(label))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     tracing::info!(address = %address, "generated independent (1:1) address");
     Ok(serde_json::json!({ "address": address, "pubkey": pubkey, "imported": true }))
 }
@@ -438,7 +439,10 @@ async fn export_vault(state: &ApiState, params: Value) -> Result<Value> {
     let blob = tokio::task::spawn_blocking(move || store.export_vault(pass.as_bytes()))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
-    tracing::warn!(bytes = blob.len(), "vault exported — sensitive output (all keys)");
+    tracing::warn!(
+        bytes = blob.len(),
+        "vault exported — sensitive output (all keys)"
+    );
     Ok(serde_json::json!({ "vault_hex": hex::encode(&blob) }))
 }
 
@@ -513,6 +517,110 @@ async fn import_private_key(state: &ApiState, params: Value) -> Result<Value> {
     .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     tracing::info!(address = %address, "imported private key");
     Ok(serde_json::json!({ "address": address, "imported": true }))
+}
+
+#[derive(serde::Deserialize)]
+struct ExportAddressParams {
+    address: String,
+    passphrase: String,
+}
+
+/// `export_address` — one passphrase-sealed blob backing up a SINGLE
+/// address's key (same WDV1 vault format, so it restores via
+/// `import_vault`). Sensitive: decrypts to that private key. Spend-scoped.
+async fn export_address(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ExportAddressParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("export_address params: {e}")))?;
+    ensure_64_hex(&p.address)?;
+    let address = p.address.to_ascii_lowercase();
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let addr_for_blocking = address.clone();
+    let blob = tokio::task::spawn_blocking(move || {
+        store.export_selected(std::slice::from_ref(&addr_for_blocking), pass.as_bytes())
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(address = %address, bytes = blob.len(), "export_address served — sensitive (one key)");
+    Ok(serde_json::json!({ "address": address, "vault_hex": hex::encode(&blob) }))
+}
+
+#[derive(serde::Deserialize)]
+struct ImportMnemonicParams {
+    mnemonic: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// `import_mnemonic` — register a 24-word BIP-39 phrase as an independent
+/// address (its 256-bit entropy is the ed25519 secret). The per-address
+/// recovery-phrase counterpart of `reveal_address_mnemonic`. Manage-scope,
+/// matching `import_private_key`.
+async fn import_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ImportMnemonicParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("import_mnemonic params: {e}")))?;
+    let store = state.store.clone();
+    let label = p.label.clone();
+    let phrase = p.mnemonic.clone();
+    let address = tokio::task::spawn_blocking(move || store.import_mnemonic(&phrase, label))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::info!(address = %address, "imported address from recovery phrase");
+    Ok(serde_json::json!({ "address": address, "imported": true }))
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteAddressParams {
+    address: String,
+    passphrase: String,
+    /// Delete even when the address still holds (or might hold) funds.
+    /// Without it, a non-zero confirmed balance — or an upstream we can't
+    /// reach to check — blocks the delete so a key with money on it isn't
+    /// dropped by accident.
+    #[serde(default)]
+    force: bool,
+}
+
+/// `delete_address` — permanently remove an address from the keystore.
+/// Passphrase-gated. For an independent/imported key the sealed secret is
+/// erased (gone unless separately backed up). A funds guard refuses the
+/// delete when the address still has a confirmed balance, or when the
+/// balance can't be verified, unless `force` is set. Spend-scoped: this is
+/// destructive and can strand value.
+async fn delete_address(state: &ApiState, params: Value) -> Result<Value> {
+    let p: DeleteAddressParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("delete_address params: {e}")))?;
+    ensure_64_hex(&p.address)?;
+    let address = p.address.to_ascii_lowercase();
+
+    if !p.force {
+        match state.node.get_balance(&address).await {
+            Ok(b) if b.balance > 0 => {
+                return Err(Error::BadParams(format!(
+                    "address {address} still holds {} exfers — sweep it first, or pass \
+                     \"force\": true to delete anyway (the key is erased unless backed up)",
+                    b.balance
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Error::BadParams(format!(
+                    "could not verify the balance of {address} ({e}); refusing to delete a \
+                     possibly-funded key. Retry when upstream is reachable, or pass \
+                     \"force\": true to delete without checking."
+                )));
+            }
+        }
+    }
+
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let addr_for_blocking = address.clone();
+    tokio::task::spawn_blocking(move || store.delete(&addr_for_blocking, pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(address = %address, force = p.force, "address deleted from keystore");
+    Ok(serde_json::json!({ "deleted": address }))
 }
 
 async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
@@ -1012,6 +1120,26 @@ async fn reveal_private_key(state: &ApiState, params: Value) -> Result<Value> {
         "address":    address,
         "secret_hex": secret_hex,
     }))
+}
+
+/// `reveal_address_mnemonic` — that one address's OWN 24-word recovery
+/// phrase (its ed25519 secret encoded as BIP-39), distinct from the
+/// whole-wallet seed phrase served by `reveal_mnemonic`. Spend-scoped.
+async fn reveal_address_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
+    let p: RevealPrivateKeyParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("reveal_address_mnemonic params: {e}")))?;
+    ensure_64_hex(&p.address)?;
+    let address = p.address.to_ascii_lowercase();
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let addr_for_blocking = address.clone();
+    let words = tokio::task::spawn_blocking(move || {
+        store.reveal_address_mnemonic(&addr_for_blocking, pass.as_bytes())
+    })
+    .await
+    .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(address = %address, "reveal_address_mnemonic served — sensitive output");
+    Ok(serde_json::json!({ "address": address, "mnemonic": words }))
 }
 
 // ----------------------------------------------------------------------------

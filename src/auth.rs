@@ -65,13 +65,19 @@ impl Scope {
             | "sign_message"
             | "reveal_mnemonic"
             | "reveal_private_key"
+            // Per-address recovery phrase reveals raw key material.
+            | "reveal_address_mnemonic"
             // Vault export/import move raw key material; gate at the
             // highest scope.
             | "export_vault"
-            | "import_vault" => Scope::Spend,
+            | "export_address"
+            | "import_vault"
+            // Deletion is destructive and can strand funds.
+            | "delete_address" => Scope::Spend,
             "generate_address"
             | "generate_independent_address"
             | "import_private_key"
+            | "import_mnemonic"
             | "abandon_transfer"
             | "htlc_forget" => Scope::Manage,
             _ => Scope::Read,

@@ -546,15 +546,39 @@ impl WalletStore for HdSeedStore {
     }
 
     fn export_vault(&self, passphrase: &[u8]) -> Result<Vec<u8>> {
-        let entries = WalletStore::list(self)?;
+        // Whole keyring = the empty-selection case.
+        self.export_selected(&[], passphrase)
+    }
+
+    fn export_selected(&self, addresses: &[String], passphrase: &[u8]) -> Result<Vec<u8>> {
+        let all = WalletStore::list(self)?;
+        let selected: Vec<AddressEntry> = if addresses.is_empty() {
+            all
+        } else {
+            let want: std::collections::BTreeSet<String> =
+                addresses.iter().map(|a| a.to_ascii_lowercase()).collect();
+            let picked: Vec<AddressEntry> = all
+                .into_iter()
+                .filter(|e| want.contains(&e.address.to_ascii_lowercase()))
+                .collect();
+            if picked.len() != want.len() {
+                let have: std::collections::BTreeSet<String> = picked
+                    .iter()
+                    .map(|e| e.address.to_ascii_lowercase())
+                    .collect();
+                let missing: Vec<String> = want.into_iter().filter(|a| !have.contains(a)).collect();
+                return Err(Error::WalletNotFound(missing.join(", ")));
+            }
+            picked
+        };
         // Verify the passphrase once (one argon2id) rather than per key:
         // reveal_secret errors on a wrong passphrase. Secrets themselves are
         // then read from the already-unlocked keystore.
-        if let Some(first) = entries.first() {
+        if let Some(first) = selected.first() {
             let _ = self.reveal_secret(&first.address, passphrase)?;
         }
-        let mut keys = Vec::with_capacity(entries.len());
-        for e in &entries {
+        let mut keys = Vec::with_capacity(selected.len());
+        for e in &selected {
             let signer = self.load_by_address(&e.address)?;
             let secret = Zeroizing::new(signer.signing_key().to_bytes());
             keys.push(serde_json::json!({
@@ -569,10 +593,79 @@ impl WalletStore for HdSeedStore {
         sealed::seal(passphrase, VAULT_AAD, &bytes)
     }
 
+    fn reveal_address_mnemonic(&self, address_hex: &str, passphrase: &[u8]) -> Result<Vec<String>> {
+        // reveal_secret verifies the passphrase and that the address is
+        // managed (derived or imported), returning its raw 32-byte secret.
+        // A 32-byte secret is exactly 256-bit BIP-39 entropy = 24 words.
+        let secret = self.reveal_secret(address_hex, passphrase)?;
+        let mnemonic = Mnemonic::from_entropy(secret.as_ref())
+            .map_err(|e| Error::Internal(format!("mnemonic from key: {e}")))?;
+        Ok(mnemonic.words().map(|w| w.to_string()).collect())
+    }
+
+    fn import_mnemonic(&self, phrase: &str, label: Option<String>) -> Result<String> {
+        let mnemonic = Mnemonic::parse_in(Language::English, phrase.trim())
+            .map_err(|e| Error::BadParams(format!("invalid recovery phrase: {e}")))?;
+        let mut entropy = mnemonic.to_entropy();
+        if entropy.len() != 32 {
+            entropy.zeroize();
+            return Err(Error::BadParams(format!(
+                "recovery phrase must be 24 words (256-bit); got {}-byte entropy",
+                entropy.len()
+            )));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&entropy);
+        entropy.zeroize();
+        let r = self.import(&secret, label);
+        secret.zeroize();
+        r
+    }
+
+    fn delete(&self, address_hex: &str, passphrase: &[u8]) -> Result<()> {
+        let address_hex = address_hex.to_ascii_lowercase();
+        // Gate on the passphrase, same proof-of-knowledge as reveal_secret.
+        let _ = self.unseal_entropy(passphrase)?;
+
+        let was_imported = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let was_derived = state.derived.remove(&address_hex).is_some();
+            let was_imported =
+                if let Some(pos) = state.imported.iter().position(|a| a == &address_hex) {
+                    state.imported.remove(pos);
+                    true
+                } else {
+                    false
+                };
+            if !was_derived && !was_imported {
+                return Err(Error::WalletNotFound(address_hex));
+            }
+            state.labels.remove(&address_hex);
+            state.save_atomic(&self.root.join(STATE_FILE))?;
+            was_imported
+        };
+
+        if let Ok(mut c) = self.cache.lock() {
+            c.remove(&address_hex);
+        }
+        // The secret only exists on disk for imported/independent keys;
+        // HD-derived addresses have no per-key file (re-derivable from seed).
+        if was_imported {
+            let path = self
+                .root
+                .join(IMPORTED_DIR)
+                .join(format!("{address_hex}.key.enc"));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn import_vault(&self, blob: &[u8], passphrase: &[u8]) -> Result<Vec<String>> {
         let bytes = sealed::unseal(passphrase, VAULT_AAD, blob)?;
-        let doc: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| Error::ParseError(format!("vault: {e}")))?;
+        let doc: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| Error::ParseError(format!("vault: {e}")))?;
         let keys = doc
             .get("keys")
             .and_then(|v| v.as_array())
@@ -587,8 +680,8 @@ impl WalletStore for HdSeedStore {
                 .get("label")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let raw = hex::decode(secret_hex)
-                .map_err(|e| Error::BadHex(format!("vault secret: {e}")))?;
+            let raw =
+                hex::decode(secret_hex).map_err(|e| Error::BadHex(format!("vault secret: {e}")))?;
             let secret: [u8; 32] = raw
                 .as_slice()
                 .try_into()
@@ -719,8 +812,115 @@ mod tests {
         // The label rode along in the vault.
         let row = dst.list().unwrap();
         assert_eq!(
-            row.iter().find(|e| &e.address == &a).unwrap().label.as_deref(),
+            row.iter()
+                .find(|e| &e.address == &a)
+                .unwrap()
+                .label
+                .as_deref(),
             Some("savings"),
+        );
+    }
+
+    #[test]
+    fn address_mnemonic_roundtrip() {
+        // Each address has its OWN 24-word phrase; importing it elsewhere
+        // reproduces exactly that one address as an independent key.
+        let src_dir = temp();
+        let src = HdSeedStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
+        let _ = src.take_fresh_mnemonic();
+        let (a, _) = src.create_independent(Some("vault-a".into())).unwrap();
+
+        let words = src.reveal_address_mnemonic(&a, b"pw").unwrap();
+        assert_eq!(words.len(), 24);
+        // Wrong passphrase must not reveal.
+        assert!(matches!(
+            src.reveal_address_mnemonic(&a, b"nope"),
+            Err(Error::KeystoreLocked(_))
+        ));
+
+        // Import the phrase into a fresh, unrelated wallet → same address.
+        let dst_dir = temp();
+        let dst = HdSeedStore::open_or_init_fresh(dst_dir.path(), b"other").unwrap();
+        let _ = dst.take_fresh_mnemonic();
+        let phrase = words.join(" ");
+        let restored = dst
+            .import_mnemonic(&phrase, Some("restored".into()))
+            .unwrap();
+        assert_eq!(
+            restored, a,
+            "address-mnemonic must reproduce the same address"
+        );
+        assert!(dst.load_by_address(&a).unwrap().address_hex() == a);
+
+        // A derived address also yields a working per-address phrase.
+        let hd = src.create(None).unwrap().address;
+        let hd_words = src.reveal_address_mnemonic(&hd, b"pw").unwrap();
+        let hd_restored = dst.import_mnemonic(&hd_words.join(" "), None).unwrap();
+        assert_eq!(hd_restored, hd);
+    }
+
+    #[test]
+    fn delete_removes_address() {
+        let dir = temp();
+        let store = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = store.take_fresh_mnemonic();
+        let (a, _) = store.create_independent(None).unwrap();
+        let (b, _) = store.create_independent(None).unwrap();
+        let key_file = dir.path().join(IMPORTED_DIR).join(format!("{a}.key.enc"));
+        assert!(key_file.exists());
+
+        // Wrong passphrase can't delete.
+        assert!(matches!(
+            store.delete(&a, b"nope"),
+            Err(Error::KeystoreLocked(_))
+        ));
+        assert!(store.exists(&a));
+
+        store.delete(&a, b"pw").unwrap();
+        assert!(!store.exists(&a));
+        assert!(!key_file.exists(), "sealed key file must be erased");
+        assert!(matches!(
+            store.load_by_address(&a),
+            Err(Error::WalletNotFound(_))
+        ));
+        // The other key is untouched.
+        assert!(store.exists(&b));
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        // Deleting an unknown address is a typed error.
+        assert!(matches!(
+            store.delete(&a, b"pw"),
+            Err(Error::WalletNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn export_single_address_imports_only_that_key() {
+        let src_dir = temp();
+        let src = HdSeedStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
+        let _ = src.take_fresh_mnemonic();
+        let (a, _) = src.create_independent(Some("one".into())).unwrap();
+        let (b, _) = src.create_independent(None).unwrap();
+
+        // Export just `a`; the blob is a one-key vault.
+        let blob = src
+            .export_selected(std::slice::from_ref(&a), b"pw")
+            .unwrap();
+        // Requesting an unknown address errors.
+        assert!(matches!(
+            src.export_selected(&["ab".repeat(32)], b"pw"),
+            Err(Error::WalletNotFound(_))
+        ));
+
+        let dst_dir = temp();
+        let dst = HdSeedStore::open_or_init_fresh(dst_dir.path(), b"pw2").unwrap();
+        let _ = dst.take_fresh_mnemonic();
+        let imported = dst.import_vault(&blob, b"pw").unwrap();
+        assert_eq!(imported, vec![a.clone()]);
+        assert!(dst.exists(&a));
+        assert!(
+            !dst.exists(&b),
+            "single-key export must not carry other keys"
         );
     }
 

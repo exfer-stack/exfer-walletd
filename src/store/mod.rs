@@ -1,12 +1,18 @@
 //! Wallet keystore.
 //!
-//! v1.0 model: a single HD seed encrypted at rest. Addresses are derived
-//! on demand via SLIP-0010 (Ed25519). Backup the BIP-39 mnemonic and you
-//! have backed up every present and future address. See `hd::HdSeedStore`
-//! for the on-disk layout.
+//! Keyring model: the wallet is a flat collection of independent keys,
+//! each individually exportable, importable, and deletable. A key can
+//! originate three ways — generated independent (1:1, its own sealed
+//! file), imported (a raw secret or a 24-word phrase), or HD-derived from
+//! an optional legacy seed. No single secret governs the others: every
+//! address has its OWN 24-word recovery phrase (its 256-bit ed25519
+//! secret encoded as BIP-39), and the vault backs up the whole keyring in
+//! one passphrase-sealed file.
 //!
-//! Imported (non-derived) addresses live alongside derived ones — used
-//! by the `migrate` subcommand to absorb legacy walletd `.key` files.
+//! The HD seed is a backward-compatible *origin*, not the spine: existing
+//! seed wallets keep deriving and their seed mnemonic still works, but new
+//! addresses default to independent keys and backup no longer hinges on a
+//! single mnemonic. See `hd::HdSeedStore` for the on-disk layout.
 //!
 //! Everything in this module is filesystem-backed; the trait stays
 //! abstract so future backends (cloud KMS, HSM) can drop in.
@@ -141,6 +147,35 @@ pub trait WalletStore: Send + Sync + 'static {
     /// key. Wrong passphrase → `KeystoreLocked`. Returns the addresses
     /// newly imported (already-present ones are skipped).
     fn import_vault(&self, blob: &[u8], passphrase: &[u8]) -> Result<Vec<String>>;
+
+    /// Seal a chosen subset of addresses into one vault blob (identical
+    /// format to [`export_vault`], so the result imports via
+    /// [`import_vault`]). Empty `addresses` ⇒ every key. This is the
+    /// single-address encrypted-export primitive. `passphrase` is verified
+    /// against the keystore and also encrypts the blob. Any requested
+    /// address not in the keystore → `WalletNotFound`.
+    fn export_selected(&self, addresses: &[String], passphrase: &[u8]) -> Result<Vec<u8>>;
+
+    /// Verify `passphrase` and return THIS address's own 24-word BIP-39
+    /// phrase — its 256-bit ed25519 secret encoded as words. Distinct from
+    /// [`reveal_mnemonic`] (the whole-wallet seed phrase): importing these
+    /// words elsewhere reproduces exactly this one address as an
+    /// independent key. Works for HD-derived and imported addresses.
+    /// Wrong passphrase → `KeystoreLocked`; unknown → `WalletNotFound`.
+    fn reveal_address_mnemonic(&self, address_hex: &str, passphrase: &[u8]) -> Result<Vec<String>>;
+
+    /// Import a 24-word BIP-39 phrase as an independent key (its 256-bit
+    /// entropy IS the ed25519 secret). Returns the address. Already-present
+    /// → `WalletAlreadyExists`; not 24 words → `BadParams`.
+    fn import_mnemonic(&self, phrase: &str, label: Option<String>) -> Result<String>;
+
+    /// Permanently remove an address from the keystore. `passphrase` is
+    /// verified first. For an independent/imported key this deletes the
+    /// sealed key file (the secret is gone unless separately backed up);
+    /// for an HD-derived address it drops it from the managed set (still
+    /// re-derivable from the seed at its index). Wrong passphrase →
+    /// `KeystoreLocked`; unknown address → `WalletNotFound`.
+    fn delete(&self, address_hex: &str, passphrase: &[u8]) -> Result<()>;
 
     /// Whether an address is known to this store.
     fn exists(&self, address_hex: &str) -> bool;

@@ -1028,31 +1028,82 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
     };
 
     let node = state.node.clone();
+    let addresses: Vec<String> = entries.iter().map(|e| e.address.clone()).collect();
+
+    // ---- Balances: one batched node call (get_balances), which costs a
+    //      single scan-rate slot for the whole wallet instead of one per
+    //      address. Forward-compatible: a node predating the batch method
+    //      answers -32601 → `None` → fall back to the per-address fan-out. ----
+    let balances: std::collections::HashMap<String, u64> = if addresses.is_empty() {
+        Default::default()
+    } else if let Some(list) = node.get_balances_opt(&addresses).await? {
+        list.into_iter().map(|b| (b.address, b.balance)).collect()
+    } else {
+        stream::iter(addresses.clone())
+            .map(|addr| {
+                let node = node.clone();
+                async move {
+                    Ok::<_, Error>((addr.clone(), node.get_balance(&addr).await?.balance))
+                }
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .collect()
+    };
+
+    // ---- UTXO counts (only when requested): batched the same way, same
+    //      -32601 fallback to per-address get_address_utxos. ----
+    let utxo_info: std::collections::HashMap<String, (usize, bool)> =
+        if !include_utxos || addresses.is_empty() {
+            Default::default()
+        } else if let Some(batch) = node.get_address_utxos_batch_opt(&addresses).await? {
+            batch
+                .addresses
+                .into_iter()
+                .map(|a| (a.address, (a.utxos.len(), a.truncated)))
+                .collect()
+        } else {
+            stream::iter(addresses.clone())
+                .map(|addr| {
+                    let node = node.clone();
+                    async move {
+                        let u = node.get_address_utxos(&addr).await?;
+                        Ok::<_, Error>((addr.clone(), (u.utxos.len(), u.truncated)))
+                    }
+                })
+                .buffer_unordered(8)
+                .try_collect::<Vec<_>>()
+                .await?
+                .into_iter()
+                .collect()
+        };
+
+    // ---- Assemble rows from the batched maps. Pending has no batch form on
+    //      the node, so get_address_mempool stays per-address (tolerant of
+    //      old nodes via _opt; sets the wallet-level pending_supported flag). ----
     let rows: Vec<Value> = stream::iter(entries.clone())
         .map(|entry| {
             let node = node.clone();
+            let bal = balances.get(&entry.address).copied().unwrap_or(0);
+            let utxo = utxo_info.get(&entry.address).copied();
             async move {
-                let bal = node.get_balance(&entry.address).await?;
                 let mut row = serde_json::json!({
                     "address": entry.address,
                     "index": entry.index,
                     "label": entry.label,
                     "imported": entry.imported,
-                    "balance": bal.balance,
+                    "balance": bal,
                 });
                 if include_utxos {
-                    let utxos = node.get_address_utxos(&entry.address).await?;
-                    let obj = row.as_object_mut().expect("row is an object");
-                    obj.insert("utxo_count".into(), serde_json::json!(utxos.utxos.len()));
-                    obj.insert("truncated".into(), serde_json::json!(utxos.truncated));
+                    if let Some((count, truncated)) = utxo {
+                        let obj = row.as_object_mut().expect("row is an object");
+                        obj.insert("utxo_count".into(), serde_json::json!(count));
+                        obj.insert("truncated".into(), serde_json::json!(truncated));
+                    }
                 }
                 if include_pending {
-                    // Tolerant variant: an upstream predating
-                    // get_address_mempool (node v1.11.3) answers -32601,
-                    // mapped to None here. The row then carries no
-                    // pending_* fields and the wallet-level
-                    // `pending_supported` flag goes false (decided after
-                    // collection) rather than failing the whole call.
                     if let Some(mp) = node.get_address_mempool_opt(&entry.address).await? {
                         let obj = row.as_object_mut().expect("row is an object");
                         obj.insert(

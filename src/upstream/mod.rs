@@ -321,6 +321,60 @@ impl ExferNode {
         }
     }
 
+    /// `get_balances` — confirmed balance for many addresses in ONE node
+    /// call (and one scan-rate slot). Node v1.11.3+ (issue #15 Tier 1).
+    pub async fn get_balances(&self, addresses: &[String]) -> Result<Vec<BalanceResponse>> {
+        let v = self
+            .call("get_balances", serde_json::json!({ "addresses": addresses }))
+            .await?;
+        let parsed: BalancesResponse =
+            serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))?;
+        Ok(parsed.balances)
+    }
+
+    /// Forward-compatible variant: `None` against a node predating the batch
+    /// method (answers `-32601`), so the caller can fall back to per-address
+    /// `get_balance`.
+    pub async fn get_balances_opt(
+        &self,
+        addresses: &[String],
+    ) -> Result<Option<Vec<BalanceResponse>>> {
+        match self.get_balances(addresses).await {
+            Ok(r) => Ok(Some(r)),
+            Err(Error::UpstreamRpc { code: -32601, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `get_address_utxos_batch` — UTXOs for many addresses in ONE node call.
+    /// Node v1.11.3+ (issue #15 Tier 1).
+    pub async fn get_address_utxos_batch(
+        &self,
+        addresses: &[String],
+    ) -> Result<UtxosBatchResponse> {
+        let v = self
+            .call(
+                "get_address_utxos_batch",
+                serde_json::json!({ "addresses": addresses }),
+            )
+            .await?;
+        serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
+    }
+
+    /// Forward-compatible variant: `None` against a node predating the batch
+    /// method (`-32601`), so the caller can fall back to per-address
+    /// `get_address_utxos`.
+    pub async fn get_address_utxos_batch_opt(
+        &self,
+        addresses: &[String],
+    ) -> Result<Option<UtxosBatchResponse>> {
+        match self.get_address_utxos_batch(addresses).await {
+            Ok(r) => Ok(Some(r)),
+            Err(Error::UpstreamRpc { code: -32601, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn send_raw_transaction(&self, tx_hex: &str) -> Result<SendRawResponse> {
         let v = self
             .call(
@@ -376,6 +430,29 @@ pub struct TxStatus {
 pub struct BalanceResponse {
     pub address: String,
     pub balance: u64,
+}
+
+/// `get_balances` response — one balance per requested address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalancesResponse {
+    pub balances: Vec<BalanceResponse>,
+}
+
+/// One address's UTXOs inside a `get_address_utxos_batch` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressUtxos {
+    pub address: String,
+    #[serde(default)]
+    pub utxos: Vec<UtxoEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// `get_address_utxos_batch` response — UTXOs for many addresses, one tip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UtxosBatchResponse {
+    pub addresses: Vec<AddressUtxos>,
+    pub tip_height: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

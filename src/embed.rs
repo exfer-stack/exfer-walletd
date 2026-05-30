@@ -32,7 +32,7 @@ use crate::auth::{check_bind_is_safe, Tokens};
 use crate::config::Config;
 use crate::inflight::InFlightUtxos;
 use crate::server::{add_tls_bootstrap_routes, build_router, AppState};
-use crate::store::HdSeedStore;
+use crate::store::KeyringStore;
 use crate::upstream::{ExferNode, RetryPolicy};
 
 /// Bearer tokens minted (or loaded) during [`run_embedded`]. The Tauri
@@ -143,13 +143,15 @@ pub async fn run_embedded(
     check_bind_is_safe(cfg.bind, &tokens_auth, cfg.allow_public_bind, cfg.tls)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    let store = HdSeedStore::open_or_init_fresh(&wallet_dir, passphrase.as_bytes())
+    // Embedded (desktop) opens a seedless keyring: brand-new wallets get
+    // no HD seed at all (new addresses are independent 1:1 keys, backup is
+    // the vault / per-address phrases). Existing seeded wallets still load
+    // their seed normally — `open_keyring` is seedless only when there is
+    // no `seed.enc` to begin with.
+    let store = KeyringStore::open_keyring(&wallet_dir, passphrase.as_bytes())
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    // First-run mnemonic print goes to stderr — same channel as the
-    // token / cert first-run boxes. Daemon operators see it; GUI hosts
-    // (Tauri swallows stderr) silently drop it, which matches the
-    // desktop UX choice of "user-set password is the only secret to
-    // remember."
+    // A fresh seedless keyring has no mnemonic to surface; only a legacy
+    // seeded wallet would (then it goes to stderr — Tauri swallows it).
     if let Some(words) = store.take_fresh_mnemonic() {
         crate::server::print_fresh_mnemonic(&words);
     }

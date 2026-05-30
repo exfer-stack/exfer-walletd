@@ -12,12 +12,12 @@
 //! The HD seed is a backward-compatible *origin*, not the spine: existing
 //! seed wallets keep deriving and their seed mnemonic still works, but new
 //! addresses default to independent keys and backup no longer hinges on a
-//! single mnemonic. See `hd::HdSeedStore` for the on-disk layout.
+//! single mnemonic. See `keyring::KeyringStore` for the on-disk layout.
 //!
 //! Everything in this module is filesystem-backed; the trait stays
 //! abstract so future backends (cloud KMS, HSM) can drop in.
 
-pub mod hd;
+pub mod keyring;
 pub mod sealed;
 
 use ed25519_dalek::SigningKey;
@@ -27,7 +27,12 @@ use serde::Serialize;
 
 use crate::error::Result;
 
-pub use hd::HdSeedStore;
+pub use keyring::KeyringStore;
+/// Backward-compatible alias. The keystore was renamed `HdSeedStore`
+/// → `KeyringStore` when the model flipped from "one seed derives all" to
+/// a flat keyring; downstream crates (the desktop) still import the old
+/// name.
+pub use keyring::KeyringStore as HdSeedStore;
 
 // ----------------------------------------------------------------------------
 // Signer — the only thing the rest of walletd needs from a loaded key

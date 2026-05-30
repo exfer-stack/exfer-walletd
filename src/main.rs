@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 
 use exfer_walletd::config::Config;
 use exfer_walletd::server;
-use exfer_walletd::store::{HdSeedStore, WalletStore};
+use exfer_walletd::store::{KeyringStore, WalletStore};
 
 /// Top-level CLI. Default invocation (no subcommand) runs the daemon
 /// with [`Config`]; subcommands provide one-shot utilities that share
@@ -77,7 +77,10 @@ fn run_migrate(
     }
     let wallet_dir = cfg.resolved_wallet_dir();
     std::fs::create_dir_all(&wallet_dir)?;
-    let store = HdSeedStore::open_or_init_fresh(&wallet_dir, passphrase.as_bytes())
+    // Standalone daemon stays seeded (operators may rely on the seed
+    // mnemonic backup + first-run print). The desktop's embedded path
+    // (embed.rs) opens seedless.
+    let store = KeyringStore::open_or_init_fresh(&wallet_dir, passphrase.as_bytes())
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     // Don't print the mnemonic during migrate — operator may be
     // running this non-interactively; the words would otherwise leak

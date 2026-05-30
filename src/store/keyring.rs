@@ -1,15 +1,27 @@
-//! HD seed-backed keystore.
+//! Keyring keystore — a flat set of independent keys, with an OPTIONAL
+//! HD seed as one backward-compatible origin.
 //!
 //! ## On-disk layout (`<wallet_dir>/`)
 //!
 //! ```text
-//!   seed.enc                  ← BIP-39 entropy (32 B), sealed (see sealed.rs)
+//!   seed.enc                  ← OPTIONAL: sealed BIP-39 entropy (32 B).
+//!                                Absent in a seedless keyring (see below).
 //!   state.json                ← {"next_index": N, "derived": {addr->idx},
 //!                                 "labels": {addr->label}, "imported": [addr]}
-//!   imported/<addr>.key.enc   ← sealed 32-byte secret for non-HD imports
+//!   imported/<addr>.key.enc   ← sealed 32-byte secret per independent /
+//!                                imported key (the 1:1 keys live here)
 //! ```
 //!
-//! ## Derivation path
+//! ## Seeded vs seedless
+//!
+//! [`KeyringStore::open_or_init_fresh`] generates a `seed.enc` on first run
+//! (legacy/operator path; the seed mnemonic backs up every derived
+//! address). [`KeyringStore::open_keyring`] creates a *seedless* keyring —
+//! no `seed.enc`, every address is its own independent key, backup is the
+//! vault or per-address recovery phrases. Existing seeded wallets open
+//! unchanged through either constructor.
+//!
+//! ## Derivation path (seeded only)
 //!
 //! `m/44'/9527'/0'/0'/i'`  (Ed25519, all hardened — SLIP-0010 spec).
 //!
@@ -18,10 +30,10 @@
 //!
 //! ## Caching
 //!
-//! Derived signers are cached in-memory after first use. The seed lives
-//! decrypted in memory for the daemon's lifetime (encrypted on disk).
-//! `Signer` itself is cheap to construct from the cached seed (~µs of
-//! HMAC-SHA512), so cache misses on cold addresses cost almost nothing.
+//! Signers are cached in-memory after first use. When present, the seed
+//! lives decrypted in memory for the daemon's lifetime (encrypted on
+//! disk); re-deriving a signer is ~µs of HMAC-SHA512, so cache misses on
+//! cold derived addresses cost almost nothing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -98,14 +110,17 @@ impl State {
 // ============================================================================
 
 /// Implements `Debug` opaquely; the seed and passphrase are NEVER printed.
-pub struct HdSeedStore {
+pub struct KeyringStore {
     root: PathBuf,
-    /// Decrypted master entropy (32 bytes for 24-word mnemonic). Held
-    /// in memory for the daemon's lifetime; cleared on Drop.
-    seed: Zeroizing<[u8; 64]>,
-    /// `Some` only between [`HdSeedStore::open_or_init_fresh`] returning
-    /// and the operator pulling the words once via [`mnemonic_words`].
-    /// Lives just long enough to be printed at first start.
+    /// Decrypted master HD seed (PBKDF2 of the 24-word entropy). `None`
+    /// for a *seedless* keyring — one made of only independent/imported
+    /// keys, with no HD origin at all (`seed.enc` absent on disk). Held in
+    /// memory for the daemon's lifetime; cleared on Drop.
+    seed: Option<Zeroizing<[u8; 64]>>,
+    /// `Some` only between a fresh seeded init returning and the operator
+    /// pulling the words once via [`take_fresh_mnemonic`]. Lives just long
+    /// enough to be printed at first start. Always `None` for a seedless
+    /// keyring (nothing is generated).
     fresh_mnemonic: Mutex<Option<Vec<String>>>,
     /// Passphrase kept around for sealing imported keys; cleared on Drop.
     passphrase: Zeroizing<Vec<u8>>,
@@ -114,19 +129,52 @@ pub struct HdSeedStore {
     cache: Mutex<BTreeMap<String, Signer>>,
 }
 
-impl std::fmt::Debug for HdSeedStore {
+impl std::fmt::Debug for KeyringStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HdSeedStore")
+        f.debug_struct("KeyringStore")
             .field("root", &self.root.display().to_string())
             .finish_non_exhaustive()
     }
 }
 
-impl HdSeedStore {
-    /// Open an existing keystore, or initialise a fresh one on first run.
+impl KeyringStore {
+    /// Open an existing keystore, or initialise a fresh **seeded** one on
+    /// first run (generates a 24-word HD seed). Legacy/operator path — the
+    /// daemon still backs up via the seed mnemonic. New keyring-model
+    /// callers prefer [`open_keyring`](Self::open_keyring).
+    ///
     /// The passphrase MUST come from a deliberate operator decision (env
     /// var `WALLETD_KEYSTORE_PASSPHRASE` in production) — never default.
     pub fn open_or_init_fresh(root: impl Into<PathBuf>, passphrase: &[u8]) -> Result<Self> {
+        Self::open_inner(root, passphrase, true)
+    }
+
+    /// Open an existing keystore, or initialise a fresh **seedless** one —
+    /// a pure keyring with no HD seed (`seed.enc` is never created). New
+    /// addresses are independent 1:1 keys; backup is the vault or
+    /// per-address recovery phrases, not a single seed mnemonic.
+    ///
+    /// Opening an existing *seeded* wallet through this path loads its seed
+    /// normally (full backward compatibility) — the seedless behaviour only
+    /// applies when there is no `seed.enc` to begin with. When the wallet
+    /// already holds keys, the passphrase is verified against one of them.
+    pub fn open_keyring(root: impl Into<PathBuf>, passphrase: &[u8]) -> Result<Self> {
+        let store = Self::open_inner(root, passphrase, false)?;
+        // A seeded open verifies the passphrase by unsealing `seed.enc`. A
+        // seedless open has no seed to check, so verify against an existing
+        // key (if any) — otherwise a wrong passphrase would silently become
+        // the sealing key for future imports and corrupt the keystore.
+        if store.seed.is_none() {
+            store.verify_passphrase(passphrase)?;
+        }
+        Ok(store)
+    }
+
+    fn open_inner(
+        root: impl Into<PathBuf>,
+        passphrase: &[u8],
+        generate_seed_if_missing: bool,
+    ) -> Result<Self> {
         let root: PathBuf = root.into();
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(root.join(IMPORTED_DIR))?;
@@ -150,9 +198,9 @@ impl HdSeedStore {
                     entropy.len()
                 ))
             })?;
-            (entropy_to_seed64(&entropy), None)
-        } else {
-            // First run — generate a 24-word mnemonic, seal entropy.
+            (Some(entropy_to_seed64(&entropy)), None)
+        } else if generate_seed_if_missing {
+            // First run (seeded) — generate a 24-word mnemonic, seal entropy.
             let mnemonic = Mnemonic::generate_in(Language::English, 24)
                 .map_err(|e| Error::Internal(format!("mnemonic generation failed: {e}")))?;
             let mut entropy = mnemonic.to_entropy();
@@ -170,19 +218,44 @@ impl HdSeedStore {
             let words: Vec<String> = mnemonic.words().map(|w| w.to_string()).collect();
             let seed64 = entropy_to_seed64(&entropy_arr);
             entropy_arr.zeroize();
-            (seed64, Some(words))
+            (Some(seed64), Some(words))
+        } else {
+            // Seedless keyring — no HD origin.
+            (None, None)
         };
 
         let state = State::load_or_default(&root.join(STATE_FILE))?;
 
         Ok(Self {
             root,
-            seed: Zeroizing::new(seed64),
+            seed: seed64.map(Zeroizing::new),
             fresh_mnemonic: Mutex::new(fresh_words),
             passphrase: Zeroizing::new(passphrase.to_vec()),
             state: Mutex::new(state),
             cache: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Verify `passphrase` without revealing anything. Seeded → unseal
+    /// `seed.enc`. Seedless → unseal one managed key, if any exist (an
+    /// empty seedless keyring has nothing to check against, so any
+    /// passphrase is accepted and becomes the sealing key). Wrong
+    /// passphrase → [`Error::KeystoreLocked`].
+    fn verify_passphrase(&self, passphrase: &[u8]) -> Result<()> {
+        if self.seed.is_some() {
+            let _ = self.unseal_entropy(passphrase)?;
+            return Ok(());
+        }
+        let probe = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.imported.first().cloned()
+        };
+        if let Some(addr) = probe {
+            let blob = std::fs::read(self.root.join(IMPORTED_DIR).join(format!("{addr}.key.enc")))?;
+            sealed::unseal(passphrase, IMPORTED_AAD, &blob)
+                .map_err(|_| Error::KeystoreLocked("wrong passphrase".into()))?;
+        }
+        Ok(())
     }
 
     /// Restore a keystore from an existing 24-word BIP-39 mnemonic:
@@ -244,10 +317,15 @@ impl HdSeedStore {
     }
 
     /// Compute the signer for a derivation index without touching cache
-    /// or state. Used internally; tests may call directly.
+    /// or state. Used internally; tests may call directly. Panics on a
+    /// seedless keyring — callers (`create`) guard on seed presence first.
     pub fn derive(&self, index: u32) -> Signer {
+        let seed = self
+            .seed
+            .as_ref()
+            .expect("derive() on a seedless keyring — guard on seed presence in the caller");
         let secret = slip10_ed25519::derive_ed25519_private_key(
-            self.seed.as_ref(),
+            seed.as_ref(),
             &[44, EXFER_COIN_TYPE, 0, 0, index],
         );
         Signer::from_secret_bytes(&secret)
@@ -262,6 +340,13 @@ impl HdSeedStore {
     /// MetaMask-style "type your password again to reveal" flows.
     /// Wrong passphrase → [`Error::KeystoreLocked`].
     pub fn reveal_mnemonic(&self, passphrase: &[u8]) -> Result<Vec<String>> {
+        if self.seed.is_none() {
+            return Err(Error::BadParams(
+                "this wallet has no seed phrase (seedless keyring); back it up via the \
+                 vault export or per-address recovery phrases instead"
+                    .into(),
+            ));
+        }
         let entropy = self.unseal_entropy(passphrase)?;
         let mnemonic = Mnemonic::from_entropy(entropy.as_ref())
             .map_err(|e| Error::Internal(format!("mnemonic from entropy: {e}")))?;
@@ -286,14 +371,6 @@ impl HdSeedStore {
     ) -> Result<Zeroizing<[u8; 32]>> {
         let address_hex = address_hex.to_ascii_lowercase();
 
-        // Verify the passphrase by re-unsealing the seed first. For
-        // imported keys we also unseal the per-key file with the same
-        // passphrase (a successful seed unseal proves the passphrase is
-        // right; a failure on the imported key would mean the imported
-        // key was sealed with a different passphrase, which today
-        // shouldn't happen but the error path remains correct).
-        let entropy = self.unseal_entropy(passphrase)?;
-
         let kind = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(i) = state.derived.get(&address_hex) {
@@ -308,6 +385,9 @@ impl HdSeedStore {
 
         let secret = match kind {
             ("derived", Some(idx)) => {
+                // HD origin: unsealing `seed.enc` both verifies the
+                // passphrase and re-derives the key.
+                let entropy = self.unseal_entropy(passphrase)?;
                 let entropy_arr: [u8; 32] = *entropy;
                 let seed64 = entropy_to_seed64(&entropy_arr);
                 let raw = slip10_ed25519::derive_ed25519_private_key(
@@ -320,6 +400,8 @@ impl HdSeedStore {
                 raw
             }
             ("imported", None) => {
+                // Independent/imported key: unsealing the per-key file IS
+                // the passphrase check (no seed needed → works seedless).
                 let blob = std::fs::read(
                     self.root
                         .join(IMPORTED_DIR)
@@ -337,7 +419,6 @@ impl HdSeedStore {
             }
             _ => unreachable!(),
         };
-        let _ = entropy;
         Ok(Zeroizing::new(secret))
     }
 
@@ -379,8 +460,15 @@ fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-impl WalletStore for HdSeedStore {
+impl WalletStore for KeyringStore {
     fn create(&self, label: Option<String>) -> Result<DerivedAddress> {
+        if self.seed.is_none() {
+            return Err(Error::BadParams(
+                "this wallet has no HD seed (seedless keyring); use \
+                 generate_independent_address for a 1:1 key"
+                    .into(),
+            ));
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let index = state.next_index;
         // u32 max is plenty (4B addresses) but be explicit.
@@ -624,8 +712,8 @@ impl WalletStore for HdSeedStore {
 
     fn delete(&self, address_hex: &str, passphrase: &[u8]) -> Result<()> {
         let address_hex = address_hex.to_ascii_lowercase();
-        // Gate on the passphrase, same proof-of-knowledge as reveal_secret.
-        let _ = self.unseal_entropy(passphrase)?;
+        // Gate on the passphrase (works seeded or seedless).
+        self.verify_passphrase(passphrase)?;
 
         let was_imported = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -707,7 +795,7 @@ mod tests {
     #[test]
     fn first_run_generates_mnemonic_and_persists_seed() {
         let dir = temp();
-        let store = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let words = store
             .take_fresh_mnemonic()
             .expect("first run prints mnemonic");
@@ -720,13 +808,13 @@ mod tests {
     #[test]
     fn reopen_with_same_passphrase_recovers_addresses() {
         let dir = temp();
-        let s1 = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let s1 = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let _ = s1.take_fresh_mnemonic();
         let a = s1.create(None).unwrap().address;
         let b = s1.create(Some("user-1".into())).unwrap().address;
         drop(s1);
 
-        let s2 = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let s2 = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         assert!(s2.take_fresh_mnemonic().is_none());
         let list = s2.list().unwrap();
         assert_eq!(list.len(), 2);
@@ -744,8 +832,8 @@ mod tests {
     #[test]
     fn wrong_passphrase_locks_keystore() {
         let dir = temp();
-        let _s1 = HdSeedStore::open_or_init_fresh(dir.path(), b"right").unwrap();
-        let err = HdSeedStore::open_or_init_fresh(dir.path(), b"wrong").unwrap_err();
+        let _s1 = KeyringStore::open_or_init_fresh(dir.path(), b"right").unwrap();
+        let err = KeyringStore::open_or_init_fresh(dir.path(), b"wrong").unwrap_err();
         assert!(matches!(err, Error::KeystoreLocked(_)));
     }
 
@@ -755,12 +843,12 @@ mod tests {
         // reopen, derive same indices — addresses must match because they
         // come from the seed not from state.
         let dir = temp();
-        let s1 = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let s1 = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let a0 = s1.derive(0).address_hex();
         let a1 = s1.derive(1).address_hex();
         drop(s1);
 
-        let s2 = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let s2 = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         assert_eq!(s2.derive(0).address_hex(), a0);
         assert_eq!(s2.derive(1).address_hex(), a1);
     }
@@ -768,7 +856,7 @@ mod tests {
     #[test]
     fn import_roundtrip() {
         let dir = temp();
-        let store = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let secret = [7u8; 32];
         let addr = store.import(&secret, Some("legacy".into())).unwrap();
 
@@ -787,7 +875,7 @@ mod tests {
     fn vault_export_import_roundtrip() {
         // Source wallet: two independent (1:1) keys + one HD-derived.
         let src_dir = temp();
-        let src = HdSeedStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
+        let src = KeyringStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
         let _ = src.take_fresh_mnemonic();
         let (a, _) = src.create_independent(Some("savings".into())).unwrap();
         let (b, _) = src.create_independent(None).unwrap();
@@ -797,7 +885,7 @@ mod tests {
         assert!(!blob.is_empty());
         // Wrong passphrase must not decrypt.
         let dst_dir = temp();
-        let dst = HdSeedStore::open_or_init_fresh(dst_dir.path(), b"pw2").unwrap();
+        let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"pw2").unwrap();
         assert!(dst.import_vault(&blob, b"wrong").is_err());
 
         // Restore into the fresh wallet.
@@ -826,7 +914,7 @@ mod tests {
         // Each address has its OWN 24-word phrase; importing it elsewhere
         // reproduces exactly that one address as an independent key.
         let src_dir = temp();
-        let src = HdSeedStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
+        let src = KeyringStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
         let _ = src.take_fresh_mnemonic();
         let (a, _) = src.create_independent(Some("vault-a".into())).unwrap();
 
@@ -840,7 +928,7 @@ mod tests {
 
         // Import the phrase into a fresh, unrelated wallet → same address.
         let dst_dir = temp();
-        let dst = HdSeedStore::open_or_init_fresh(dst_dir.path(), b"other").unwrap();
+        let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"other").unwrap();
         let _ = dst.take_fresh_mnemonic();
         let phrase = words.join(" ");
         let restored = dst
@@ -862,7 +950,7 @@ mod tests {
     #[test]
     fn delete_removes_address() {
         let dir = temp();
-        let store = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let _ = store.take_fresh_mnemonic();
         let (a, _) = store.create_independent(None).unwrap();
         let (b, _) = store.create_independent(None).unwrap();
@@ -897,7 +985,7 @@ mod tests {
     #[test]
     fn export_single_address_imports_only_that_key() {
         let src_dir = temp();
-        let src = HdSeedStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
+        let src = KeyringStore::open_or_init_fresh(src_dir.path(), b"pw").unwrap();
         let _ = src.take_fresh_mnemonic();
         let (a, _) = src.create_independent(Some("one".into())).unwrap();
         let (b, _) = src.create_independent(None).unwrap();
@@ -913,7 +1001,7 @@ mod tests {
         ));
 
         let dst_dir = temp();
-        let dst = HdSeedStore::open_or_init_fresh(dst_dir.path(), b"pw2").unwrap();
+        let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"pw2").unwrap();
         let _ = dst.take_fresh_mnemonic();
         let imported = dst.import_vault(&blob, b"pw").unwrap();
         assert_eq!(imported, vec![a.clone()]);
@@ -925,9 +1013,72 @@ mod tests {
     }
 
     #[test]
+    fn seedless_keyring_has_no_seed_but_full_keyring_lifecycle() {
+        let dir = temp();
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        // No HD seed was generated.
+        assert!(
+            !dir.path().join(SEED_FILE).exists(),
+            "seedless: no seed.enc"
+        );
+        assert!(store.take_fresh_mnemonic().is_none());
+
+        // HD-only operations are refused; independent keys work.
+        assert!(matches!(store.create(None), Err(Error::BadParams(_))));
+        assert!(matches!(
+            store.reveal_mnemonic(b"pw"),
+            Err(Error::BadParams(_))
+        ));
+        let (a, _) = store.create_independent(Some("ind".into())).unwrap();
+        assert!(store.exists(&a));
+
+        // Per-address mnemonic, export, delete all work without a seed.
+        let words = store.reveal_address_mnemonic(&a, b"pw").unwrap();
+        assert_eq!(words.len(), 24);
+        let blob = store.export_vault(b"pw").unwrap();
+        assert!(!blob.is_empty());
+        store.delete(&a, b"pw").unwrap();
+        assert!(!store.exists(&a));
+    }
+
+    #[test]
+    fn seedless_reopen_verifies_passphrase_against_a_key() {
+        // Once a seedless keyring holds a key, reopening with the wrong
+        // passphrase must fail rather than silently mis-seal future keys.
+        let dir = temp();
+        let s1 = KeyringStore::open_keyring(dir.path(), b"right").unwrap();
+        let (_a, _) = s1.create_independent(None).unwrap();
+        drop(s1);
+
+        assert!(matches!(
+            KeyringStore::open_keyring(dir.path(), b"wrong"),
+            Err(Error::KeystoreLocked(_))
+        ));
+        // Correct passphrase reopens fine.
+        assert!(KeyringStore::open_keyring(dir.path(), b"right").is_ok());
+    }
+
+    #[test]
+    fn open_keyring_loads_an_existing_seeded_wallet() {
+        // Backward compat: a wallet created seeded still opens (with its
+        // seed) through the seedless constructor.
+        let dir = temp();
+        let seeded = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = seeded.take_fresh_mnemonic();
+        let hd = seeded.create(None).unwrap().address;
+        drop(seeded);
+
+        let reopened = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        assert!(reopened.exists(&hd));
+        // Seed is present → seed mnemonic still works, HD derive still works.
+        assert_eq!(reopened.reveal_mnemonic(b"pw").unwrap().len(), 24);
+        assert!(reopened.create(None).is_ok());
+    }
+
+    #[test]
     fn load_unknown_address_returns_typed_error() {
         let dir = temp();
-        let store = HdSeedStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let res = store.load_by_address(&"ab".repeat(32));
         assert!(matches!(res, Err(Error::WalletNotFound(_))));
     }

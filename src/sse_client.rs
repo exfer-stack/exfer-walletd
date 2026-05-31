@@ -263,9 +263,19 @@ impl SseClient {
 
             // Probe: try to open the stream; if the connect fails or the
             // node refuses /sse, go to fallback and re-probe later.
+            //
+            // We POST (with a `{}` body) rather than GET because some
+            // L7 proxies in the wild mangle GETs or reject empty-body
+            // requests. The node's /sse endpoint accepts both verbs;
+            // addresses are in the query string either way, so the
+            // body is ignored server-side.
             let probe = tokio::time::timeout(
                 PROBE_CONNECT_TIMEOUT,
-                http.get(&url).header("Accept", "text/event-stream").send(),
+                http.post(&url)
+                    .header("Accept", "text/event-stream")
+                    .header("Content-Type", "application/json")
+                    .body("{}")
+                    .send(),
             )
             .await;
 

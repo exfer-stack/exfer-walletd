@@ -61,6 +61,14 @@ pub struct ServerHandle {
     /// Resolved auth tokens (auto-generated to `<datadir>/token-*`
     /// when not supplied via `cfg`).
     pub tokens: EmbeddedTokens,
+    /// Push-event channel for embedders (the Tauri supervisor / future
+    /// in-process consumers). Forwards Phase 2 SSE nudges from the
+    /// upstream node so the UI can re-render the moment a balance
+    /// changes instead of waiting for the next poll. Returns an empty
+    /// stream when the upstream node has no /sse endpoint (the
+    /// SseClient stays in fallback mode and the existing follower poll
+    /// loop covers the gap).
+    pub events: Arc<crate::sse_client::WalletEvents>,
     shutdown: CancellationToken,
     join: JoinHandle<anyhow::Result<()>>,
 }
@@ -179,6 +187,22 @@ pub async fn run_embedded(
         crate::follower::FollowerConfig::default(),
     );
     let _follower_task = follower.spawn();
+
+    // Phase 2 SSE: connect to the upstream node's /sse push endpoint and
+    // forward every script_changed / tip / resync nudge onto an
+    // in-process broadcast channel. Probe-and-fallback semantics:
+    // unreachable / 404 nodes (pre-1.12) leave the channel empty and
+    // the follower's poll loop handles updates unchanged. Successful
+    // streams reduce the "tx submitted → wallet observes" gap from
+    // poll-interval-bounded (2 s) to network-RTT-bounded.
+    let events = crate::sse_client::WalletEvents::new();
+    let sse_shutdown = shutdown.clone();
+    let sse_client = crate::sse_client::SseClient::new(
+        store.clone(),
+        node.clone(),
+        events.clone(),
+    );
+    let _sse_task = sse_client.spawn(sse_shutdown);
 
     // Optional indexer delegation — only lights up when --indexer-rpc
     // (or WALLETD_INDEXER_RPC) is set. Methods that need data outside
@@ -300,6 +324,7 @@ pub async fn run_embedded(
             manage,
             spend,
         },
+        events,
         shutdown,
         join,
     })

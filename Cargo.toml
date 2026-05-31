@@ -1,6 +1,6 @@
 [package]
 name        = "exfer-walletd"
-version     = "1.9.6"
+version     = "1.10.0"
 edition     = "2021"
 description = "Exfer Wallet Daemon — independent wallet service that exposes generate_address / transfer / balance over JSON-RPC, talking to one or more Exfer nodes"
 license     = "MIT"
@@ -22,7 +22,7 @@ path = "src/main.rs"
 # surface consume. The types are awaiting re-land in ahuman-exfer/exfer
 # (PR #23). Once that PR merges, this can switch to a tag pin on the
 # upstream release that contains them.
-exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "c97b7f0132f08cef7169b2ee5e0fb1eb748edc22" }
+exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "99c45cfde397ca6602685ee9993a30317ae4e2f3" }
 
 axum            = { version = "0.7", features = ["macros"] }
 
@@ -36,7 +36,7 @@ tokio-util      = { version = "0.7", features = ["rt"] }
 futures         = "0.3"
 tower            = "0.5"
 tower-http       = { version = "0.6", features = ["trace", "cors"] }
-reqwest          = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest          = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde            = { version = "1", features = ["derive"] }
 serde_json       = "1"
 hex              = "0.4"

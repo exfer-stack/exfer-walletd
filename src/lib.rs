@@ -63,6 +63,7 @@ pub mod indexer;
 pub mod inflight;
 pub mod payment_uri;
 pub mod server;
+pub mod sse_client;
 pub mod store;
 pub mod tls;
 pub mod tx;

@@ -321,6 +321,37 @@ impl ExferNode {
         }
     }
 
+    /// `get_address_mempool_batch` — mempool view for many addresses in ONE
+    /// node call (and one scan-rate slot). A wallet polling N addresses would
+    /// otherwise spend N of the node's 30 scans/min just on pending; this
+    /// collapses that to one.
+    pub async fn get_address_mempool_batch(
+        &self,
+        addresses: &[String],
+    ) -> Result<MempoolBatchResponse> {
+        let v = self
+            .call(
+                "get_address_mempool_batch",
+                serde_json::json!({ "addresses": addresses }),
+            )
+            .await?;
+        serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
+    }
+
+    /// Like [`Self::get_address_mempool_batch`] but tolerant of upstreams that
+    /// predate the method (answer `-32601 Method not found`) — the caller
+    /// falls back to the per-address fan-out so a mixed fleet keeps working.
+    pub async fn get_address_mempool_batch_opt(
+        &self,
+        addresses: &[String],
+    ) -> Result<Option<MempoolBatchResponse>> {
+        match self.get_address_mempool_batch(addresses).await {
+            Ok(r) => Ok(Some(r)),
+            Err(Error::UpstreamRpc { code: -32601, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `get_balances` — confirmed balance for many addresses in ONE node
     /// call (and one scan-rate slot). Node v1.11.3+ (issue #15 Tier 1).
     pub async fn get_balances(&self, addresses: &[String]) -> Result<Vec<BalanceResponse>> {
@@ -538,6 +569,38 @@ impl AddressMempoolResponse {
 
     /// Total value of this address's outputs being spent in the
     /// mempool (outgoing, unconfirmed debit).
+    pub fn pending_spent(&self) -> u64 {
+        self.mempool
+            .iter()
+            .flat_map(|t| t.spent.iter())
+            .map(|s| s.value)
+            .sum()
+    }
+}
+
+/// Response of `get_address_mempool_batch`: one entry per requested address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolBatchResponse {
+    #[serde(default)]
+    pub addresses: Vec<AddressMempoolEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressMempoolEntry {
+    pub address: String,
+    #[serde(default)]
+    pub mempool: Vec<MempoolTx>,
+}
+
+impl AddressMempoolEntry {
+    pub fn pending_received(&self) -> u64 {
+        self.mempool
+            .iter()
+            .flat_map(|t| t.received.iter())
+            .map(|r| r.value)
+            .sum()
+    }
+
     pub fn pending_spent(&self) -> u64 {
         self.mempool
             .iter()

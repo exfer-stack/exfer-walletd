@@ -1274,14 +1274,37 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
                 .collect()
         };
 
-    // ---- Assemble rows from the batched maps. Pending has no batch form on
-    //      the node, so get_address_mempool stays per-address (tolerant of
-    //      old nodes via _opt; sets the wallet-level pending_supported flag). ----
+    // ---- Pending (mempool): one batched node call when supported, which
+    //      costs a SINGLE scan-rate slot for the whole wallet instead of one
+    //      per address. A node predating the batch method answers -32601 →
+    //      `None` → fall back to the per-address fan-out in the row loop. ----
+    let pending_map: Option<
+        std::sync::Arc<std::collections::HashMap<String, (u64, u64)>>,
+    > = if !include_pending || addresses.is_empty() {
+        None
+    } else {
+        node.get_address_mempool_batch_opt(&addresses).await?.map(|b| {
+            std::sync::Arc::new(
+                b.addresses
+                    .into_iter()
+                    .map(|e| {
+                        (
+                            e.address.to_lowercase(),
+                            (e.pending_received(), e.pending_spent()),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+    };
+
+    // ---- Assemble rows from the batched maps. ----
     let rows: Vec<Value> = stream::iter(entries.clone())
         .map(|entry| {
             let node = node.clone();
             let bal = balances.get(&entry.address).copied().unwrap_or(0);
             let utxo = utxo_info.get(&entry.address).copied();
+            let pending_map = pending_map.clone();
             async move {
                 let mut row = serde_json::json!({
                     "address": entry.address,
@@ -1298,16 +1321,19 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
                     }
                 }
                 if include_pending {
-                    if let Some(mp) = node.get_address_mempool_opt(&entry.address).await? {
+                    // Batch path: O(1) map lookup (absent address ⇒ no pending).
+                    // Fallback path (old node): per-address get_address_mempool.
+                    let pending = if let Some(map) = &pending_map {
+                        map.get(&entry.address.to_lowercase()).copied()
+                    } else {
+                        node.get_address_mempool_opt(&entry.address)
+                            .await?
+                            .map(|mp| (mp.pending_received(), mp.pending_spent()))
+                    };
+                    if let Some((pr, ps)) = pending {
                         let obj = row.as_object_mut().expect("row is an object");
-                        obj.insert(
-                            "pending_received".into(),
-                            serde_json::json!(mp.pending_received()),
-                        );
-                        obj.insert(
-                            "pending_spent".into(),
-                            serde_json::json!(mp.pending_spent()),
-                        );
+                        obj.insert("pending_received".into(), serde_json::json!(pr));
+                        obj.insert("pending_spent".into(), serde_json::json!(ps));
                     }
                 }
                 Ok::<Value, Error>(row)

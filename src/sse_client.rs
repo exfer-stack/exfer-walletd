@@ -61,6 +61,15 @@ const ADDRESS_RESCAN_INTERVAL: Duration = Duration::from_secs(15);
 /// unreachable so we fall back fast.
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Idle read timeout for an established stream. SSE is long-lived by
+/// design, so we must NOT impose a total-request timeout (that just caps
+/// every healthy stream and forces a needless reconnect). Instead bound
+/// the gap between reads: the node emits a `: heartbeat` comment every
+/// 25 s, so any silence beyond this means the connection is wedged and we
+/// reconnect. reqwest resets this on each successful read, so a healthy
+/// stream never trips it.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Internal broadcast capacity. Sized for ~1 minute of bursty mempool
 /// activity at one event per address change; slow consumers see
 /// `RecvError::Lagged` and can resync via the wallet's normal
@@ -219,7 +228,12 @@ impl SseClient {
     async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         let mut backoff = STREAM_BACKOFF_INITIAL;
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300)) // long for the read; we hand-rolled the connect timeout below
+            // No total-request timeout: an SSE stream is meant to live
+            // indefinitely. Bound the connect phase (also hand-rolled around
+            // `.send()` below) and use a read timeout to detect a *stalled*
+            // stream without capping a healthy one — see STREAM_READ_TIMEOUT.
+            .connect_timeout(PROBE_CONNECT_TIMEOUT)
+            .read_timeout(STREAM_READ_TIMEOUT)
             .build();
         let http = match http {
             Ok(c) => c,

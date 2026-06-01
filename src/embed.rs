@@ -71,6 +71,13 @@ pub struct ServerHandle {
     pub events: Arc<crate::sse_client::WalletEvents>,
     shutdown: CancellationToken,
     join: JoinHandle<anyhow::Result<()>>,
+    /// The block-follower task. Held so [`shutdown`](Self::shutdown) can
+    /// await its exit — the follower owns a clone of the wallet store, and
+    /// the datadir isn't free for an embedded restart until it drops.
+    follower_task: JoinHandle<()>,
+    /// The SSE push-client task. Also owns a clone of the wallet store, so
+    /// it must drain on shutdown for the datadir to be released.
+    sse_task: JoinHandle<()>,
 }
 
 impl ServerHandle {
@@ -84,10 +91,17 @@ impl ServerHandle {
     /// else cancelled the shutdown token, or the server errored).
     /// Returns whatever the server task returned.
     pub async fn wait(self) -> anyhow::Result<()> {
-        match self.join.await {
+        let r = match self.join.await {
             Ok(r) => r,
             Err(join_err) => Err(anyhow::anyhow!("walletd task join failed: {join_err}")),
-        }
+        };
+        // Also await the follower and SSE client so their holds on the wallet
+        // store are released before we return — an embedded restart reopens
+        // the same datadir immediately after, and redb won't grant a second
+        // handle while either task is still alive.
+        let _ = self.follower_task.await;
+        let _ = self.sse_task.await;
+        r
     }
 
     /// Cancel the shutdown token and wait for the server task to
@@ -177,16 +191,18 @@ pub async fn run_embedded(
     let node = Arc::new(node);
     let index = Arc::new(crate::index::Index::open(&datadir)?);
 
-    // Spawn the block follower. It runs forever (until the process
-    // exits); the returned `tip_rx` is what `wait_for_tx` will
-    // subscribe to.
+    // Spawn the block follower wired to the shutdown token. It must stop on
+    // shutdown (not "run until process exit") — otherwise, for an embedded
+    // restart, the old follower keeps polling and holding the wallet store,
+    // so the new instance can't reopen the datadir. `tip_rx` is what
+    // `wait_for_tx` will subscribe to.
     let (follower, tip_rx) = crate::follower::Follower::new(
         store.clone(),
         node.clone(),
         index.clone(),
         crate::follower::FollowerConfig::default(),
     );
-    let _follower_task = follower.spawn();
+    let follower_task = follower.spawn_with_shutdown(shutdown.clone());
 
     // Phase 2 SSE: connect to the upstream node's /sse push endpoint and
     // forward every script_changed / tip / resync nudge onto an
@@ -202,7 +218,7 @@ pub async fn run_embedded(
         node.clone(),
         events.clone(),
     );
-    let _sse_task = sse_client.spawn(sse_shutdown);
+    let sse_task = sse_client.spawn(sse_shutdown);
 
     // Optional indexer delegation — only lights up when --indexer-rpc
     // (or WALLETD_INDEXER_RPC) is set. Methods that need data outside
@@ -327,5 +343,7 @@ pub async fn run_embedded(
         events,
         shutdown,
         join,
+        follower_task,
+        sse_task,
     })
 }

@@ -51,6 +51,7 @@ use exfer::covenants::htlc::{
 };
 use exfer::types::transaction::Transaction;
 use tokio::sync::{watch, Mutex};
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 use crate::index::{FollowerMeta, Index};
@@ -140,12 +141,35 @@ impl Follower {
     /// exits. The returned `JoinHandle` is only useful for tests; in
     /// production the task lives for the lifetime of walletd.
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run().await })
+        // A token that is never cancelled = run forever (legacy behaviour
+        // for tests and callers that don't manage shutdown).
+        self.spawn_with_shutdown(CancellationToken::new())
+    }
+
+    /// Spawn the follower wired to a shutdown token. When the token is
+    /// cancelled the loop stops promptly and the task exits, releasing its
+    /// hold on the wallet store (and thus the datadir lock) — required so an
+    /// embedded restart can reopen the same datadir.
+    pub fn spawn_with_shutdown(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.run_until(shutdown).await })
     }
 
     /// Main loop. Tries to make forward progress each tick; never
     /// panics. Errors are logged at `warn` and the loop continues.
     pub async fn run(self: Arc<Self>) {
+        // Runs forever (token never cancelled). Kept for tests / callers
+        // that don't drive shutdown.
+        self.run_until(CancellationToken::new()).await
+    }
+
+    /// Like [`run`](Self::run) but stops as soon as `shutdown` is cancelled.
+    /// Cancellation is checked before each iteration and races the work +
+    /// sleep, so a cancel mid-tick aborts the in-flight (transactional) work
+    /// at its next await point rather than blocking shutdown.
+    pub async fn run_until(self: Arc<Self>, shutdown: CancellationToken) {
         if self.config.disabled {
             tracing::warn!("follower: disabled by config; nothing will be indexed");
             return;
@@ -155,17 +179,21 @@ impl Follower {
             self.config.poll_interval
         );
         loop {
-            if let Err(e) = self.refresh_owned().await {
-                tracing::warn!("follower: owned-key refresh failed: {e}");
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = async {
+                    if let Err(e) = self.refresh_owned().await {
+                        tracing::warn!("follower: owned-key refresh failed: {e}");
+                    }
+                    if let Err(e) = self.tick().await {
+                        tracing::warn!("follower: tick failed: {e}");
+                    }
+                    tokio::time::sleep(self.config.poll_interval).await;
+                } => {}
             }
-            match self.tick().await {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!("follower: tick failed: {e}");
-                }
-            }
-            tokio::time::sleep(self.config.poll_interval).await;
         }
+        tracing::info!("follower: stopped (shutdown)");
     }
 
     /// Refresh the in-memory owned-key cache from the wallet store.

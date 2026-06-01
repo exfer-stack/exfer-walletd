@@ -187,3 +187,43 @@ async fn rejects_empty_passphrase() {
         "unexpected error message: {msg}"
     );
 }
+
+/// Regression: a shutdown must fully release the datadir so an immediate
+/// re-boot on the SAME datadir succeeds. The block follower (and SSE
+/// client) used to outlive `shutdown()` — they held a clone of the wallet
+/// store, so the second `run_embedded` blocked on the redb datadir lock.
+/// The embedded node-switch path (stop -> start, e.g. set_node_rpc) depends
+/// on this working; before the fix it left walletd offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_reopens_same_datadir_after_shutdown() {
+    let dir = TempDir::new().unwrap();
+    let datadir = dir.path().to_path_buf();
+
+    // First boot, then shut down.
+    let h1 = run_embedded(
+        build_config(datadir.clone()),
+        "test-passphrase",
+        CancellationToken::new(),
+    )
+    .await
+    .expect("first boot should succeed");
+    h1.shutdown().await.expect("first shutdown should join");
+
+    // Second boot on the SAME datadir must succeed promptly. Bound it so a
+    // regression (the follower keeping the store open) surfaces as a clean
+    // timeout failure instead of hanging the whole suite.
+    let h2 = tokio::time::timeout(
+        Duration::from_secs(15),
+        run_embedded(
+            build_config(datadir.clone()),
+            "test-passphrase",
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("second boot must not hang on the datadir lock")
+    .expect("second boot should succeed");
+
+    assert_ne!(h2.local_addr.port(), 0);
+    h2.shutdown().await.expect("second shutdown should join");
+}

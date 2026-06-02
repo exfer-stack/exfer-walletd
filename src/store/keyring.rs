@@ -57,6 +57,30 @@ const IMPORTED_DIR: &str = "imported";
 const SEED_AAD: &[u8] = b"exfer-walletd/v1/seed";
 const IMPORTED_AAD: &[u8] = b"exfer-walletd/v1/imported";
 const VAULT_AAD: &[u8] = b"exfer-walletd/v1/vault";
+/// AAD for the sealed BIP-39 entropy stored next to a STANDARD address's key,
+/// so its standard recovery phrase can be revealed later.
+const MNEMONIC_AAD: &[u8] = b"exfer-walletd/v1/mnemonic";
+/// Sealed-mnemonic filename suffix: `imported/<addr>.mnemonic.enc`. Present
+/// only for standard addresses; absent for legacy/imported keys.
+const MNEMONIC_SUFFIX: &str = ".mnemonic.enc";
+/// Domain tag mixed with the BIP-39 seed to derive a STANDARD address's
+/// ed25519 secret. MUST stay byte-for-byte identical across every Exfer
+/// wallet (exfer.dev web, the apps) or the same phrase yields a different
+/// address. Verified against an exfer.dev test vector in the tests below.
+const STD_MNEMONIC_DOMAIN: &[u8] = b"EXFER-MNEMONIC-ED25519-V1";
+
+/// Standard scheme: `secret = SHA-256(STD_MNEMONIC_DOMAIN || BIP39_seed(phrase))`.
+/// The BIP-39 seed uses an empty passphrase (the keystore passphrase protects
+/// the entropy at rest, not the seed). One-way, so the entropy is sealed
+/// separately to make the phrase revealable.
+fn standard_secret_from_mnemonic(mnemonic: &Mnemonic) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let seed = mnemonic.to_seed("");
+    let mut h = Sha256::new();
+    h.update(STD_MNEMONIC_DOMAIN);
+    h.update(seed);
+    h.finalize().into()
+}
 
 // ============================================================================
 // Persisted state
@@ -633,6 +657,40 @@ impl WalletStore for KeyringStore {
         Ok((addr, pubkey_hex))
     }
 
+    fn create_standard(&self, label: Option<String>) -> Result<(String, String)> {
+        // Generate a real BIP-39 phrase and derive the key with the STANDARD
+        // scheme, so the same phrase reproduces this address in any Exfer
+        // wallet (exfer.dev, the apps). The key is stored like any imported
+        // key; the phrase's entropy is sealed alongside so it can be revealed.
+        let mnemonic = Mnemonic::generate_in(Language::English, 24)
+            .map_err(|e| Error::Internal(format!("mnemonic generation failed: {e}")))?;
+        let mut secret = Zeroizing::new(standard_secret_from_mnemonic(&mnemonic));
+        let signer = Signer::from_secret_bytes(&secret);
+        let pubkey_hex = hex::encode(signer.pubkey());
+        let addr = self.import(&secret, label)?;
+        secret.zeroize();
+
+        // Seal the 24-word phrase's entropy next to the key. Best-effort write:
+        // the address already works regardless; if this is missing, reveal just
+        // falls back to the legacy raw-key encoding.
+        let mut entropy = mnemonic.to_entropy();
+        let sealed = sealed::seal(&self.passphrase, MNEMONIC_AAD, &entropy);
+        entropy.zeroize();
+        match sealed {
+            Ok(blob) => {
+                let mpath = self
+                    .root
+                    .join(IMPORTED_DIR)
+                    .join(format!("{addr}{MNEMONIC_SUFFIX}"));
+                if let Err(e) = atomic_write_0600(&mpath, &blob) {
+                    tracing::warn!(error = %e, address = %addr, "could not store standard mnemonic");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, address = %addr, "could not seal standard mnemonic"),
+        }
+        Ok((addr, pubkey_hex))
+    }
+
     fn export_vault(&self, passphrase: &[u8]) -> Result<Vec<u8>> {
         // Whole keyring = the empty-selection case.
         self.export_selected(&[], passphrase)
@@ -682,10 +740,22 @@ impl WalletStore for KeyringStore {
     }
 
     fn reveal_address_mnemonic(&self, address_hex: &str, passphrase: &[u8]) -> Result<Vec<String>> {
-        // reveal_secret verifies the passphrase and that the address is
-        // managed (derived or imported), returning its raw 32-byte secret.
-        // A 32-byte secret is exactly 256-bit BIP-39 entropy = 24 words.
-        let secret = self.reveal_secret(address_hex, passphrase)?;
+        let addr = address_hex.to_ascii_lowercase();
+        // STANDARD address: return the sealed standard phrase, which re-derives
+        // this exact address in any Exfer wallet. A wrong passphrase fails the
+        // AES-GCM auth in `unseal`.
+        let mpath = self.root.join(IMPORTED_DIR).join(format!("{addr}{MNEMONIC_SUFFIX}"));
+        if mpath.exists() {
+            let blob = std::fs::read(&mpath)?;
+            let entropy = sealed::unseal(passphrase, MNEMONIC_AAD, &blob)?;
+            let mnemonic = Mnemonic::from_entropy(&entropy)
+                .map_err(|e| Error::Internal(format!("mnemonic from entropy: {e}")))?;
+            return Ok(mnemonic.words().map(|w| w.to_string()).collect());
+        }
+        // LEGACY / imported address (no stored phrase): the words encode the raw
+        // 32-byte key directly. `reveal_secret` verifies the passphrase and that
+        // the address is managed. Unchanged behaviour for pre-existing wallets.
+        let secret = self.reveal_secret(&addr, passphrase)?;
         let mnemonic = Mnemonic::from_entropy(secret.as_ref())
             .map_err(|e| Error::Internal(format!("mnemonic from key: {e}")))?;
         Ok(mnemonic.words().map(|w| w.to_string()).collect())
@@ -745,6 +815,15 @@ impl WalletStore for KeyringStore {
                 .join(format!("{address_hex}.key.enc"));
             if path.exists() {
                 std::fs::remove_file(&path)?;
+            }
+            // Drop the sealed standard mnemonic too (present only for standard
+            // addresses), so deleting an address leaves nothing behind.
+            let mpath = self
+                .root
+                .join(IMPORTED_DIR)
+                .join(format!("{address_hex}{MNEMONIC_SUFFIX}"));
+            if mpath.exists() {
+                let _ = std::fs::remove_file(&mpath);
             }
         }
         Ok(())
@@ -945,6 +1024,67 @@ mod tests {
         let hd_words = src.reveal_address_mnemonic(&hd, b"pw").unwrap();
         let hd_restored = dst.import_mnemonic(&hd_words.join(" "), None).unwrap();
         assert_eq!(hd_restored, hd);
+    }
+
+    // Ground truth from exfer.dev (the web wallet): the standard scheme on this
+    // public BIP-39 test phrase yields this exact address. If our standard
+    // derivation ever drifts from the rest of the ecosystem, this fails.
+    #[test]
+    fn standard_scheme_matches_exfer_dev_vector() {
+        let phrase = format!("{}art", "abandon ".repeat(23));
+        let m = Mnemonic::parse_in(Language::English, phrase.trim()).unwrap();
+        let secret = standard_secret_from_mnemonic(&m);
+        let addr = Signer::from_secret_bytes(&secret).address_hex();
+        assert_eq!(
+            addr,
+            "f74919726a8c38fff716258f85e0a569abaf9add9717d5ac8106eaca51ff3073"
+        );
+    }
+
+    #[test]
+    fn standard_address_reveals_standard_phrase() {
+        let dir = temp();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = store.take_fresh_mnemonic();
+
+        let (addr, _pubkey) = store.create_standard(Some("std".into())).unwrap();
+
+        // Reveal returns the STANDARD phrase (not the legacy raw-key encoding),
+        // and that phrase re-derives the same address under the standard scheme.
+        let words = store.reveal_address_mnemonic(&addr, b"pw").unwrap();
+        assert_eq!(words.len(), 24);
+        let m = Mnemonic::parse_in(Language::English, &words.join(" ")).unwrap();
+        let redrived = Signer::from_secret_bytes(&standard_secret_from_mnemonic(&m)).address_hex();
+        assert_eq!(redrived, addr, "standard phrase must reproduce the address");
+
+        // Wrong passphrase must not reveal.
+        assert!(store.reveal_address_mnemonic(&addr, b"nope").is_err());
+
+        // Importing that standard phrase as a RAW key (legacy) would land on a
+        // DIFFERENT address — proving reveal returned the standard form.
+        let dst_dir = temp();
+        let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"x").unwrap();
+        let _ = dst.take_fresh_mnemonic();
+        let legacy_addr = dst.import_mnemonic(&words.join(" "), None).unwrap();
+        assert_ne!(legacy_addr, addr);
+    }
+
+    #[test]
+    fn legacy_address_still_reveals_raw_key_phrase() {
+        // Backward compatibility: an independent (legacy) address has no sealed
+        // standard mnemonic, so reveal falls back to the raw-key encoding and
+        // re-imports to the SAME address — exactly as before this change.
+        let dir = temp();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = store.take_fresh_mnemonic();
+        let (addr, _) = store.create_independent(None).unwrap();
+        let words = store.reveal_address_mnemonic(&addr, b"pw").unwrap();
+
+        let dst_dir = temp();
+        let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"x").unwrap();
+        let _ = dst.take_fresh_mnemonic();
+        let restored = dst.import_mnemonic(&words.join(" "), None).unwrap();
+        assert_eq!(restored, addr);
     }
 
     #[test]

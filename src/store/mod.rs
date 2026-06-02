@@ -141,6 +141,18 @@ pub trait WalletStore: Send + Sync + 'static {
     /// Returns `(address_hex, pubkey_hex)`.
     fn create_independent(&self, label: Option<String>) -> Result<(String, String)>;
 
+    /// Generate a fresh address using the STANDARD BIP-39 scheme: a random
+    /// 24-word phrase whose key is `SHA-256("EXFER-MNEMONIC-ED25519-V1" ||
+    /// BIP39_seed(phrase))`, with the phrase's entropy sealed alongside so it
+    /// can be revealed later. The same phrase reproduces this exact address in
+    /// any Exfer wallet. This is the default for new addresses; the legacy
+    /// `create_independent` (raw random key) stays for backward compatibility.
+    /// Default impl falls back to `create_independent` for stores that don't
+    /// implement the standard scheme. Returns `(address_hex, pubkey_hex)`.
+    fn create_standard(&self, label: Option<String>) -> Result<(String, String)> {
+        self.create_independent(label)
+    }
+
     /// Seal every managed key (HD-derived re-derived + imported) into one
     /// passphrase-encrypted vault blob — a single-file backup of the whole
     /// wallet that doesn't hinge on a single mnemonic. `passphrase` is

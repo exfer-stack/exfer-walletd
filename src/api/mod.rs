@@ -305,6 +305,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- generate / list (wrapper-only) ----
         "generate_address" => generate_address(state, req.params).await,
         "generate_independent_address" => generate_independent_address(state, req.params).await,
+        "generate_standard_address" => generate_standard_address(state, req.params).await,
         "import_private_key" => import_private_key(state, req.params).await,
         "export_vault" => export_vault(state, req.params).await,
         "import_vault" => import_vault(state, req.params).await,
@@ -440,6 +441,26 @@ async fn generate_independent_address(state: &ApiState, params: Value) -> Result
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     tracing::info!(address = %address, "generated independent (1:1) address");
+    Ok(serde_json::json!({ "address": address, "pubkey": pubkey, "imported": true }))
+}
+
+/// `generate_standard_address` — the DEFAULT for new addresses. A fresh 1:1
+/// address derived from a random standard BIP-39 phrase (matches exfer.dev /
+/// the apps); its phrase is sealed so it can be revealed and re-imported to the
+/// same address anywhere. Manage-scoped, like the other generators.
+async fn generate_standard_address(state: &ApiState, params: Value) -> Result<Value> {
+    let p: GenerateAddressParams = if params.is_null() {
+        GenerateAddressParams::default()
+    } else {
+        serde_json::from_value(params)
+            .map_err(|e| Error::BadParams(format!("generate_standard_address params: {e}")))?
+    };
+    let store = state.store.clone();
+    let label = p.label.clone();
+    let (address, pubkey) = tokio::task::spawn_blocking(move || store.create_standard(label))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::info!(address = %address, "generated standard (BIP-39) address");
     Ok(serde_json::json!({ "address": address, "pubkey": pubkey, "imported": true }))
 }
 

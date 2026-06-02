@@ -76,6 +76,7 @@ impl Scope {
             | "delete_address" => Scope::Spend,
             "generate_address"
             | "generate_independent_address"
+            | "generate_standard_address"
             | "import_private_key"
             | "import_mnemonic"
             | "abandon_transfer"

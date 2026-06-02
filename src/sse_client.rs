@@ -225,6 +225,12 @@ impl SseClient {
         ))
     }
 
+    // `backoff` is reset to the initial value on every (re)connect (line ~293)
+    // and grown on each stream break; some of those resets/grows are the last
+    // write before a reset on the next loop turn, which the dataflow lint reads
+    // as a dead store. The exponential-backoff intent is deliberate — suppress
+    // the lint here rather than change reconnect behaviour.
+    #[allow(unused_assignments)]
     async fn run(self: Arc<Self>, shutdown: CancellationToken) {
         let mut backoff = STREAM_BACKOFF_INITIAL;
         let http = reqwest::Client::builder()

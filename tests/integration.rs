@@ -43,7 +43,8 @@ fn make_state_with_retry(
         index,
         tip_rx,
         indexer: None,
-        events: exfer_walletd::sse_client::WalletEvents::new(),    };
+        events: exfer_walletd::sse_client::WalletEvents::new(),
+    };
     (state, wallet_dir)
 }
 
@@ -53,6 +54,24 @@ fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
         method: method.into(),
         params,
         id: Some(json!(1)),
+    }
+}
+
+/// Make the upstream behave like a node that predates the batch query
+/// methods: `get_balances` / `get_address_utxos_batch` answer JSON-RPC
+/// -32601 so the `_opt` wrappers return `None` and `get_wallet_balance`
+/// falls back to the per-address calls these tests mount.
+async fn mount_batch_unsupported(mock: &MockServer) {
+    for m in ["get_balances", "get_address_utxos_batch"] {
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({ "method": m })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "error":   { "code": -32601, "message": "method not found" },
+                "id": 1
+            })))
+            .mount(mock)
+            .await;
     }
 }
 
@@ -1307,6 +1326,8 @@ async fn get_wallet_balance_aggregates_per_address() {
         .mount(&mock)
         .await;
 
+    mount_batch_unsupported(&mock).await;
+
     let result = dispatch(&state, rpc("get_wallet_balance", json!({})))
         .await
         .unwrap();
@@ -1341,6 +1362,8 @@ async fn get_wallet_balance_skips_utxos_when_disabled() {
         })))
         .mount(&mock)
         .await;
+
+    mount_batch_unsupported(&mock).await;
 
     let result = dispatch(&state, rpc("get_wallet_balance", json!({ "utxos": false })))
         .await
@@ -1384,6 +1407,8 @@ async fn get_wallet_balance_filters_to_given_addresses() {
         })))
         .mount(&mock)
         .await;
+
+    mount_batch_unsupported(&mock).await;
 
     let result = dispatch(
         &state,

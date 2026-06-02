@@ -126,7 +126,8 @@ async fn wait_for_payment_returns_on_sse_nudge() {
     let store: Arc<dyn WalletStore> = Arc::new(store);
 
     let node = Arc::new(
-        ExferNode::with_retry_policy(node_url, Duration::from_secs(5), RetryPolicy::none()).unwrap(),
+        ExferNode::with_retry_policy(node_url, Duration::from_secs(5), RetryPolicy::none())
+            .unwrap(),
     );
 
     // Real event bus + real SSE client feeding it from the mock node.
@@ -149,7 +150,8 @@ async fn wait_for_payment_returns_on_sse_nudge() {
         index,
         tip_rx,
         indexer: None,
-        events,    };
+        events,
+    };
 
     let req = RpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -159,16 +161,29 @@ async fn wait_for_payment_returns_on_sse_nudge() {
     };
 
     let started = Instant::now();
-    let out = dispatch(&state, req).await.expect("wait_for_payment dispatch");
+    let out = dispatch(&state, req)
+        .await
+        .expect("wait_for_payment dispatch");
     let elapsed = started.elapsed();
 
     shutdown.cancel();
 
-    assert_eq!(out["received"], json!(true), "should observe the credit: {out}");
+    assert_eq!(
+        out["received"],
+        json!(true),
+        "should observe the credit: {out}"
+    );
     assert_eq!(out["tx_id"], json!(PAY_TXID), "tx_id mismatch: {out}");
     assert_eq!(out["amount"], json!(PAY_AMOUNT), "amount mismatch: {out}");
-    assert_eq!(out["confirmations"], json!(0), "mempool credit is 0-conf: {out}");
+    assert_eq!(
+        out["confirmations"],
+        json!(0),
+        "mempool credit is 0-conf: {out}"
+    );
     // It returned via an SSE nudge well inside the 15 s budget (the tip
     // channel never ticked, so this is the push path, not polling).
-    assert!(elapsed < Duration::from_secs(10), "took too long: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "took too long: {elapsed:?}"
+    );
 }

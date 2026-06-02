@@ -671,7 +671,7 @@ impl WalletStore for KeyringStore {
             let secret = Zeroizing::new(signer.signing_key().to_bytes());
             keys.push(serde_json::json!({
                 "address": e.address,
-                "secret_hex": hex::encode(&*secret),
+                "secret_hex": hex::encode(*secret),
                 "label": e.label,
             }));
         }
@@ -901,7 +901,7 @@ mod tests {
         let row = dst.list().unwrap();
         assert_eq!(
             row.iter()
-                .find(|e| &e.address == &a)
+                .find(|e| e.address == a)
                 .unwrap()
                 .label
                 .as_deref(),

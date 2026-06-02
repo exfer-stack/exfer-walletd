@@ -31,7 +31,8 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
         index,
         tip_rx,
         indexer: None,
-        events: exfer_walletd::sse_client::WalletEvents::new(),    };
+        events: exfer_walletd::sse_client::WalletEvents::new(),
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -166,7 +167,8 @@ async fn boot_scoped(
         index,
         tip_rx,
         indexer: None,
-        events: exfer_walletd::sse_client::WalletEvents::new(),    };
+        events: exfer_walletd::sse_client::WalletEvents::new(),
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app_state = exfer_walletd::server::build_app_state_for_tests_scoped(
@@ -324,7 +326,8 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
         index,
         tip_rx,
         indexer: None,
-        events: exfer_walletd::sse_client::WalletEvents::new(),    };
+        events: exfer_walletd::sse_client::WalletEvents::new(),
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app_state = exfer_walletd::server::build_app_state_for_tests(api, None);

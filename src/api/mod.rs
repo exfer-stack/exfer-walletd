@@ -1385,25 +1385,26 @@ async fn get_wallet_balance(state: &ApiState, params: Value) -> Result<Value> {
     //      costs a SINGLE scan-rate slot for the whole wallet instead of one
     //      per address. A node predating the batch method answers -32601 →
     //      `None` → fall back to the per-address fan-out in the row loop. ----
-    let pending_map: Option<
-        std::sync::Arc<std::collections::HashMap<String, (u64, u64)>>,
-    > = if !include_pending || addresses.is_empty() {
-        None
-    } else {
-        node.get_address_mempool_batch_opt(&addresses).await?.map(|b| {
-            std::sync::Arc::new(
-                b.addresses
-                    .into_iter()
-                    .map(|e| {
-                        (
-                            e.address.to_lowercase(),
-                            (e.pending_received(), e.pending_spent()),
-                        )
-                    })
-                    .collect(),
-            )
-        })
-    };
+    let pending_map: Option<std::sync::Arc<std::collections::HashMap<String, (u64, u64)>>> =
+        if !include_pending || addresses.is_empty() {
+            None
+        } else {
+            node.get_address_mempool_batch_opt(&addresses)
+                .await?
+                .map(|b| {
+                    std::sync::Arc::new(
+                        b.addresses
+                            .into_iter()
+                            .map(|e| {
+                                (
+                                    e.address.to_lowercase(),
+                                    (e.pending_received(), e.pending_spent()),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+        };
 
     // ---- Assemble rows from the batched maps. ----
     let rows: Vec<Value> = stream::iter(entries.clone())
@@ -1638,9 +1639,8 @@ mod tests {
     // split between claimers (walletd) and resolvers (indexer).
     #[test]
     fn name_script_matches_indexer_vector() {
-        let want =
-            hex::decode("dbbce120c1d1bc12cba5ed500e1fe9c4b67ae92ec4349d3d847f01d74e711dcd")
-                .unwrap();
+        let want = hex::decode("dbbce120c1d1bc12cba5ed500e1fe9c4b67ae92ec4349d3d847f01d74e711dcd")
+            .unwrap();
         for n in ["alice", "Alice", "  ALICE  "] {
             assert_eq!(name_script(n).to_vec(), want, "mismatch for {n:?}");
         }

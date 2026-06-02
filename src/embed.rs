@@ -213,11 +213,7 @@ pub async fn run_embedded(
     // poll-interval-bounded (2 s) to network-RTT-bounded.
     let events = crate::sse_client::WalletEvents::new();
     let sse_shutdown = shutdown.clone();
-    let sse_client = crate::sse_client::SseClient::new(
-        store.clone(),
-        node.clone(),
-        events.clone(),
-    );
+    let sse_client = crate::sse_client::SseClient::new(store.clone(), node.clone(), events.clone());
     let sse_task = sse_client.spawn(sse_shutdown);
 
     // Optional indexer delegation — only lights up when --indexer-rpc

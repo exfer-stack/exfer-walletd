@@ -480,8 +480,14 @@ async fn wait_for_payment_inner(
 
     let mut bus_alive = true;
     loop {
-        if let Some(seen) =
-            detect_payment(state, &address, &baseline_txids, baseline_balance, min_amount).await?
+        if let Some(seen) = detect_payment(
+            state,
+            &address,
+            &baseline_txids,
+            baseline_balance,
+            min_amount,
+        )
+        .await?
         {
             return Ok(serde_json::json!({
                 "address": address,

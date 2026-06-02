@@ -1070,6 +1070,110 @@ mod tests {
     }
 
     #[test]
+    fn mixed_wallet_old_and_new_addresses_all_behave() {
+        // A long-time user's wallet: legacy independent + HD addresses, an OLD
+        // phrase imported from another wallet, a raw key imported from a
+        // wallet.key, and NEW standard addresses — all mixed in one keystore.
+        // Every kind must reveal + round-trip to the RIGHT address, survive a
+        // reopen, and not disturb the others.
+        let std_addr_of = |phrase: &str| {
+            let m = Mnemonic::parse_in(Language::English, phrase).unwrap();
+            Signer::from_secret_bytes(&standard_secret_from_mnemonic(&m)).address_hex()
+        };
+        let legacy_addr_of = |phrase: &str| {
+            let m = Mnemonic::parse_in(Language::English, phrase).unwrap();
+            let mut e = [0u8; 32];
+            e.copy_from_slice(&m.to_entropy());
+            Signer::from_secret_bytes(&e).address_hex()
+        };
+
+        let dir = temp();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = store.take_fresh_mnemonic();
+
+        // (1) legacy independent (old "new address")
+        let (legacy_ind, _) = store.create_independent(Some("ind".into())).unwrap();
+        // (2) HD-derived (old generate_address)
+        let hd = store.create(Some("hd".into())).unwrap().address;
+        // (3) an OLD phrase exported from a DIFFERENT wallet, imported here
+        let other_dir = temp();
+        let other = KeyringStore::open_or_init_fresh(other_dir.path(), b"o").unwrap();
+        let _ = other.take_fresh_mnemonic();
+        let (other_addr, _) = other.create_independent(None).unwrap();
+        let old_phrase = other.reveal_address_mnemonic(&other_addr, b"o").unwrap().join(" ");
+        let imported_phrase = store.import_mnemonic(&old_phrase, Some("imp-phrase".into())).unwrap();
+        assert_eq!(imported_phrase, other_addr, "old phrase reproduces its address");
+        // (4) a raw private key imported (e.g. a wallet.key)
+        let raw = [0x11u8; 32];
+        let imported_key = store.import(&raw, Some("imp-key".into())).unwrap();
+        assert_eq!(imported_key, Signer::from_secret_bytes(&raw).address_hex());
+        // (5) two NEW standard addresses
+        let (std_a, _) = store.create_standard(Some("std-a".into())).unwrap();
+        let (std_b, _) = store.create_standard(Some("std-b".into())).unwrap();
+        assert_ne!(std_a, std_b);
+
+        // --- standard addresses reveal the STANDARD phrase (re-derives the
+        //     same address under the standard scheme; legacy interp differs) ---
+        for std in [&std_a, &std_b] {
+            let p = store.reveal_address_mnemonic(std, b"pw").unwrap().join(" ");
+            assert_eq!(std_addr_of(&p), *std, "standard phrase → standard address");
+            assert_ne!(legacy_addr_of(&p), *std, "legacy interp must differ");
+        }
+
+        // --- legacy/imported addresses reveal the legacy (raw-key) phrase
+        //     (round-trips as legacy; standard interp differs) ---
+        for leg in [&legacy_ind, &hd, &imported_phrase, &imported_key] {
+            let p = store.reveal_address_mnemonic(leg, b"pw").unwrap().join(" ");
+            assert_eq!(legacy_addr_of(&p), *leg, "legacy phrase → same address");
+            assert_ne!(std_addr_of(&p), *leg, "standard interp must differ");
+        }
+        // the imported old phrase reveals EXACTLY what was imported
+        assert_eq!(
+            store.reveal_address_mnemonic(&imported_phrase, b"pw").unwrap().join(" "),
+            old_phrase
+        );
+
+        // --- persistence: reopen the keystore, behaviour is identical ---
+        let std_a_phrase = store.reveal_address_mnemonic(&std_a, b"pw").unwrap();
+        drop(store);
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        assert_eq!(store.reveal_address_mnemonic(&std_a, b"pw").unwrap(), std_a_phrase);
+        assert_eq!(std_addr_of(&std_a_phrase.join(" ")), std_a);
+        // legacy still legacy after reopen
+        let li = store.reveal_address_mnemonic(&legacy_ind, b"pw").unwrap().join(" ");
+        assert_eq!(legacy_addr_of(&li), legacy_ind);
+
+        // --- wrong passphrase fails for both kinds ---
+        assert!(store.reveal_address_mnemonic(&std_a, b"nope").is_err());
+        assert!(store.reveal_address_mnemonic(&legacy_ind, b"nope").is_err());
+
+        // --- vault backup/restore preserves every address (the key), so funds
+        //     are safe; a restored standard address reverts to the legacy
+        //     reveal because the vault carries raw keys, not sealed phrases ---
+        let vault = store.export_vault(b"pw").unwrap();
+        let v_dir = temp();
+        let vstore = KeyringStore::open_or_init_fresh(v_dir.path(), b"v2").unwrap();
+        let _ = vstore.take_fresh_mnemonic();
+        vstore.import_vault(&vault, b"pw").unwrap();
+        let restored: std::collections::BTreeSet<String> =
+            vstore.list().unwrap().into_iter().map(|e| e.address).collect();
+        for a in [&legacy_ind, &hd, &imported_phrase, &imported_key, &std_a, &std_b] {
+            assert!(restored.contains(a), "vault must restore {a}");
+        }
+        // restored standard address → same address, legacy reveal now
+        let rp = vstore.reveal_address_mnemonic(&std_a, b"v2").unwrap().join(" ");
+        assert_eq!(legacy_addr_of(&rp), std_a);
+
+        // --- delete a standard address removes its sealed mnemonic file ---
+        store.delete(&std_b, b"pw").unwrap();
+        let mpath = dir.path().join("imported").join(format!("{std_b}.mnemonic.enc"));
+        assert!(!mpath.exists(), "deleting must drop the sealed mnemonic");
+        let live: std::collections::BTreeSet<String> =
+            store.list().unwrap().into_iter().map(|e| e.address).collect();
+        assert!(!live.contains(&std_b) && live.contains(&std_a));
+    }
+
+    #[test]
     fn legacy_address_still_reveals_raw_key_phrase() {
         // Backward compatibility: an independent (legacy) address has no sealed
         // standard mnemonic, so reveal falls back to the raw-key encoding and

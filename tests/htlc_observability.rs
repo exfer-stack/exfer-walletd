@@ -41,7 +41,7 @@ fn make_ctx(mock_uri: String) -> Ctx {
         index: index.clone(),
         tip_rx,
         indexer: None,
-    };
+        events: exfer_walletd::sse_client::WalletEvents::new(),    };
     Ctx { state, dir, index }
 }
 

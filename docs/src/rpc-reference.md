@@ -929,6 +929,56 @@ as "not yet visible" — `wait_for_tx` keeps waiting up to the timeout.
 
 ---
 
+### `wait_for_payment`
+
+| | |
+|---|---|
+| **Scope** | read |
+
+Blocks until a **new** credit to `address` is observed, then returns
+immediately. The fast path wakes on the in-process push bus fed by the
+node's `/sse` endpoint — a `script_changed` nudge arrives within a
+network RTT of the paying transaction hitting the node's mempool, so an
+agent learns "I was paid" sub-second, with no polling. When the node has
+no `/sse` (pre-1.12) the method falls back to waking on each follower tip
+advance.
+
+Returns as soon as the payment is **seen in the mempool** (0
+confirmations) — this is a liveness/receipt signal, *not* settlement
+finality. Pair it with [`wait_for_tx`](#wait_for_tx) when you need the
+credit buried to a confirmation depth.
+
+**Params**
+
+| Field          | Type  | Required | Default | Description |
+| -------------- | ----- | -------- | ------- | ----------- |
+| `address`      | hex64 | yes      |         | The address (script) to watch for incoming credit. |
+| `min_amount`   | u64   | no       | `1`     | Only report a credit of at least this many exfers. |
+| `timeout_secs` | u64   | no       | `60`    | Max wait, capped at `600`. |
+
+**Returns** — on a credit:
+
+```ts
+{
+  address:       hex64,
+  received:      true,
+  timed_out:     false,
+  tx_id:         hex64 | null,  // null when detected via a confirmed-balance delta
+  amount:        u64,           // value of the new credit
+  confirmations: u64,           // 0 = mempool-seen, ≥1 = already confirmed
+  tip_height:    u64,
+}
+```
+
+On timeout (a quiet window — a normal outcome for a watcher, not an
+error):
+
+```ts
+{ address: hex64, received: false, timed_out: true, waited_secs: u64 }
+```
+
+---
+
 ## Payment URI codec (v1.9)
 
 Pure functions — no upstream calls, no key access. Round-trip

@@ -334,6 +334,195 @@ async fn wait_for_tx_inner(state: &ApiState, tx_id: String, min_confs: u32) -> R
 }
 
 // ---------------------------------------------------------------------------
+// wait_for_payment
+// ---------------------------------------------------------------------------
+
+/// Maximum permitted `timeout_secs` for `wait_for_payment`. Above this the
+/// API clamps the request rather than rejecting it.
+pub const WAIT_FOR_PAYMENT_MAX_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Debug, Deserialize)]
+pub struct WaitForPaymentParams {
+    /// 64-hex address (script) to watch for incoming credit.
+    pub address: String,
+    /// Only report a credit whose value is at least this many exfers.
+    /// Defaults to 1 (any non-zero credit).
+    #[serde(default = "default_min_amount")]
+    pub min_amount: u64,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_min_amount() -> u64 {
+    1
+}
+
+/// Block until a *new* credit to `address` is observed, or `timeout_secs`
+/// elapses. The fast path wakes on the in-process `WalletEvents` bus (a
+/// `Script` nudge arrives within a network RTT of the paying tx hitting the
+/// node's mempool when the node's `/sse` push is connected); the fallback
+/// wakes on each follower tip advance. Returns as soon as the payment is
+/// *seen* in the mempool (0 confirmations) — pair with `wait_for_tx` for
+/// settlement finality.
+///
+/// A quiet window is a normal outcome for a watcher, not an error: on
+/// timeout this returns `{received: false, timed_out: true}` so an agent
+/// can simply call again.
+pub async fn wait_for_payment_method(state: &ApiState, params: Value) -> Result<Value> {
+    let p: WaitForPaymentParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("wait_for_payment params: {e}")))?;
+    ensure_64_hex(&p.address)?;
+    let timeout_secs = p.timeout_secs.min(WAIT_FOR_PAYMENT_MAX_TIMEOUT_SECS);
+
+    let work = wait_for_payment_inner(state, p.address.clone(), p.min_amount);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), work).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(serde_json::json!({
+            "address": p.address,
+            "received": false,
+            "timed_out": true,
+            "waited_secs": timeout_secs,
+        })),
+    }
+}
+
+/// A credit observed for the watched address.
+struct PaymentSeen {
+    tx_id: Option<String>,
+    amount: u64,
+    confirmed: bool,
+    tip_height: u64,
+}
+
+/// Snapshot the address's current incoming state so only *new* credit is
+/// reported. Returns (mempool received tx_ids, confirmed balance).
+async fn payment_baseline(
+    state: &ApiState,
+    address: &str,
+) -> Result<(std::collections::HashSet<String>, u64)> {
+    let mut seen = std::collections::HashSet::new();
+    if let Some(m) = state.node.get_address_mempool_opt(address).await? {
+        for tx in &m.mempool {
+            if !tx.received.is_empty() {
+                seen.insert(tx.tx_id.clone());
+            }
+        }
+    }
+    let balance = state.node.get_balance(address).await?.balance;
+    Ok((seen, balance))
+}
+
+/// Detect a credit absent at baseline. A new mempool tx paying this address
+/// is the sub-second path; a confirmed-balance increase is the fallback for
+/// nodes without `get_address_mempool` or payments that land straight in a
+/// block.
+async fn detect_payment(
+    state: &ApiState,
+    address: &str,
+    baseline_txids: &std::collections::HashSet<String>,
+    baseline_balance: u64,
+    min_amount: u64,
+) -> Result<Option<PaymentSeen>> {
+    let mempool = state.node.get_address_mempool_opt(address).await?;
+    if let Some(m) = &mempool {
+        for tx in &m.mempool {
+            if tx.received.is_empty() || baseline_txids.contains(&tx.tx_id) {
+                continue;
+            }
+            let amount: u64 = tx.received.iter().map(|r| r.value).sum();
+            if amount >= min_amount {
+                return Ok(Some(PaymentSeen {
+                    tx_id: Some(tx.tx_id.clone()),
+                    amount,
+                    confirmed: false,
+                    tip_height: m.tip_height,
+                }));
+            }
+        }
+    }
+    let balance = state.node.get_balance(address).await?.balance;
+    if balance > baseline_balance {
+        let delta = balance - baseline_balance;
+        if delta >= min_amount {
+            let tip_height = mempool
+                .as_ref()
+                .map(|m| m.tip_height)
+                .unwrap_or_else(|| *state.tip_rx.borrow());
+            return Ok(Some(PaymentSeen {
+                tx_id: None,
+                amount: delta,
+                confirmed: true,
+                tip_height,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+async fn wait_for_payment_inner(
+    state: &ApiState,
+    address: String,
+    min_amount: u64,
+) -> Result<Value> {
+    use crate::sse_client::WalletNudge;
+    use tokio::sync::broadcast::error::RecvError;
+
+    // The 32-byte script we match `Script` nudges against. `ensure_64_hex`
+    // already guaranteed this decodes to 32 bytes.
+    let target = hex::decode(&address).ok();
+
+    // Subscribe before snapshotting so a payment landing in the gap still
+    // wakes us.
+    let mut rx = state.events.subscribe();
+    let mut tip_rx = state.tip_rx.clone();
+    let (baseline_txids, baseline_balance) = payment_baseline(state, &address).await?;
+
+    let mut bus_alive = true;
+    loop {
+        if let Some(seen) =
+            detect_payment(state, &address, &baseline_txids, baseline_balance, min_amount).await?
+        {
+            return Ok(serde_json::json!({
+                "address": address,
+                "received": true,
+                "timed_out": false,
+                "tx_id": seen.tx_id,
+                "amount": seen.amount,
+                "confirmations": if seen.confirmed { 1 } else { 0 },
+                "tip_height": seen.tip_height,
+            }));
+        }
+
+        // Wait for the next *relevant* wake-up: a matching script nudge, a
+        // tip advance, or a resync. Other addresses' nudges are ignored
+        // without re-querying.
+        loop {
+            tokio::select! {
+                r = rx.recv(), if bus_alive => match r {
+                    Ok(WalletNudge::Script(s)) => {
+                        if target.as_deref() == Some(s.as_slice()) {
+                            break;
+                        }
+                    }
+                    Ok(WalletNudge::Tip(_)) | Ok(WalletNudge::Resync) => break,
+                    Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => bus_alive = false,
+                },
+                c = tip_rx.changed() => {
+                    if c.is_err() {
+                        return Err(Error::Internal(
+                            "wait_for_payment: follower channel closed".into(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

@@ -250,6 +250,7 @@ pub async fn run_embedded(
         index,
         tip_rx,
         indexer,
+        events: events.clone(),
     };
     let app_state = AppState {
         api,

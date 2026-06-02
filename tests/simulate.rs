@@ -31,7 +31,7 @@ fn make_state(node_url: String, wallet_dir: tempfile::TempDir) -> (ApiState, tem
         index,
         tip_rx,
         indexer: None,
-    };
+        events: exfer_walletd::sse_client::WalletEvents::new(),    };
     (state, wallet_dir)
 }
 

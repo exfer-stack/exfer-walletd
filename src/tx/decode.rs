@@ -89,6 +89,13 @@ pub struct DecodedOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script_hex: Option<String>,
     pub value: u64,
+    /// Hex-encoded datum carried by this output (a generic, app-defined
+    /// on-chain blob), if any. Surfaced verbatim — meaning is the app's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datum: Option<String>,
+    /// Hex-encoded datum hash commitment, if the output carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datum_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,7 +125,7 @@ pub async fn decode_with_inputs(node: &ExferNode, tx_hex: &str) -> Result<Decode
     let outputs: Vec<DecodedOutput> = tx
         .outputs
         .iter()
-        .map(|o| decoded_output(&o.script, o.value))
+        .map(|o| decoded_output(&o.script, o.value, &o.datum, &o.datum_hash))
         .collect();
     let total_out: u64 = outputs.iter().map(|o| o.value).sum();
 
@@ -257,12 +264,19 @@ async fn resolve_input(
     Some((address, script_hex, out.value))
 }
 
-fn decoded_output(script: &[u8], value: u64) -> DecodedOutput {
+fn decoded_output(
+    script: &[u8],
+    value: u64,
+    datum: &Option<Vec<u8>>,
+    datum_hash: &Option<exfer::types::Hash256>,
+) -> DecodedOutput {
     let (address, script_hex) = address_or_script(script);
     DecodedOutput {
         address,
         script_hex,
         value,
+        datum: datum.as_ref().map(hex::encode),
+        datum_hash: datum_hash.as_ref().map(|h| hex::encode(h.as_bytes())),
     }
 }
 
@@ -329,7 +343,7 @@ mod tests {
         let outs: Vec<DecodedOutput> = tx
             .outputs
             .iter()
-            .map(|o| decoded_output(&o.script, o.value))
+            .map(|o| decoded_output(&o.script, o.value, &o.datum, &o.datum_hash))
             .collect();
 
         assert_eq!(outs.len(), 2);
@@ -343,12 +357,27 @@ mod tests {
     #[test]
     fn non_p2pkh_output_falls_back_to_script_hex() {
         let weird = vec![0x11; 17];
-        let out = decoded_output(&weird, 5);
+        let out = decoded_output(&weird, 5, &None, &None);
         assert!(out.address.is_none());
         assert_eq!(
             out.script_hex.as_deref(),
             Some("1111111111111111111111111111111111")
         );
         assert_eq!(out.value, 5);
+    }
+
+    #[test]
+    fn datum_is_surfaced_verbatim() {
+        let with = decoded_output(
+            &[0xbb; 32],
+            1_000,
+            &Some(vec![0xde, 0xad, 0xbe, 0xef]),
+            &None,
+        );
+        assert_eq!(with.datum.as_deref(), Some("deadbeef"));
+        assert!(with.datum_hash.is_none());
+
+        let without = decoded_output(&[0xbb; 32], 1_000, &None, &None);
+        assert!(without.datum.is_none());
     }
 }

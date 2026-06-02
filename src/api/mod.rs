@@ -158,6 +158,13 @@ pub struct TransferParams {
     /// 8..=128 ASCII chars.
     #[serde(default)]
     pub client_token: Option<String>,
+    /// Optional datum (hex): a generic, app-defined on-chain blob carried
+    /// by the payment, attached to the primary (first) recipient output.
+    /// The chain validates only size (<= MAX_DATUM_SIZE = 4096 bytes);
+    /// the meaning of the bytes is entirely the application's. Read it
+    /// back with `get_output_datum`.
+    #[serde(default)]
+    pub datum: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -694,17 +701,35 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
 
+    // ---- optional datum: a generic app-defined blob on the payment ----
+    let recipient_datum: Option<Vec<u8>> = match p.datum.as_deref() {
+        None => None,
+        Some(h) => {
+            let b = hex::decode(h).map_err(|e| Error::BadHex(e.to_string()))?;
+            if b.len() > exfer::types::MAX_DATUM_SIZE {
+                return Err(Error::BadParams(format!(
+                    "datum is {} bytes, exceeds MAX_DATUM_SIZE {}",
+                    b.len(),
+                    exfer::types::MAX_DATUM_SIZE
+                )));
+            }
+            Some(b)
+        }
+    };
+
     // ---- run, possibly through the idempotency cache -----------------
     let receipt: std::sync::Arc<TransferReceipt> = match p.client_token.as_deref() {
         Some(token) => {
             let fingerprint = fingerprint_transfer(&p, &fee_choice, max_fee);
             let recipients_for_run = recipients.clone();
+            let datum_for_run = recipient_datum.clone();
             state
                 .idempotency
                 .get_or_run(token, fingerprint, move || async move {
                     crate::tx::transfer(
                         &signer,
                         recipients_for_run,
+                        datum_for_run,
                         fee_choice,
                         max_fee,
                         &state.node,
@@ -718,6 +743,7 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
             let r = crate::tx::transfer(
                 &signer,
                 recipients,
+                recipient_datum,
                 fee_choice,
                 max_fee,
                 &state.node,
@@ -743,6 +769,9 @@ fn fingerprint_transfer(p: &TransferParams, fee_choice: &FeeChoice, max_fee: u64
         o.to.to_ascii_lowercase().hash(&mut h);
         o.amount.hash(&mut h);
     }
+    // A different datum yields a different transfer, so it must change the
+    // idempotency fingerprint too.
+    p.datum.as_deref().map(str::to_ascii_lowercase).hash(&mut h);
     match fee_choice {
         FeeChoice::Absolute(f) => (0u8, *f).hash(&mut h),
         FeeChoice::Rate(r) => (1u8, *r).hash(&mut h),

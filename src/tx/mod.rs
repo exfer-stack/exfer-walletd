@@ -168,6 +168,7 @@ pub struct SimulateTransferReceipt {
 pub async fn transfer(
     signer: &Signer,
     recipients: Vec<(Hash256, u64)>,
+    datum: Option<Vec<u8>>,
     fee_choice: FeeChoice,
     max_fee: u64,
     node: &ExferNode,
@@ -186,7 +187,8 @@ pub async fn transfer(
         })
         .collect();
 
-    let core = build_sign_broadcast(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    let core =
+        build_sign_broadcast(signer, outputs, datum, fee_choice, max_fee, node, inflight).await?;
 
     let mut outputs_receipt: Vec<ReceiptOutput> = recipients
         .iter()
@@ -253,7 +255,10 @@ pub async fn simulate_transfer(
         })
         .collect();
 
-    let (built, _guard) = build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    // simulate ignores datum (its only effect is a few cost-units of size);
+    // a dry-run fee estimate stays accurate enough without it.
+    let (built, _guard) =
+        build_only(signer, outputs, None, fee_choice, max_fee, node, inflight).await?;
     // Dropping `_guard` releases the inflight UTXO reservation — the
     // simulated build was a snapshot, not a commitment.
 
@@ -309,12 +314,14 @@ pub async fn simulate_transfer(
 pub(crate) async fn build_sign_broadcast(
     signer: &Signer,
     outputs: Vec<CoreOutput>,
+    datum: Option<Vec<u8>>,
     fee_choice: FeeChoice,
     max_fee: u64,
     node: &ExferNode,
     inflight: &InFlightUtxos,
 ) -> Result<CoreReceipt> {
-    let (built, guard) = build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    let (built, guard) =
+        build_only(signer, outputs, datum, fee_choice, max_fee, node, inflight).await?;
     broadcast_built(node, &built).await?;
     guard.commit();
     Ok(CoreReceipt {
@@ -345,6 +352,7 @@ pub(crate) async fn build_sign_broadcast(
 pub(crate) async fn build_only<'a>(
     signer: &Signer,
     outputs: Vec<CoreOutput>,
+    datum: Option<Vec<u8>>,
     fee_choice: FeeChoice,
     max_fee: u64,
     node: &ExferNode,
@@ -472,6 +480,15 @@ pub(crate) async fn build_only<'a>(
             datum_hash: None,
         })
         .collect();
+
+    // Attach the optional datum to the primary (first) recipient output —
+    // a generic, app-defined on-chain blob carried by the payment. The
+    // chain validates only size (<= MAX_DATUM_SIZE); meaning is the app's.
+    if let Some(d) = datum {
+        if let Some(first) = tx_outputs.first_mut() {
+            first.datum = Some(d);
+        }
+    }
 
     // Placeholder change so the cost model includes it.
     tx_outputs.push(TxOutput {

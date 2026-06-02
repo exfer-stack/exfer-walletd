@@ -102,7 +102,8 @@ pub async fn htlc_lock(
         script,
         value: amount,
     }];
-    let core = build_sign_broadcast(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    let core =
+        build_sign_broadcast(signer, outputs, None, fee_choice, max_fee, node, inflight).await?;
 
     Ok(HtlcLockReceipt {
         tx_id: core.tx_id_hex,
@@ -145,7 +146,8 @@ pub async fn simulate_htlc_lock(
         script,
         value: amount,
     }];
-    let (built, _guard) = build_only(signer, outputs, fee_choice, max_fee, node, inflight).await?;
+    let (built, _guard) =
+        build_only(signer, outputs, None, fee_choice, max_fee, node, inflight).await?;
     let total_in: u64 = built.selected.iter().map(|(_, v)| v).sum();
     Ok(SimulateHtlcLockReceipt {
         size: built.size,

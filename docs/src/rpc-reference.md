@@ -389,6 +389,7 @@ Build, sign, and broadcast a multi-output payment.
 | `fee`         | u64                                           | no       | Absolute fee in exfers. Mutually exclusive with `fee_rate`. |
 | `max_fee`     | u64                                           | no       | Cap; default **2_000_000** (0.02 EXFER). |
 | `client_token`| string (8..=128 ASCII)                        | no       | Idempotency key. |
+| `datum`       | hex (≤ 4096 bytes)                            | no       | Generic app-defined on-chain blob attached to the primary (first) recipient output. The chain validates only size; meaning is the application's. Read it back from `get_transaction` (`outputs[].datum`). |
 
 Defaults: if neither `fee` nor `fee_rate` is set, `fee_rate=1`
 (consensus minimum). Fee is always floored at `consensus::cost::min_fee`

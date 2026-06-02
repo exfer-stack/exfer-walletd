@@ -186,6 +186,17 @@ pub trait WalletStore: Send + Sync + 'static {
     /// → `WalletAlreadyExists`; not 24 words → `BadParams`.
     fn import_mnemonic(&self, phrase: &str, label: Option<String>) -> Result<String>;
 
+    /// Import a 24-word STANDARD BIP-39 phrase (key = SHA-256(domain ||
+    /// BIP39_seed)), reproducing the same address as exfer.dev / the apps, and
+    /// seal the phrase so reveal returns it. Distinct from `import_mnemonic`,
+    /// which treats the words as a raw-key (legacy) encoding. Default impl
+    /// rejects; keyring stores override it.
+    fn import_standard_mnemonic(&self, _phrase: &str, _label: Option<String>) -> Result<String> {
+        Err(crate::error::Error::BadParams(
+            "standard mnemonic import is not supported by this store".into(),
+        ))
+    }
+
     /// Permanently remove an address from the keystore. `passphrase` is
     /// verified first. For an independent/imported key this deletes the
     /// sealed key file (the secret is gone unless separately backed up);

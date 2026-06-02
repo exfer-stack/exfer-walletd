@@ -79,6 +79,7 @@ impl Scope {
             | "generate_standard_address"
             | "import_private_key"
             | "import_mnemonic"
+            | "import_standard_mnemonic"
             | "abandon_transfer"
             | "htlc_forget" => Scope::Manage,
             _ => Scope::Read,

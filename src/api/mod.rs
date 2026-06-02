@@ -311,6 +311,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "import_vault" => import_vault(state, req.params).await,
         "export_address" => export_address(state, req.params).await,
         "import_mnemonic" => import_mnemonic(state, req.params).await,
+        "import_standard_mnemonic" => import_standard_mnemonic(state, req.params).await,
         "delete_address" => delete_address(state, req.params).await,
         "list_addresses" => list_addresses(state).await,
 
@@ -607,6 +608,23 @@ async fn import_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
     tracing::info!(address = %address, "imported address from recovery phrase");
+    Ok(serde_json::json!({ "address": address, "imported": true }))
+}
+
+/// `import_standard_mnemonic` — import a STANDARD phrase to the same address it
+/// has elsewhere (exfer.dev / the apps), sealing the phrase so it reveals back.
+/// Use for standard phrases; `import_mnemonic` is the legacy raw-key path.
+async fn import_standard_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ImportMnemonicParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("import_standard_mnemonic params: {e}")))?;
+    let store = state.store.clone();
+    let label = p.label.clone();
+    let phrase = p.mnemonic.clone();
+    let address =
+        tokio::task::spawn_blocking(move || store.import_standard_mnemonic(&phrase, label))
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::info!(address = %address, "imported address from standard recovery phrase");
     Ok(serde_json::json!({ "address": address, "imported": true }))
 }
 

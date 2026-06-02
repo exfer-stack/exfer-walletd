@@ -82,6 +82,29 @@ fn standard_secret_from_mnemonic(mnemonic: &Mnemonic) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Seal a standard address's phrase entropy at `imported/<addr>.mnemonic.enc`,
+/// so reveal can return the standard phrase. Best-effort: the address works
+/// regardless; without this, reveal falls back to the legacy raw-key encoding.
+fn seal_standard_mnemonic(
+    root: &std::path::Path,
+    passphrase: &[u8],
+    addr: &str,
+    mnemonic: &Mnemonic,
+) {
+    let mut entropy = mnemonic.to_entropy();
+    let sealed = sealed::seal(passphrase, MNEMONIC_AAD, &entropy);
+    entropy.zeroize();
+    match sealed {
+        Ok(blob) => {
+            let mpath = root.join(IMPORTED_DIR).join(format!("{addr}{MNEMONIC_SUFFIX}"));
+            if let Err(e) = atomic_write_0600(&mpath, &blob) {
+                tracing::warn!(error = %e, address = %addr, "could not store standard mnemonic");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, address = %addr, "could not seal standard mnemonic"),
+    }
+}
+
 // ============================================================================
 // Persisted state
 // ============================================================================
@@ -669,25 +692,7 @@ impl WalletStore for KeyringStore {
         let pubkey_hex = hex::encode(signer.pubkey());
         let addr = self.import(&secret, label)?;
         secret.zeroize();
-
-        // Seal the 24-word phrase's entropy next to the key. Best-effort write:
-        // the address already works regardless; if this is missing, reveal just
-        // falls back to the legacy raw-key encoding.
-        let mut entropy = mnemonic.to_entropy();
-        let sealed = sealed::seal(&self.passphrase, MNEMONIC_AAD, &entropy);
-        entropy.zeroize();
-        match sealed {
-            Ok(blob) => {
-                let mpath = self
-                    .root
-                    .join(IMPORTED_DIR)
-                    .join(format!("{addr}{MNEMONIC_SUFFIX}"));
-                if let Err(e) = atomic_write_0600(&mpath, &blob) {
-                    tracing::warn!(error = %e, address = %addr, "could not store standard mnemonic");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, address = %addr, "could not seal standard mnemonic"),
-        }
+        seal_standard_mnemonic(&self.root, &self.passphrase, &addr, &mnemonic);
         Ok((addr, pubkey_hex))
     }
 
@@ -778,6 +783,26 @@ impl WalletStore for KeyringStore {
         let r = self.import(&secret, label);
         secret.zeroize();
         r
+    }
+
+    fn import_standard_mnemonic(&self, phrase: &str, label: Option<String>) -> Result<String> {
+        // Re-import a STANDARD phrase to the SAME address it has in any Exfer
+        // wallet, and seal the phrase so reveal returns it (symmetric with
+        // create_standard / a standard reveal). Use this for phrases produced
+        // by the standard scheme; `import_mnemonic` stays for legacy raw-key
+        // phrases.
+        let mnemonic = Mnemonic::parse_in(Language::English, phrase.trim())
+            .map_err(|e| Error::BadParams(format!("invalid recovery phrase: {e}")))?;
+        if mnemonic.to_entropy().len() != 32 {
+            return Err(Error::BadParams(
+                "recovery phrase must be 24 words (256-bit)".into(),
+            ));
+        }
+        let mut secret = Zeroizing::new(standard_secret_from_mnemonic(&mnemonic));
+        let addr = self.import(&secret, label)?;
+        secret.zeroize();
+        seal_standard_mnemonic(&self.root, &self.passphrase, &addr, &mnemonic);
+        Ok(addr)
     }
 
     fn delete(&self, address_hex: &str, passphrase: &[u8]) -> Result<()> {
@@ -1171,6 +1196,35 @@ mod tests {
         let live: std::collections::BTreeSet<String> =
             store.list().unwrap().into_iter().map(|e| e.address).collect();
         assert!(!live.contains(&std_b) && live.contains(&std_a));
+    }
+
+    #[test]
+    fn standard_phrase_round_trips_via_import_standard_mnemonic() {
+        // Symmetry: a standard phrase revealed here re-imports to the SAME
+        // address (and seals so it reveals back), while importing it as legacy
+        // lands elsewhere.
+        let dir = temp();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = store.take_fresh_mnemonic();
+        let (addr, _) = store.create_standard(Some("s".into())).unwrap();
+        let phrase = store.reveal_address_mnemonic(&addr, b"pw").unwrap().join(" ");
+
+        let dst_dir = temp();
+        let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"x").unwrap();
+        let _ = dst.take_fresh_mnemonic();
+        let restored = dst.import_standard_mnemonic(&phrase, None).unwrap();
+        assert_eq!(restored, addr, "standard import reproduces the address");
+        assert_eq!(
+            dst.reveal_address_mnemonic(&restored, b"x").unwrap().join(" "),
+            phrase,
+            "imported standard phrase reveals back the same phrase"
+        );
+
+        let dst2_dir = temp();
+        let dst2 = KeyringStore::open_or_init_fresh(dst2_dir.path(), b"y").unwrap();
+        let _ = dst2.take_fresh_mnemonic();
+        let as_legacy = dst2.import_mnemonic(&phrase, None).unwrap();
+        assert_ne!(as_legacy, addr, "same phrase as legacy lands elsewhere");
     }
 
     #[test]

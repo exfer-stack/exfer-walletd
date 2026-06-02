@@ -309,10 +309,6 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- transfer (wrapper-only) ----
         "transfer" => transfer_method(state, req.params).await,
 
-        // ---- naming (first-burn-owns; resolve is indexer-delegated) ----
-        "name_script" => name_script_method(req.params).await,
-        "name_claim" => name_claim_method(state, req.params).await,
-
         // ---- htlc lifecycle (wrapper-only) ----
         "htlc_lock" => htlc_lock_method(state, req.params).await,
         "htlc_claim" => htlc_claim_method(state, req.params).await,
@@ -350,7 +346,6 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "detect_in_chain_swaps" => {
             proxy_to_indexer(state, "detect_in_chain_swaps", req.params).await
         }
-        "resolve_name" => proxy_to_indexer(state, "resolve_name", req.params).await,
         "htlc_lookup_by_hashlock" => {
             proxy_to_indexer(state, "htlc_lookup_by_hashlock", req.params).await
         }
@@ -769,95 +764,6 @@ async fn load_signer(state: &ApiState, address_hex: &str) -> Result<crate::store
     tokio::task::spawn_blocking(move || store.load_by_address(&from))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))?
-}
-
-// ---------------------------------------------------------------------------
-// naming — first-burn-owns name registry (resolution lives in the indexer)
-// ---------------------------------------------------------------------------
-
-/// Domain-separated burn-script for a name. A name is claimed by being the
-/// first to send value to this 32-byte script (unspendable ⇒ effective
-/// burn). MUST stay byte-identical to the indexer's `name_script`.
-fn name_script(name: &str) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"EXFER-NAME-v1:");
-    h.update(name.trim().to_lowercase().as_bytes());
-    let mut s = [0u8; 32];
-    s.copy_from_slice(&h.finalize());
-    s
-}
-
-#[derive(Debug, Deserialize)]
-struct NameParam {
-    name: String,
-}
-
-/// Pure: derive the burn-script a name maps to (no upstream call).
-async fn name_script_method(params: Value) -> Result<Value> {
-    let p: NameParam = serde_json::from_value(params)
-        .map_err(|e| Error::BadParams(format!("name_script params: {e}")))?;
-    Ok(serde_json::json!({
-        "name": p.name,
-        "script": hex::encode(name_script(&p.name)),
-    }))
-}
-
-fn default_name_claim_amount() -> u64 {
-    1000
-}
-
-/// Value of the optional pointer output (a real, tiny payment to the
-/// declared target that doubles as the on-chain "points-to" declaration).
-const NAME_POINTER_AMOUNT: u64 = 1000;
-
-#[derive(Debug, Deserialize)]
-struct NameClaimParams {
-    name: String,
-    from: String,
-    /// Value burned to the name's script — this is the *bid*. Ownership is
-    /// the highest cumulative burn, so a bigger amount buys more standing.
-    #[serde(default = "default_name_claim_amount")]
-    amount: u64,
-    /// Optional: the address the name should point to. Omit (or set to
-    /// `from`) to point the name at yourself. Encoded as an extra output.
-    #[serde(default)]
-    target: Option<String>,
-    #[serde(default)]
-    fee: Option<u64>,
-}
-
-/// Claim (or out-bid for) a name by burning `amount` to its derived script
-/// via a normal transfer. Ownership goes to
-/// the highest cumulative burner; a `target` declares where the name
-/// points (default: `from`). Resolve with `resolve_name`.
-async fn name_claim_method(state: &ApiState, params: Value) -> Result<Value> {
-    let p: NameClaimParams = serde_json::from_value(params)
-        .map_err(|e| Error::BadParams(format!("name_claim params: {e}")))?;
-    ensure_64_hex(&p.from)?;
-    let script_hex = hex::encode(name_script(&p.name));
-
-    let mut outputs = vec![serde_json::json!({ "to": script_hex, "amount": p.amount })];
-    // Declare a pointer to a *different* address with an extra output. A
-    // pointer to `from` is the default (no extra output needed).
-    if let Some(ref target) = p.target {
-        ensure_64_hex(target)?;
-        if !target.eq_ignore_ascii_case(&p.from) {
-            outputs.push(serde_json::json!({ "to": target, "amount": NAME_POINTER_AMOUNT }));
-        }
-    }
-
-    let mut transfer_params = serde_json::json!({ "from": p.from, "outputs": outputs });
-    if let Some(f) = p.fee {
-        transfer_params["fee"] = serde_json::json!(f);
-    }
-    let receipt = transfer_method(state, transfer_params).await?;
-    Ok(serde_json::json!({
-        "name": p.name,
-        "script": script_hex,
-        "target": p.target,
-        "transfer": receipt,
-    }))
 }
 
 async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
@@ -1633,18 +1539,6 @@ fn ensure_hex(s: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    // MUST match the indexer's `name_script` test vector. If either side
-    // changes the derivation, both tests fail and the name registry would
-    // split between claimers (walletd) and resolvers (indexer).
-    #[test]
-    fn name_script_matches_indexer_vector() {
-        let want = hex::decode("dbbce120c1d1bc12cba5ed500e1fe9c4b67ae92ec4349d3d847f01d74e711dcd")
-            .unwrap();
-        for n in ["alice", "Alice", "  ALICE  "] {
-            assert_eq!(name_script(n).to_vec(), want, "mismatch for {n:?}");
-        }
-    }
 
     #[test]
     fn utxo_status_classification_priority() {

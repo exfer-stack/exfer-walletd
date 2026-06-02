@@ -73,9 +73,7 @@ impl Scope {
             | "export_address"
             | "import_vault"
             // Deletion is destructive and can strand funds.
-            | "delete_address"
-            // Claiming a name burns value via a transfer.
-            | "name_claim" => Scope::Spend,
+            | "delete_address" => Scope::Spend,
             "generate_address"
             | "generate_independent_address"
             | "import_private_key"

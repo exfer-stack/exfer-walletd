@@ -18,6 +18,5 @@
 # Operating
 
 - [Security model](./security-model.md)
-- [Names (highest-burn registry)](./naming.md)
 - [Backup, upgrade, rotate](./operations.md)
 - [FAQ & troubleshooting](./faq.md)

@@ -67,6 +67,20 @@ rustls-pemfile   = "2"
 sha2             = "0.10"
 time             = "0.3"
 
+# BSC / EVM cross-chain swap leg. secp256k1 BIP-32 derivation (m/44'/60'/0'/0/0)
+# from the same HD seed as the EXFER ed25519 keys, plus alloy for EIP-1559 tx
+# signing + ABI encoding. We deliberately avoid alloy's provider/transport stack
+# and talk to BSC over the existing reqwest client to keep the mobile
+# cross-compile lean.
+bip32            = "0.5"
+alloy = { version = "1.0", default-features = false, features = [
+    "consensus",
+    "eips",
+    "signers",
+    "signer-local",
+    "sol-types",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"

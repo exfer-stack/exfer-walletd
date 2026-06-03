@@ -56,6 +56,8 @@ pub mod auth;
 pub mod config;
 pub mod embed;
 pub mod error;
+pub mod evm;
+pub mod swap;
 pub mod follower;
 pub mod idempotency;
 pub mod index;

@@ -126,6 +126,23 @@ pub trait WalletStore: Send + Sync + 'static {
     /// derived and imported addresses.
     fn load_by_address(&self, address_hex: &str) -> Result<Signer>;
 
+    /// Derive the wallet's canonical BSC/EVM secp256k1 secret key (BIP-32
+    /// path `m/44'/60'/0'/0/0`) from the HD seed — the same 64-byte BIP-39
+    /// seed the EXFER ed25519 keys come from, so the resulting BSC address is
+    /// reproducible from the user's mnemonic (and importable into MetaMask).
+    /// Errors on a seedless keyring. Used only by the cross-chain swap engine;
+    /// the secret never leaves the daemon.
+    fn evm_secret(&self) -> Result<zeroize::Zeroizing<[u8; 32]>>;
+
+    /// Seal arbitrary auxiliary data (the pending-swap journal) with the
+    /// keystore passphrase + caller-chosen AAD. Same Argon2id + ChaCha20-Poly1305
+    /// scheme as the seed, so swap secrets (preimages) live at the same security
+    /// bar as private keys.
+    fn seal_aux(&self, aad: &[u8], payload: &[u8]) -> Result<Vec<u8>>;
+
+    /// Inverse of [`seal_aux`]. Wrong passphrase / tampered blob → error.
+    fn unseal_aux(&self, aad: &[u8], blob: &[u8]) -> Result<Vec<u8>>;
+
     /// Enumerate every known address (derived + imported), sorted by
     /// derivation index ascending (imported addresses appended).
     fn list(&self) -> Result<Vec<AddressEntry>>;

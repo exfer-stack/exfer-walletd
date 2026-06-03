@@ -598,6 +598,34 @@ impl WalletStore for KeyringStore {
         Ok(signer)
     }
 
+    fn evm_secret(&self) -> Result<Zeroizing<[u8; 32]>> {
+        let seed = self.seed.as_ref().ok_or_else(|| {
+            Error::BadParams(
+                "cross-chain swap requires a seeded wallet (no seed.enc present)".into(),
+            )
+        })?;
+        // BIP-32 secp256k1 derivation at the standard Ethereum path. Uses the
+        // same 64-byte BIP-39 seed the ed25519 keys derive from, so this BSC
+        // address matches what MetaMask shows for the user's mnemonic.
+        let path: bip32::DerivationPath = "m/44'/60'/0'/0/0"
+            .parse()
+            .map_err(|e| Error::Internal(format!("bad EVM derivation path: {e}")))?;
+        let xprv = bip32::XPrv::derive_from_path(&seed[..], &path)
+            .map_err(|e| Error::Internal(format!("EVM key derivation failed: {e}")))?;
+        let fb = xprv.private_key().to_bytes();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(fb.as_slice());
+        Ok(Zeroizing::new(bytes))
+    }
+
+    fn seal_aux(&self, aad: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+        sealed::seal(&self.passphrase[..], aad, payload)
+    }
+
+    fn unseal_aux(&self, aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
+        sealed::unseal(&self.passphrase[..], aad, blob)
+    }
+
     fn list(&self) -> Result<Vec<AddressEntry>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 

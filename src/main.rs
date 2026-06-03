@@ -39,6 +39,17 @@ enum Subcmd {
         #[arg(long, env = "WALLETD_LEGACY_PASSPHRASE")]
         legacy_passphrase: Option<String>,
     },
+
+    /// Initialise a SEEDED keystore (writes `seed.enc`) from a 24-word phrase
+    /// — required for the cross-chain swap engine, whose BSC key derives from
+    /// the HD seed. Generates a fresh phrase if `--mnemonic` is omitted, makes
+    /// one standard EXFER address, and prints the phrase + EXFER + BSC
+    /// addresses. Needs `WALLETD_KEYSTORE_PASSPHRASE`.
+    InitSeeded {
+        /// 24-word recovery phrase to seed from. Omit to generate a fresh one.
+        #[arg(long)]
+        mnemonic: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -61,7 +72,48 @@ async fn main() -> anyhow::Result<()> {
             from,
             legacy_passphrase,
         }) => run_migrate(cli.config, &from, legacy_passphrase.as_deref()),
+        Some(Subcmd::InitSeeded { mnemonic }) => run_init_seeded(cli.config, mnemonic),
     }
+}
+
+fn run_init_seeded(cfg: Config, mnemonic: Option<String>) -> anyhow::Result<()> {
+    use bip39::{Language, Mnemonic};
+    let passphrase = std::env::var("WALLETD_KEYSTORE_PASSPHRASE").unwrap_or_default();
+    if passphrase.is_empty() {
+        anyhow::bail!("WALLETD_KEYSTORE_PASSPHRASE is required to seed the keystore.");
+    }
+    let phrase = match mnemonic {
+        Some(p) => p,
+        None => {
+            let mut rng = rand::thread_rng();
+            Mnemonic::generate_in_with(&mut rng, Language::English, 24)
+                .map_err(|e| anyhow::anyhow!("generate mnemonic: {e}"))?
+                .to_string()
+        }
+    };
+    let wallet_dir = cfg.resolved_wallet_dir();
+    KeyringStore::init_from_mnemonic(&wallet_dir, passphrase.as_bytes(), &phrase)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let store = KeyringStore::open_keyring(&wallet_dir, passphrase.as_bytes())
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let (exfer_addr, _pubkey) = store
+        .create_standard(Some("primary".into()))
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let secret = store
+        .evm_secret()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let bsc_addr =
+        exfer_walletd::evm::evm_address(&secret).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "mnemonic": phrase,
+            "exfer_address": exfer_addr,
+            "bsc_address": bsc_addr,
+            "wallet_dir": wallet_dir.display().to_string(),
+        })
+    );
+    Ok(())
 }
 
 fn run_migrate(

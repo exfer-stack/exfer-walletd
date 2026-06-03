@@ -37,6 +37,28 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Parse a human USDT amount (≤18 dp) into 18-decimal smallest units.
+fn parse_units_18(s: &str) -> Result<alloy::primitives::U256> {
+    let s = s.trim();
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if (whole.is_empty() && frac.is_empty())
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !frac.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(Error::BadParams("amount must be a decimal number".into()));
+    }
+    if frac.len() > 18 {
+        return Err(Error::BadParams("USDT has at most 18 decimals".into()));
+    }
+    let mut combined = String::from(whole);
+    combined.push_str(frac);
+    for _ in frac.len()..18 {
+        combined.push('0');
+    }
+    alloy::primitives::U256::from_str_radix(&combined, 10)
+        .map_err(|e| Error::BadParams(format!("bad amount: {e}")))
+}
+
 /// AAD binding the sealed journal to its purpose (domain separation from the
 /// seed/vault blobs).
 const JOURNAL_AAD: &[u8] = b"exfer-walletd/v1/swap-journal";
@@ -473,6 +495,30 @@ impl SwapEngine {
             Err(_) => alloy::primitives::U256::ZERO,
         };
         Ok((bnb.to_string(), usdt.to_string()))
+    }
+
+    /// Withdraw USDT from the derived BSC address to an external wallet
+    /// (MetaMask / exchange). `amount_human` is in USDT (18 dp on BSC); empty
+    /// or "max" sends the whole balance. Needs BNB for gas. Returns the tx hash.
+    pub async fn send_usdt(&self, to: &str, amount_human: &str) -> Result<String> {
+        let secret = self.store.evm_secret()?;
+        let addr = secret_address(&secret)?;
+        let token = self
+            .bsc_usdt
+            .parse::<alloy::primitives::Address>()
+            .map_err(|e| Error::Internal(format!("bad USDT token address: {e}")))?;
+        let amount = if amount_human.trim().is_empty() || amount_human.eq_ignore_ascii_case("max") {
+            self.evm.erc20_balance(token, addr).await?
+        } else {
+            parse_units_18(amount_human)?
+        };
+        if amount.is_zero() {
+            return Err(Error::BadParams("nothing to send (zero USDT)".into()));
+        }
+        let _guard = self.bsc_lock.lock().await;
+        self.evm
+            .erc20_transfer(&secret, &self.bsc_usdt, to, amount)
+            .await
     }
 
     /// Quote + reserve a swap. Generates the preimage (kept secret), persists a

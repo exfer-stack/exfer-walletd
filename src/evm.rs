@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 
 sol! {
     function approve(address spender, uint256 value) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
     function balanceOf(address owner) external view returns (uint256);
     function lock(bytes32 hashlock, address recipient, address token, uint256 amount, uint64 timeoutSec) external;
     function claim(bytes32 preimage) external;
@@ -308,6 +309,23 @@ impl EvmClient {
         let data = approveCall {
             spender: parse_address(spender)?,
             value: U256::MAX,
+        }
+        .abi_encode();
+        self.send_call(secret, parse_address(token)?, data).await
+    }
+
+    /// `transfer(to, amount)` on a BEP-20 token — withdraw the derived address's
+    /// tokens (e.g. USDT received from a sell) to an external wallet.
+    pub async fn erc20_transfer(
+        &self,
+        secret: &[u8; 32],
+        token: &str,
+        to: &str,
+        amount: U256,
+    ) -> Result<String> {
+        let data = transferCall {
+            to: parse_address(to)?,
+            value: amount,
         }
         .abi_encode();
         self.send_call(secret, parse_address(token)?, data).await

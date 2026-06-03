@@ -87,3 +87,18 @@ pub async fn bsc_get_balances(state: &ApiState) -> Result<Value> {
     let (bnb, usdt) = engine(state)?.bsc_balances().await?;
     Ok(serde_json::json!({ "bnb_wei": bnb, "usdt_units": usdt }))
 }
+
+#[derive(Deserialize)]
+struct SendUsdtParams {
+    to: String,
+    /// USDT amount (≤18 dp). Empty or "max" sends the whole balance.
+    #[serde(default)]
+    amount: String,
+}
+
+pub async fn bsc_send_usdt(state: &ApiState, params: Value) -> Result<Value> {
+    let p: SendUsdtParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_send_usdt params: {e}")))?;
+    let txhash = engine(state)?.send_usdt(&p.to, &p.amount).await?;
+    Ok(serde_json::json!({ "txhash": txhash }))
+}

@@ -34,6 +34,7 @@ pub mod htlc;
 pub mod payment_uri;
 pub mod signmsg;
 pub mod simulate;
+pub mod swap;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -61,6 +62,9 @@ pub struct ApiState {
     /// subscribes to it for sub-second inbound-credit detection, falling
     /// back to the follower tip channel when SSE is unavailable.
     pub events: Arc<crate::sse_client::WalletEvents>,
+    /// Cross-chain swap engine (EXFER↔USDT). `Some` only when `--swap-pool`
+    /// is configured; the `swap_*` / `bsc_*` RPCs return `-32602` otherwise.
+    pub engine: Option<Arc<crate::swap::SwapEngine>>,
 }
 
 // ============================================================================
@@ -326,6 +330,15 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- dry-run cost simulation ----
         "simulate_transfer" => simulate::simulate_transfer_method(state, req.params).await,
         "simulate_htlc_lock" => simulate::simulate_htlc_lock_method(state, req.params).await,
+
+        // ---- cross-chain swap (EXFER ↔ USDT-BSC), needs --swap-pool ----
+        "swap_get_quote" => swap::swap_get_quote(state, req.params).await,
+        "swap_execute" => swap::swap_execute(state, req.params).await,
+        "swap_refund" => swap::swap_refund(state, req.params).await,
+        "swap_status" => swap::swap_status(state, req.params).await,
+        "swap_list" => swap::swap_list(state).await,
+        "bsc_get_address" => swap::bsc_get_address(state).await,
+        "bsc_get_balances" => swap::bsc_get_balances(state).await,
 
         // ---- payment URI codec (pure) ----
         "payment_uri_encode" => payment_uri::payment_uri_encode(req.params).await,

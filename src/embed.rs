@@ -238,15 +238,45 @@ pub async fn run_embedded(
         None => None,
     };
 
+    let inflight = Arc::new(InFlightUtxos::new());
+
+    // Cross-chain swap engine — only when --swap-pool is configured. Opens the
+    // encrypted journal (recovering any in-flight swaps) and spawns the monitor
+    // that advances them to settlement / timeout-refund.
+    let engine = match cfg.swap_pool_url.clone() {
+        Some(pool_url) => {
+            let journal = Arc::new(crate::swap::Journal::open(&wallet_dir, store.clone())?);
+            let eng = Arc::new(crate::swap::SwapEngine::new(
+                store.clone(),
+                node.clone(),
+                inflight.clone(),
+                indexer.clone(),
+                journal,
+                crate::swap::EngineConfig {
+                    pool_url,
+                    bsc_rpc_url: cfg.bsc_rpc_url.clone(),
+                    bsc_chain_id: cfg.bsc_chain_id,
+                },
+            ));
+            let mon = eng.clone();
+            let mon_shutdown = shutdown.clone();
+            tokio::spawn(async move { crate::swap::run_monitor(mon, mon_shutdown).await });
+            tracing::info!(chain_id = cfg.bsc_chain_id, "swap engine enabled");
+            Some(eng)
+        }
+        None => None,
+    };
+
     let api = ApiState {
         store,
         node,
-        inflight: Arc::new(InFlightUtxos::new()),
+        inflight,
         idempotency: Arc::new(crate::idempotency::IdempotencyCache::new()),
         index,
         tip_rx,
         indexer,
         events: events.clone(),
+        engine,
     };
     let app_state = AppState {
         api,

@@ -18,12 +18,24 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::evm::{evm_address, EvmClient};
+use crate::indexer::IndexerClient;
+use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
+use crate::upstream::ExferNode;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// AAD binding the sealed journal to its purpose (domain separation from the
 /// seed/vault blobs).
@@ -208,7 +220,7 @@ impl Journal {
             .values()
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|r| std::cmp::Reverse(r.created_at));
         v
     }
 
@@ -222,6 +234,638 @@ impl Journal {
             .cloned()
             .collect()
     }
+}
+
+// ───────────────────────── pool client ─────────────────────────
+
+/// HTTP client for the exfer-pool market-maker bot.
+#[derive(Clone)]
+pub struct PoolClient {
+    http: reqwest::Client,
+    base_url: String,
+}
+
+#[derive(Deserialize)]
+struct BscInstr {
+    #[serde(rename = "htlcContract")]
+    htlc_contract: String,
+    #[serde(rename = "usdtToken")]
+    usdt_token: String,
+    recipient: String,
+    #[serde(rename = "timeoutSec")]
+    timeout_sec: u64,
+}
+
+#[derive(Deserialize)]
+struct ExferInstr {
+    #[serde(rename = "receiverPubkey")]
+    receiver_pubkey: String,
+    #[serde(rename = "timeoutHeight")]
+    timeout_height: u64,
+}
+
+#[derive(Deserialize)]
+struct Instructions {
+    #[serde(default)]
+    bsc: Option<BscInstr>,
+    #[serde(default)]
+    exfer: Option<ExferInstr>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteResp {
+    swap_id: String,
+    amount_in: String,
+    amount_out: String,
+    amount_in_units: String,
+    amount_out_units: String,
+    expires_at: u64,
+    instructions: Instructions,
+}
+
+impl PoolClient {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    async fn quote(
+        &self,
+        direction: Direction,
+        amount_in_human: &str,
+        hashlock: &str,
+        user_bsc_address: Option<&str>,
+        user_exfer_address: Option<&str>,
+    ) -> Result<QuoteResp> {
+        let dir = match direction {
+            Direction::ExferToUsdt => "exfer_to_usdt",
+            Direction::UsdtToExfer => "usdt_to_exfer",
+        };
+        let body = serde_json::json!({
+            "direction": dir,
+            "amount_in": amount_in_human,
+            "hashlock": hashlock,
+            "user_bsc_address": user_bsc_address,
+            "user_exfer_address": user_exfer_address,
+        });
+        let resp = self
+            .http
+            .post(format!("{}/api/quote", self.base_url))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool /api/quote: {e}")))?;
+        if !resp.status().is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(Error::UpstreamUnexpected(format!(
+                "pool quote rejected: {txt}"
+            )));
+        }
+        resp.json::<QuoteResp>()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("pool quote decode: {e}")))
+    }
+
+    async fn get_swap(&self, id: &str) -> Result<serde_json::Value> {
+        self.http
+            .get(format!("{}/api/swap/{id}", self.base_url))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool /api/swap: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("pool swap decode: {e}")))
+    }
+
+    async fn notify_exfer_lock(&self, id: &str, tx_id: &str) -> Result<()> {
+        self.http
+            .post(format!("{}/api/swap/{id}/notify-exfer-lock", self.base_url))
+            .json(&serde_json::json!({ "exfer_lock_tx_id": tx_id }))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool notify-exfer-lock: {e}")))?;
+        Ok(())
+    }
+
+    async fn relay_claim(&self, id: &str, preimage: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(format!("{}/api/swap/{id}/relay-claim", self.base_url))
+            .json(&serde_json::json!({ "preimage": preimage }))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool relay-claim: {e}")))?;
+        if !resp.status().is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(Error::UpstreamUnexpected(format!(
+                "relay-claim rejected: {txt}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("relay-claim decode: {e}")))
+    }
+}
+
+// ───────────────────────── engine ─────────────────────────
+
+#[derive(Clone)]
+pub struct EngineConfig {
+    pub pool_url: String,
+    pub bsc_rpc_url: String,
+    pub bsc_chain_id: u64,
+}
+
+/// Owns the full swap lifecycle. Secrets stay in the daemon; the engine signs
+/// both legs (EXFER via `tx::htlc`, BSC via [`EvmClient`]) and persists every
+/// transition to the encrypted [`Journal`].
+pub struct SwapEngine {
+    store: Arc<dyn WalletStore>,
+    node: Arc<ExferNode>,
+    inflight: Arc<InFlightUtxos>,
+    indexer: Option<IndexerClient>,
+    evm: EvmClient,
+    pool: PoolClient,
+    journal: Arc<Journal>,
+    /// Serializes BSC sends from our single derived account (nonce safety).
+    bsc_lock: tokio::sync::Mutex<()>,
+}
+
+fn strip0x(s: &str) -> &str {
+    s.trim_start_matches("0x")
+}
+
+fn hash256_from_hex(s: &str) -> Result<exfer::types::Hash256> {
+    Ok(exfer::types::Hash256(crate::tx::decode_hash(strip0x(s))?))
+}
+
+impl SwapEngine {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        store: Arc<dyn WalletStore>,
+        node: Arc<ExferNode>,
+        inflight: Arc<InFlightUtxos>,
+        indexer: Option<IndexerClient>,
+        journal: Arc<Journal>,
+        cfg: EngineConfig,
+    ) -> Self {
+        let evm = EvmClient::new(cfg.bsc_rpc_url.clone(), cfg.bsc_chain_id);
+        let pool = PoolClient::new(cfg.pool_url.clone());
+        Self {
+            store,
+            node,
+            inflight,
+            indexer,
+            evm,
+            pool,
+            journal,
+            bsc_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn journal(&self) -> &Arc<Journal> {
+        &self.journal
+    }
+
+    /// Derived BSC address (EIP-55) for receiving USDT / funding gas.
+    pub fn bsc_address(&self) -> Result<String> {
+        let secret = self.store.evm_secret()?;
+        evm_address(&secret)
+    }
+
+    async fn load_signer(&self, address_hex: &str) -> Result<crate::store::Signer> {
+        let store = self.store.clone();
+        let a = address_hex.to_string();
+        tokio::task::spawn_blocking(move || store.load_by_address(&a))
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))?
+    }
+
+    /// `(bnb_wei, usdt_units)` for the derived BSC address. Lets the UI
+    /// pre-flight a buy (needs USDT + BNB gas).
+    pub async fn bsc_balances(&self) -> Result<(String, String)> {
+        let secret = self.store.evm_secret()?;
+        let addr = secret_address(&secret)?;
+        let bnb = self.evm.bnb_balance(addr).await?;
+        Ok((bnb.to_string(), "0".to_string()))
+    }
+
+    /// Quote + reserve a swap. Generates the preimage (kept secret), persists a
+    /// `Quoted` record. `from_exfer` is the EXFER address that funds (sell) or
+    /// receives (buy) the EXFER leg.
+    pub async fn get_quote(
+        &self,
+        direction: Direction,
+        amount_in_human: String,
+        from_exfer: String,
+    ) -> Result<SwapRecord> {
+        use rand::RngCore;
+        use sha2::{Digest, Sha256};
+
+        let secret = self.store.evm_secret()?;
+        let our_bsc = evm_address(&secret)?;
+        let signer = self.load_signer(&from_exfer).await?;
+        let our_pubkey = hex::encode(signer.pubkey());
+
+        let mut pre = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut pre);
+        let hashlock = format!("0x{}", hex::encode(Sha256::digest(pre)));
+        let preimage = format!("0x{}", hex::encode(pre));
+
+        let (user_bsc, user_exfer) = match direction {
+            Direction::ExferToUsdt => (Some(our_bsc.as_str()), None),
+            Direction::UsdtToExfer => (None, Some(our_pubkey.as_str())),
+        };
+        let q = self
+            .pool
+            .quote(direction, &amount_in_human, &hashlock, user_bsc, user_exfer)
+            .await?;
+
+        let now = now_secs();
+        let rec = SwapRecord {
+            swap_id: q.swap_id,
+            direction,
+            status: SwapStatus::Quoted,
+            hashlock,
+            preimage,
+            amount_in: q.amount_in,
+            amount_out: q.amount_out,
+            amount_in_units: q.amount_in_units,
+            amount_out_units: q.amount_out_units,
+            pool_exfer_pubkey: q
+                .instructions
+                .exfer
+                .as_ref()
+                .map(|e| e.receiver_pubkey.clone()),
+            pool_bsc_address: q.instructions.bsc.as_ref().map(|b| b.recipient.clone()),
+            htlc_contract: q.instructions.bsc.as_ref().map(|b| b.htlc_contract.clone()),
+            usdt_token: q.instructions.bsc.as_ref().map(|b| b.usdt_token.clone()),
+            our_bsc_address: Some(our_bsc),
+            our_exfer_address: Some(from_exfer),
+            user_lock_tx: None,
+            pool_lock_ref: None,
+            claim_tx: None,
+            refund_tx: None,
+            exfer_timeout_height: q.instructions.exfer.as_ref().map(|e| e.timeout_height),
+            bsc_timeout_sec: q.instructions.bsc.as_ref().map(|b| b.timeout_sec),
+            expires_at: q.expires_at,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.journal.put(rec.clone())?;
+        Ok(rec)
+    }
+
+    /// Execute the user's first leg (sell: lock EXFER; buy: approve+lock USDT).
+    pub async fn execute(&self, swap_id: &str) -> Result<SwapRecord> {
+        let rec = self
+            .journal
+            .get(swap_id)
+            .ok_or_else(|| Error::BadParams(format!("unknown swap_id {swap_id}")))?;
+        if rec.status != SwapStatus::Quoted {
+            return Ok(rec); // already executing/done
+        }
+        let now = now_secs();
+        if now >= rec.expires_at {
+            self.journal.update(swap_id, now, |r| {
+                r.status = SwapStatus::Failed;
+                r.error = Some("quote expired before execution".into());
+            })?;
+            return Err(Error::BadParams(
+                "quote expired; request a fresh quote".into(),
+            ));
+        }
+
+        match rec.direction {
+            Direction::ExferToUsdt => {
+                let from = rec
+                    .our_exfer_address
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing EXFER from-address".into()))?;
+                let signer = self.load_signer(&from).await?;
+                let receiver = crate::tx::decode_hash(strip0x(
+                    rec.pool_exfer_pubkey
+                        .as_deref()
+                        .ok_or_else(|| Error::Internal("missing pool EXFER pubkey".into()))?,
+                ))?;
+                let hash_lock = hash256_from_hex(&rec.hashlock)?;
+                let timeout = rec
+                    .exfer_timeout_height
+                    .ok_or_else(|| Error::Internal("missing EXFER timeout height".into()))?;
+                let amount: u64 = rec
+                    .amount_in_units
+                    .parse()
+                    .map_err(|e| Error::Internal(format!("bad EXFER amount: {e}")))?;
+                let receipt = crate::tx::htlc::htlc_lock(
+                    &signer,
+                    receiver,
+                    hash_lock,
+                    timeout,
+                    amount,
+                    crate::tx::FeeChoice::Rate(1),
+                    crate::api::DEFAULT_MAX_FEE,
+                    &self.node,
+                    &self.inflight,
+                )
+                .await?;
+                self.pool
+                    .notify_exfer_lock(swap_id, &receipt.tx_id)
+                    .await
+                    .ok();
+                self.journal.update(swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::UserLocked;
+                    r.user_lock_tx = Some(receipt.tx_id);
+                })?;
+            }
+            Direction::UsdtToExfer => {
+                let secret = self.store.evm_secret()?;
+                let htlc = rec
+                    .htlc_contract
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing HTLC contract".into()))?;
+                let token = rec
+                    .usdt_token
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing USDT token".into()))?;
+                let recipient = rec
+                    .pool_bsc_address
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing pool BSC address".into()))?;
+                let timeout = rec
+                    .bsc_timeout_sec
+                    .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
+                let amount = alloy::primitives::U256::from_str_radix(&rec.amount_in_units, 10)
+                    .map_err(|e| Error::Internal(format!("bad USDT amount: {e}")))?;
+
+                let our_addr = secret_address(&secret)?;
+                // Pre-flight: need BNB for gas.
+                let bnb = self.evm.bnb_balance(our_addr).await?;
+                if bnb.is_zero() {
+                    return Err(Error::BadParams(
+                        "BSC address has no BNB for gas; fund it before buying".into(),
+                    ));
+                }
+
+                let _guard = self.bsc_lock.lock().await;
+                // Approve once if allowance is short.
+                let allowance = self.evm.allowance(&token, our_addr, &htlc).await?;
+                if allowance < amount {
+                    let _ = self.evm.approve_max(&secret, &token, &htlc).await?;
+                }
+                let tx = self
+                    .evm
+                    .htlc_lock(
+                        &secret,
+                        &htlc,
+                        &rec.hashlock,
+                        &recipient,
+                        &token,
+                        amount,
+                        timeout,
+                    )
+                    .await?;
+                self.journal.update(swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::UserLocked;
+                    r.user_lock_tx = Some(tx);
+                })?;
+            }
+        }
+        Ok(self.journal.get(swap_id).unwrap_or(rec))
+    }
+
+    /// One monitor tick for a single swap: advance toward settlement, or refund
+    /// after timeout. Errors are logged by the caller and retried next tick.
+    pub async fn advance(&self, rec: &SwapRecord) -> Result<()> {
+        match (rec.status, rec.direction) {
+            // Wait for the pool to mirror our lock.
+            (SwapStatus::UserLocked, _) => {
+                let pj = self.pool.get_swap(&rec.swap_id).await?;
+                let pstatus = pj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(pstatus, "pool_locked" | "preimage_seen" | "completed") {
+                    let plr = pj
+                        .get("poolLockTxhash")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::PoolLocked;
+                        r.pool_lock_ref = plr;
+                    })?;
+                }
+            }
+            // Sell: claim the pool's USDT (gasless relay, with self-claim fallback).
+            (SwapStatus::PoolLocked, Direction::ExferToUsdt) => {
+                match self.pool.relay_claim(&rec.swap_id, &rec.preimage).await {
+                    Ok(v) => {
+                        let tx = v.get("txhash").and_then(|x| x.as_str()).map(str::to_string);
+                        self.journal.update(&rec.swap_id, now_secs(), |r| {
+                            r.status = SwapStatus::Completed;
+                            r.claim_tx = tx;
+                        })?;
+                    }
+                    Err(e) => {
+                        // Fallback: self-submit if we hold BNB for gas.
+                        let secret = self.store.evm_secret()?;
+                        let htlc = rec.htlc_contract.clone().unwrap_or_default();
+                        let our = secret_address(&secret)?;
+                        if !htlc.is_empty() && !self.evm.bnb_balance(our).await?.is_zero() {
+                            let _guard = self.bsc_lock.lock().await;
+                            let tx = self.evm.htlc_claim(&secret, &htlc, &rec.preimage).await?;
+                            self.journal.update(&rec.swap_id, now_secs(), |r| {
+                                r.status = SwapStatus::Completed;
+                                r.claim_tx = Some(tx);
+                            })?;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            // Buy: claim the pool's EXFER lock, revealing the preimage on-chain.
+            (SwapStatus::PoolLocked, Direction::UsdtToExfer) => {
+                let indexer = self.indexer.as_ref().ok_or_else(|| {
+                    Error::Internal("indexer required for buy-direction claim".into())
+                })?;
+                let from = rec.our_exfer_address.clone().unwrap_or_default();
+                let signer = self.load_signer(&from).await?;
+                let our_pubkey = hex::encode(signer.pubkey());
+                let resp = indexer
+                    .htlc_lookup_by_hashlock(
+                        serde_json::json!({ "hash_lock": strip0x(&rec.hashlock) }),
+                    )
+                    .await?;
+                let htlcs = resp
+                    .get("htlcs")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let pool_lock = htlcs.iter().find(|h| {
+                    h.get("params")
+                        .and_then(|p| p.get("receiver"))
+                        .and_then(|v| v.as_str())
+                        .map(|r| r.eq_ignore_ascii_case(&our_pubkey))
+                        .unwrap_or(false)
+                });
+                let Some(pl) = pool_lock else {
+                    return Ok(()); // pool's EXFER lock not indexed yet; retry next tick
+                };
+                let params = pl.get("params").cloned().unwrap_or_default();
+                let lock_tx_id =
+                    pl.get("lock_tx_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            Error::UpstreamUnexpected("indexed htlc missing lock_tx_id".into())
+                        })?;
+                let sender = params
+                    .get("sender")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        Error::UpstreamUnexpected("indexed htlc missing sender".into())
+                    })?;
+                let timeout = params
+                    .get("timeout_height")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let preimage = hex::decode(strip0x(&rec.preimage))
+                    .map_err(|e| Error::Internal(format!("bad preimage: {e}")))?;
+                let receipt = crate::tx::htlc::htlc_claim(
+                    &signer,
+                    hash256_from_hex(lock_tx_id)?,
+                    0,
+                    preimage,
+                    crate::tx::decode_hash(strip0x(sender))?,
+                    timeout,
+                    None,
+                    &self.node,
+                )
+                .await?;
+                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Completed;
+                    r.claim_tx = Some(receipt.tx_id);
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether the user's first leg is past its refund deadline (so a reclaim
+    /// can succeed). Sell: EXFER block height ≥ timeout. Buy: unix time ≥ timeout.
+    async fn refundable(&self, rec: &SwapRecord) -> bool {
+        match rec.direction {
+            Direction::ExferToUsdt => {
+                match (rec.exfer_timeout_height, self.node.get_block_height().await) {
+                    (Some(t), Ok(tip)) => tip.height >= t,
+                    _ => false,
+                }
+            }
+            Direction::UsdtToExfer => rec
+                .bsc_timeout_sec
+                .map(|t| now_secs() >= t)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Reclaim the user's first leg after its timeout. No funds are ever lost:
+    /// the user always controls the refund arm of their own lock.
+    pub async fn refund(&self, swap_id: &str) -> Result<SwapRecord> {
+        let rec = self
+            .journal
+            .get(swap_id)
+            .ok_or_else(|| Error::BadParams(format!("unknown swap_id {swap_id}")))?;
+        if rec.is_terminal() {
+            return Ok(rec);
+        }
+        let lock_tx = rec
+            .user_lock_tx
+            .clone()
+            .ok_or_else(|| Error::BadParams("nothing locked yet for this swap".into()))?;
+
+        match rec.direction {
+            Direction::ExferToUsdt => {
+                let from = rec.our_exfer_address.clone().unwrap_or_default();
+                let signer = self.load_signer(&from).await?;
+                let receiver = crate::tx::decode_hash(strip0x(
+                    rec.pool_exfer_pubkey.as_deref().unwrap_or(""),
+                ))?;
+                let receipt = crate::tx::htlc::htlc_reclaim(
+                    &signer,
+                    hash256_from_hex(&lock_tx)?,
+                    0,
+                    receiver,
+                    hash256_from_hex(&rec.hashlock)?,
+                    rec.exfer_timeout_height.unwrap_or(0),
+                    None,
+                    &self.node,
+                )
+                .await?;
+                self.journal.update(swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Refunded;
+                    r.refund_tx = Some(receipt.tx_id);
+                })?;
+            }
+            Direction::UsdtToExfer => {
+                let secret = self.store.evm_secret()?;
+                let htlc = rec.htlc_contract.clone().unwrap_or_default();
+                let _guard = self.bsc_lock.lock().await;
+                let tx = self.evm.htlc_refund(&secret, &htlc, &rec.hashlock).await?;
+                self.journal.update(swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Refunded;
+                    r.refund_tx = Some(tx);
+                })?;
+            }
+        }
+        Ok(self.journal.get(swap_id).unwrap_or(rec))
+    }
+}
+
+/// Background monitor: each tick, advance every pending swap toward settlement,
+/// expire stale quotes, and reclaim past-deadline locks. Runs until shutdown.
+pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::CancellationToken) {
+    const TICK: std::time::Duration = std::time::Duration::from_secs(10);
+    tracing::info!("swap monitor started");
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(TICK) => {}
+        }
+        for rec in engine.journal().pending() {
+            // Expire quotes the user never executed.
+            if rec.status == SwapStatus::Quoted {
+                if now_secs() >= rec.expires_at {
+                    let _ = engine.journal().update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::Failed;
+                        r.error = Some("quote expired (never executed)".into());
+                    });
+                }
+                continue;
+            }
+            // Past the refund deadline → reclaim the user's lock.
+            if matches!(rec.status, SwapStatus::UserLocked | SwapStatus::PoolLocked)
+                && engine.refundable(&rec).await
+            {
+                if let Err(e) = engine.refund(&rec.swap_id).await {
+                    tracing::debug!(swap = %rec.swap_id, error = %e, "swap refund retry");
+                }
+                continue;
+            }
+            // Otherwise drive it forward.
+            if let Err(e) = engine.advance(&rec).await {
+                tracing::debug!(swap = %rec.swap_id, error = %e, "swap advance retry");
+            }
+        }
+    }
+    tracing::info!("swap monitor stopped");
+}
+
+/// Address for a raw secret (helper to avoid re-parsing in two places).
+fn secret_address(secret: &[u8; 32]) -> Result<alloy::primitives::Address> {
+    evm_address(secret)?
+        .parse::<alloy::primitives::Address>()
+        .map_err(|e| Error::Internal(format!("bad derived BSC address: {e}")))
 }
 
 #[cfg(test)]
@@ -301,6 +945,9 @@ mod tests {
             Arc::new(KeyringStore::open_or_init_fresh(other.path(), b"different").unwrap());
         // Point the wrong store at the original journal file dir.
         let res = Journal::open(dir.path(), wrong);
-        assert!(res.is_err(), "wrong passphrase must not decrypt the journal");
+        assert!(
+            res.is_err(),
+            "wrong passphrase must not decrypt the journal"
+        );
     }
 }

@@ -85,9 +85,13 @@ fn parse_address(s: &str) -> Result<Address> {
 
 fn parse_b256(s: &str) -> Result<B256> {
     let h = s.trim_start_matches("0x");
-    let bytes = hex::decode(h).map_err(|e| Error::BadParams(format!("bad 32-byte hex {s}: {e}")))?;
+    let bytes =
+        hex::decode(h).map_err(|e| Error::BadParams(format!("bad 32-byte hex {s}: {e}")))?;
     if bytes.len() != 32 {
-        return Err(Error::BadParams(format!("expected 32 bytes, got {}", bytes.len())));
+        return Err(Error::BadParams(format!(
+            "expected 32 bytes, got {}",
+            bytes.len()
+        )));
     }
     Ok(B256::from_slice(&bytes))
 }
@@ -166,7 +170,10 @@ impl EvmClient {
     /// Pending nonce for `addr` (accounts for in-flight txs).
     pub async fn pending_nonce(&self, addr: Address) -> Result<u64> {
         let r = self
-            .rpc("eth_getTransactionCount", json!([addr.to_checksum(None), "pending"]))
+            .rpc(
+                "eth_getTransactionCount",
+                json!([addr.to_checksum(None), "pending"]),
+            )
             .await?;
         Self::hex_to_u64(Self::result_hex(&r)?)
     }
@@ -270,13 +277,21 @@ impl EvmClient {
         envelope.encode_2718(&mut raw);
 
         let r = self
-            .rpc("eth_sendRawTransaction", json!([format!("0x{}", hex::encode(raw))]))
+            .rpc(
+                "eth_sendRawTransaction",
+                json!([format!("0x{}", hex::encode(raw))]),
+            )
             .await?;
         Ok(Self::result_hex(&r)?.to_string())
     }
 
     /// `approve(spender, MAX)` on a BEP-20 token.
-    pub async fn approve_max(&self, secret: &[u8; 32], token: &str, spender: &str) -> Result<String> {
+    pub async fn approve_max(
+        &self,
+        secret: &[u8; 32],
+        token: &str,
+        spender: &str,
+    ) -> Result<String> {
         let data = approveCall {
             spender: parse_address(spender)?,
             value: U256::MAX,
@@ -293,12 +308,15 @@ impl EvmClient {
         let mut data = Vec::with_capacity(4 + 64);
         data.extend_from_slice(&alloy::primitives::keccak256("allowance(address,address)")[..4]);
         data.extend_from_slice(B256::left_padding_from(owner.as_slice()).as_slice());
-        data.extend_from_slice(B256::left_padding_from(parse_address(spender)?.as_slice()).as_slice());
+        data.extend_from_slice(
+            B256::left_padding_from(parse_address(spender)?.as_slice()).as_slice(),
+        );
         let out = self.eth_call(parse_address(token)?, &data).await?;
         Ok(U256::from_be_slice(&out))
     }
 
     /// `lock(hashlock, recipient, token, amount, timeoutSec)` on the HTLC.
+    #[allow(clippy::too_many_arguments)]
     pub async fn htlc_lock(
         &self,
         secret: &[u8; 32],
@@ -321,14 +339,30 @@ impl EvmClient {
     }
 
     /// `claim(preimage)` — reveal the preimage to receive the locked USDT.
-    pub async fn htlc_claim(&self, secret: &[u8; 32], htlc: &str, preimage: &str) -> Result<String> {
-        let data = claimCall { preimage: parse_b256(preimage)? }.abi_encode();
+    pub async fn htlc_claim(
+        &self,
+        secret: &[u8; 32],
+        htlc: &str,
+        preimage: &str,
+    ) -> Result<String> {
+        let data = claimCall {
+            preimage: parse_b256(preimage)?,
+        }
+        .abi_encode();
         self.send_call(secret, parse_address(htlc)?, data).await
     }
 
     /// `refund(hashlock)` — reclaim our own expired lock (sender arm).
-    pub async fn htlc_refund(&self, secret: &[u8; 32], htlc: &str, hashlock: &str) -> Result<String> {
-        let data = refundCall { hashlock: parse_b256(hashlock)? }.abi_encode();
+    pub async fn htlc_refund(
+        &self,
+        secret: &[u8; 32],
+        htlc: &str,
+        hashlock: &str,
+    ) -> Result<String> {
+        let data = refundCall {
+            hashlock: parse_b256(hashlock)?,
+        }
+        .abi_encode();
         self.send_call(secret, parse_address(htlc)?, data).await
     }
 

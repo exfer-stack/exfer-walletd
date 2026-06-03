@@ -96,7 +96,9 @@ fn seal_standard_mnemonic(
     entropy.zeroize();
     match sealed {
         Ok(blob) => {
-            let mpath = root.join(IMPORTED_DIR).join(format!("{addr}{MNEMONIC_SUFFIX}"));
+            let mpath = root
+                .join(IMPORTED_DIR)
+                .join(format!("{addr}{MNEMONIC_SUFFIX}"));
             if let Err(e) = atomic_write_0600(&mpath, &blob) {
                 tracing::warn!(error = %e, address = %addr, "could not store standard mnemonic");
             }
@@ -777,7 +779,10 @@ impl WalletStore for KeyringStore {
         // STANDARD address: return the sealed standard phrase, which re-derives
         // this exact address in any Exfer wallet. A wrong passphrase fails the
         // AES-GCM auth in `unseal`.
-        let mpath = self.root.join(IMPORTED_DIR).join(format!("{addr}{MNEMONIC_SUFFIX}"));
+        let mpath = self
+            .root
+            .join(IMPORTED_DIR)
+            .join(format!("{addr}{MNEMONIC_SUFFIX}"));
         if mpath.exists() {
             let blob = std::fs::read(&mpath)?;
             let entropy = sealed::unseal(passphrase, MNEMONIC_AAD, &blob)?;
@@ -1153,9 +1158,17 @@ mod tests {
         let other = KeyringStore::open_or_init_fresh(other_dir.path(), b"o").unwrap();
         let _ = other.take_fresh_mnemonic();
         let (other_addr, _) = other.create_independent(None).unwrap();
-        let old_phrase = other.reveal_address_mnemonic(&other_addr, b"o").unwrap().join(" ");
-        let imported_phrase = store.import_mnemonic(&old_phrase, Some("imp-phrase".into())).unwrap();
-        assert_eq!(imported_phrase, other_addr, "old phrase reproduces its address");
+        let old_phrase = other
+            .reveal_address_mnemonic(&other_addr, b"o")
+            .unwrap()
+            .join(" ");
+        let imported_phrase = store
+            .import_mnemonic(&old_phrase, Some("imp-phrase".into()))
+            .unwrap();
+        assert_eq!(
+            imported_phrase, other_addr,
+            "old phrase reproduces its address"
+        );
         // (4) a raw private key imported (e.g. a wallet.key)
         let raw = [0x11u8; 32];
         let imported_key = store.import(&raw, Some("imp-key".into())).unwrap();
@@ -1182,7 +1195,10 @@ mod tests {
         }
         // the imported old phrase reveals EXACTLY what was imported
         assert_eq!(
-            store.reveal_address_mnemonic(&imported_phrase, b"pw").unwrap().join(" "),
+            store
+                .reveal_address_mnemonic(&imported_phrase, b"pw")
+                .unwrap()
+                .join(" "),
             old_phrase
         );
 
@@ -1190,10 +1206,16 @@ mod tests {
         let std_a_phrase = store.reveal_address_mnemonic(&std_a, b"pw").unwrap();
         drop(store);
         let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
-        assert_eq!(store.reveal_address_mnemonic(&std_a, b"pw").unwrap(), std_a_phrase);
+        assert_eq!(
+            store.reveal_address_mnemonic(&std_a, b"pw").unwrap(),
+            std_a_phrase
+        );
         assert_eq!(std_addr_of(&std_a_phrase.join(" ")), std_a);
         // legacy still legacy after reopen
-        let li = store.reveal_address_mnemonic(&legacy_ind, b"pw").unwrap().join(" ");
+        let li = store
+            .reveal_address_mnemonic(&legacy_ind, b"pw")
+            .unwrap()
+            .join(" ");
         assert_eq!(legacy_addr_of(&li), legacy_ind);
 
         // --- wrong passphrase fails for both kinds ---
@@ -1208,21 +1230,42 @@ mod tests {
         let vstore = KeyringStore::open_or_init_fresh(v_dir.path(), b"v2").unwrap();
         let _ = vstore.take_fresh_mnemonic();
         vstore.import_vault(&vault, b"pw").unwrap();
-        let restored: std::collections::BTreeSet<String> =
-            vstore.list().unwrap().into_iter().map(|e| e.address).collect();
-        for a in [&legacy_ind, &hd, &imported_phrase, &imported_key, &std_a, &std_b] {
+        let restored: std::collections::BTreeSet<String> = vstore
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.address)
+            .collect();
+        for a in [
+            &legacy_ind,
+            &hd,
+            &imported_phrase,
+            &imported_key,
+            &std_a,
+            &std_b,
+        ] {
             assert!(restored.contains(a), "vault must restore {a}");
         }
         // restored standard address → same address, legacy reveal now
-        let rp = vstore.reveal_address_mnemonic(&std_a, b"v2").unwrap().join(" ");
+        let rp = vstore
+            .reveal_address_mnemonic(&std_a, b"v2")
+            .unwrap()
+            .join(" ");
         assert_eq!(legacy_addr_of(&rp), std_a);
 
         // --- delete a standard address removes its sealed mnemonic file ---
         store.delete(&std_b, b"pw").unwrap();
-        let mpath = dir.path().join("imported").join(format!("{std_b}.mnemonic.enc"));
+        let mpath = dir
+            .path()
+            .join("imported")
+            .join(format!("{std_b}.mnemonic.enc"));
         assert!(!mpath.exists(), "deleting must drop the sealed mnemonic");
-        let live: std::collections::BTreeSet<String> =
-            store.list().unwrap().into_iter().map(|e| e.address).collect();
+        let live: std::collections::BTreeSet<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.address)
+            .collect();
         assert!(!live.contains(&std_b) && live.contains(&std_a));
     }
 
@@ -1235,7 +1278,10 @@ mod tests {
         let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let _ = store.take_fresh_mnemonic();
         let (addr, _) = store.create_standard(Some("s".into())).unwrap();
-        let phrase = store.reveal_address_mnemonic(&addr, b"pw").unwrap().join(" ");
+        let phrase = store
+            .reveal_address_mnemonic(&addr, b"pw")
+            .unwrap()
+            .join(" ");
 
         let dst_dir = temp();
         let dst = KeyringStore::open_or_init_fresh(dst_dir.path(), b"x").unwrap();
@@ -1243,7 +1289,9 @@ mod tests {
         let restored = dst.import_standard_mnemonic(&phrase, None).unwrap();
         assert_eq!(restored, addr, "standard import reproduces the address");
         assert_eq!(
-            dst.reveal_address_mnemonic(&restored, b"x").unwrap().join(" "),
+            dst.reveal_address_mnemonic(&restored, b"x")
+                .unwrap()
+                .join(" "),
             phrase,
             "imported standard phrase reveals back the same phrase"
         );

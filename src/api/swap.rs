@@ -1,0 +1,89 @@
+//! JSON-RPC surface for the cross-chain swap engine (EXFER ↔ USDT-BSC).
+//!
+//! All methods require `--swap-pool` to be configured; otherwise they return
+//! `-32602` with a clear message. The heavy lifting lives in [`crate::swap`];
+//! these are thin param-validation + dispatch wrappers.
+
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::ApiState;
+use crate::error::{Error, Result};
+use crate::swap::{Direction, SwapEngine};
+
+fn engine(state: &ApiState) -> Result<&std::sync::Arc<SwapEngine>> {
+    state
+        .engine
+        .as_ref()
+        .ok_or_else(|| Error::BadParams("swap not configured (set --swap-pool)".into()))
+}
+
+fn parse_direction(s: &str) -> Result<Direction> {
+    match s {
+        "exfer_to_usdt" => Ok(Direction::ExferToUsdt),
+        "usdt_to_exfer" => Ok(Direction::UsdtToExfer),
+        other => Err(Error::BadParams(format!("unknown swap direction: {other}"))),
+    }
+}
+
+fn to_value<T: serde::Serialize>(v: T) -> Result<Value> {
+    serde_json::to_value(v).map_err(|e| Error::Internal(e.to_string()))
+}
+
+#[derive(Deserialize)]
+struct QuoteParams {
+    direction: String,
+    amount_in: String,
+    /// EXFER address that funds (sell) or receives (buy) the EXFER leg.
+    from: String,
+}
+
+pub async fn swap_get_quote(state: &ApiState, params: Value) -> Result<Value> {
+    let p: QuoteParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("swap_get_quote params: {e}")))?;
+    let dir = parse_direction(&p.direction)?;
+    let rec = engine(state)?.get_quote(dir, p.amount_in, p.from).await?;
+    to_value(rec)
+}
+
+#[derive(Deserialize)]
+struct SwapIdParams {
+    swap_id: String,
+}
+
+pub async fn swap_execute(state: &ApiState, params: Value) -> Result<Value> {
+    let p: SwapIdParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("swap_execute params: {e}")))?;
+    to_value(engine(state)?.execute(&p.swap_id).await?)
+}
+
+pub async fn swap_refund(state: &ApiState, params: Value) -> Result<Value> {
+    let p: SwapIdParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("swap_refund params: {e}")))?;
+    to_value(engine(state)?.refund(&p.swap_id).await?)
+}
+
+pub async fn swap_status(state: &ApiState, params: Value) -> Result<Value> {
+    let p: SwapIdParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("swap_status params: {e}")))?;
+    let eng = engine(state)?;
+    let rec = eng
+        .journal()
+        .get(&p.swap_id)
+        .ok_or_else(|| Error::BadParams(format!("unknown swap_id {}", p.swap_id)))?;
+    to_value(rec)
+}
+
+pub async fn swap_list(state: &ApiState) -> Result<Value> {
+    to_value(engine(state)?.journal().list())
+}
+
+pub async fn bsc_get_address(state: &ApiState) -> Result<Value> {
+    let addr = engine(state)?.bsc_address()?;
+    Ok(serde_json::json!({ "address": addr }))
+}
+
+pub async fn bsc_get_balances(state: &ApiState) -> Result<Value> {
+    let (bnb, usdt) = engine(state)?.bsc_balances().await?;
+    Ok(serde_json::json!({ "bnb_wei": bnb, "usdt_units": usdt }))
+}

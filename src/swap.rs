@@ -972,7 +972,7 @@ impl SwapEngine {
 /// Background monitor: each tick, advance every pending swap toward settlement,
 /// expire stale quotes, and reclaim past-deadline locks. Runs until shutdown.
 pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::CancellationToken) {
-    const TICK: std::time::Duration = std::time::Duration::from_secs(10);
+    const TICK: std::time::Duration = std::time::Duration::from_secs(3);
     tracing::info!("swap monitor started");
     loop {
         tokio::select! {

@@ -1,4 +1,4 @@
-//! JSON-RPC surface for the cross-chain swap engine (EXFER ↔ USDT-BSC).
+//! JSON-RPC surface for the cross-chain swap engine (EXFER ↔ BNB).
 //!
 //! All methods require `--swap-pool` to be configured; otherwise they return
 //! `-32602` with a clear message. The heavy lifting lives in [`crate::swap`];
@@ -20,8 +20,8 @@ fn engine(state: &ApiState) -> Result<&std::sync::Arc<SwapEngine>> {
 
 fn parse_direction(s: &str) -> Result<Direction> {
     match s {
-        "exfer_to_usdt" => Ok(Direction::ExferToUsdt),
-        "usdt_to_exfer" => Ok(Direction::UsdtToExfer),
+        "exfer_to_bnb" => Ok(Direction::ExferToBnb),
+        "bnb_to_exfer" => Ok(Direction::BnbToExfer),
         other => Err(Error::BadParams(format!("unknown swap direction: {other}"))),
     }
 }
@@ -84,21 +84,21 @@ pub async fn bsc_get_address(state: &ApiState) -> Result<Value> {
 }
 
 pub async fn bsc_get_balances(state: &ApiState) -> Result<Value> {
-    let (bnb, usdt) = engine(state)?.bsc_balances().await?;
-    Ok(serde_json::json!({ "bnb_wei": bnb, "usdt_units": usdt }))
+    let bnb = engine(state)?.bsc_balances().await?;
+    Ok(serde_json::json!({ "bnb_wei": bnb }))
 }
 
 #[derive(Deserialize)]
-struct SendUsdtParams {
+struct SendBnbParams {
     to: String,
-    /// USDT amount (≤18 dp). Empty or "max" sends the whole balance.
+    /// BNB amount (≤18 dp). Empty or "max" sends the whole balance minus gas.
     #[serde(default)]
     amount: String,
 }
 
-pub async fn bsc_send_usdt(state: &ApiState, params: Value) -> Result<Value> {
-    let p: SendUsdtParams = serde_json::from_value(params)
-        .map_err(|e| Error::BadParams(format!("bsc_send_usdt params: {e}")))?;
-    let txhash = engine(state)?.send_usdt(&p.to, &p.amount).await?;
+pub async fn bsc_send_bnb(state: &ApiState, params: Value) -> Result<Value> {
+    let p: SendBnbParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_send_bnb params: {e}")))?;
+    let txhash = engine(state)?.send_bnb(&p.to, &p.amount).await?;
     Ok(serde_json::json!({ "txhash": txhash }))
 }

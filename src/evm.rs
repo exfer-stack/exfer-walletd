@@ -29,13 +29,10 @@ use crate::error::{Error, Result};
 // ───────────────────────── ABI ─────────────────────────
 
 sol! {
-    function approve(address spender, uint256 value) external returns (bool);
-    function transfer(address to, uint256 value) external returns (bool);
-    function balanceOf(address owner) external view returns (uint256);
-    function lock(bytes32 hashlock, address recipient, address token, uint256 amount, uint64 timeoutSec) external;
+    function lock(bytes32 hashlock, address recipient, uint64 timeoutSec) external payable;
     function claim(bytes32 preimage) external;
     function refund(bytes32 hashlock) external;
-    function getSwap(bytes32 hashlock) external view returns (address sender, address recipient, address token, uint256 amount, uint64 timeoutSec, uint8 state);
+    function getSwap(bytes32 hashlock) external view returns (address sender, address recipient, uint256 amount, uint64 timeoutSec, uint8 state);
 }
 
 /// On-chain HTLC state mirror (ExferHtlc.sol `enum State`).
@@ -187,12 +184,6 @@ impl EvmClient {
         Self::hex_to_u256(Self::result_hex(&r)?)
     }
 
-    /// BEP-20 token balance (smallest units).
-    pub async fn erc20_balance(&self, token: Address, owner: Address) -> Result<U256> {
-        let data = balanceOfCall { owner }.abi_encode();
-        let out = self.eth_call(token, &data).await?;
-        Ok(U256::from_be_slice(&out))
-    }
 
     /// Read a swap entry from the HTLC contract.
     pub async fn get_swap(&self, htlc: Address, hashlock: B256) -> Result<OnChainSwap> {
@@ -238,7 +229,13 @@ impl EvmClient {
         Self::hex_to_u128(Self::result_hex(&r)?)
     }
 
-    async fn estimate_gas(&self, from: Address, to: Address, data: &[u8]) -> Result<u64> {
+    async fn estimate_gas_value(
+        &self,
+        from: Address,
+        to: Address,
+        data: &[u8],
+        value: U256,
+    ) -> Result<u64> {
         let r = self
             .rpc(
                 "eth_estimateGas",
@@ -246,6 +243,7 @@ impl EvmClient {
                     "from": from.to_checksum(None),
                     "to": to.to_checksum(None),
                     "data": format!("0x{}", hex::encode(data)),
+                    "value": format!("0x{:x}", value),
                 }]),
             )
             .await?;
@@ -260,6 +258,18 @@ impl EvmClient {
     /// Caller is responsible for serializing concurrent sends from the same
     /// account (nonce safety) — the swap engine holds a per-account lock.
     async fn send_call(&self, secret: &[u8; 32], to: Address, data: Vec<u8>) -> Result<String> {
+        self.send_call_value(secret, to, data, U256::ZERO).await
+    }
+
+    /// As [`send_call`] but attaches native `value` (wei) — used to lock native
+    /// BNB into the HTLC (and to send BNB withdrawals).
+    async fn send_call_value(
+        &self,
+        secret: &[u8; 32],
+        to: Address,
+        data: Vec<u8>,
+        value: U256,
+    ) -> Result<String> {
         let signer = signer_from_secret(secret)?;
         let from = signer.address();
 
@@ -267,7 +277,7 @@ impl EvmClient {
         let gas_price = self.gas_price().await?;
         let max_priority_fee_per_gas = MIN_PRIORITY_FEE_WEI;
         let max_fee_per_gas = gas_price.saturating_add(max_priority_fee_per_gas);
-        let gas_limit = self.estimate_gas(from, to, &data).await?;
+        let gas_limit = self.estimate_gas_value(from, to, &data, value).await?;
 
         let tx = TxEip1559 {
             chain_id: self.chain_id,
@@ -276,7 +286,7 @@ impl EvmClient {
             max_fee_per_gas,
             max_priority_fee_per_gas,
             to: TxKind::Call(to),
-            value: U256::ZERO,
+            value,
             access_list: Default::default(),
             input: Bytes::from(data),
         };
@@ -299,77 +309,35 @@ impl EvmClient {
         Ok(Self::result_hex(&r)?.to_string())
     }
 
-    /// `approve(spender, MAX)` on a BEP-20 token.
-    pub async fn approve_max(
-        &self,
-        secret: &[u8; 32],
-        token: &str,
-        spender: &str,
-    ) -> Result<String> {
-        let data = approveCall {
-            spender: parse_address(spender)?,
-            value: U256::MAX,
-        }
-        .abi_encode();
-        self.send_call(secret, parse_address(token)?, data).await
+    /// Send native BNB to an external address — withdraw the derived address's
+    /// BNB (e.g. proceeds from a sell) to an exchange / another wallet.
+    pub async fn send_bnb(&self, secret: &[u8; 32], to: &str, amount: U256) -> Result<String> {
+        self.send_call_value(secret, parse_address(to)?, Vec::new(), amount)
+            .await
     }
 
-    /// `transfer(to, amount)` on a BEP-20 token — withdraw the derived address's
-    /// tokens (e.g. USDT received from a sell) to an external wallet.
-    pub async fn erc20_transfer(
-        &self,
-        secret: &[u8; 32],
-        token: &str,
-        to: &str,
-        amount: U256,
-    ) -> Result<String> {
-        let data = transferCall {
-            to: parse_address(to)?,
-            value: amount,
-        }
-        .abi_encode();
-        self.send_call(secret, parse_address(token)?, data).await
-    }
-
-    /// Current token allowance owner→spender (smallest units). Lets the engine
-    /// skip a redundant approve.
-    pub async fn allowance(&self, token: &str, owner: Address, spender: &str) -> Result<U256> {
-        // allowance(address,address) selector + args, hand-encoded (not in the
-        // sol! block above to keep it minimal).
-        let mut data = Vec::with_capacity(4 + 64);
-        data.extend_from_slice(&alloy::primitives::keccak256("allowance(address,address)")[..4]);
-        data.extend_from_slice(B256::left_padding_from(owner.as_slice()).as_slice());
-        data.extend_from_slice(
-            B256::left_padding_from(parse_address(spender)?.as_slice()).as_slice(),
-        );
-        let out = self.eth_call(parse_address(token)?, &data).await?;
-        Ok(U256::from_be_slice(&out))
-    }
-
-    /// `lock(hashlock, recipient, token, amount, timeoutSec)` on the HTLC.
-    #[allow(clippy::too_many_arguments)]
+    /// `lock(hashlock, recipient, timeoutSec)` on the HTLC, sending `amount` wei
+    /// of native BNB as the locked value.
     pub async fn htlc_lock(
         &self,
         secret: &[u8; 32],
         htlc: &str,
         hashlock: &str,
         recipient: &str,
-        token: &str,
         amount: U256,
         timeout_sec: u64,
     ) -> Result<String> {
         let data = lockCall {
             hashlock: parse_b256(hashlock)?,
             recipient: parse_address(recipient)?,
-            token: parse_address(token)?,
-            amount,
             timeoutSec: timeout_sec,
         }
         .abi_encode();
-        self.send_call(secret, parse_address(htlc)?, data).await
+        self.send_call_value(secret, parse_address(htlc)?, data, amount)
+            .await
     }
 
-    /// `claim(preimage)` — reveal the preimage to receive the locked USDT.
+    /// `claim(preimage)` — reveal the preimage to receive the locked BNB.
     pub async fn htlc_claim(
         &self,
         secret: &[u8; 32],
@@ -471,33 +439,21 @@ mod tests {
     }
 
     #[test]
-    fn abi_encode_approve_lock_golden() {
-        // Golden selectors (keccak256(sig)[..4]) + ABI lengths for the two
-        // write calls the engine signs. Catches any drift in the sol! ABI.
-        let approve = approveCall {
-            spender: Address::repeat_byte(0x01),
-            value: U256::from(123u64),
-        }
-        .abi_encode();
-        assert_eq!(
-            &approve[..4],
-            &alloy::primitives::keccak256("approve(address,uint256)")[..4]
-        );
-        assert_eq!(approve.len(), 4 + 32 * 2);
-
+    fn abi_encode_lock_golden() {
+        // Golden selector (keccak256(sig)[..4]) + ABI length for the native-BNB
+        // lock call the engine signs. Catches any drift in the sol! ABI. The
+        // locked amount is msg.value (native BNB), so it is NOT an ABI arg.
         let lock = lockCall {
             hashlock: B256::repeat_byte(0xAA),
             recipient: Address::repeat_byte(0x02),
-            token: Address::repeat_byte(0x03),
-            amount: U256::from(1u64),
             timeoutSec: 42u64,
         }
         .abi_encode();
         assert_eq!(
             &lock[..4],
-            &alloy::primitives::keccak256("lock(bytes32,address,address,uint256,uint64)")[..4]
+            &alloy::primitives::keccak256("lock(bytes32,address,uint64)")[..4]
         );
-        assert_eq!(lock.len(), 4 + 32 * 5);
+        assert_eq!(lock.len(), 4 + 32 * 3);
     }
 
     #[test]

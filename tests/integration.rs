@@ -44,6 +44,7 @@ fn make_state_with_retry(
         tip_rx,
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
+        engine: None,
     };
     (state, wallet_dir)
 }

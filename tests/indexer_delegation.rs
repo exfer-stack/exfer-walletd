@@ -34,6 +34,7 @@ fn make_state(
         tip_rx,
         indexer,
         events: exfer_walletd::sse_client::WalletEvents::new(),
+        engine: None,
     };
     (state, wallet_dir)
 }

@@ -256,7 +256,6 @@ pub async fn run_embedded(
                     pool_url,
                     bsc_rpc_url: cfg.bsc_rpc_url.clone(),
                     bsc_chain_id: cfg.bsc_chain_id,
-                    bsc_usdt_address: cfg.bsc_usdt_address.clone(),
                 },
             ));
             let mon = eng.clone();

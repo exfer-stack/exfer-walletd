@@ -75,10 +75,10 @@ const MIN_BSC_LOCK_SECS: u64 = 2 * 3600;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
-    /// Sell EXFER for USDT. User locks EXFER first.
-    ExferToUsdt,
-    /// Buy EXFER with USDT. User locks USDT (on BSC) first.
-    UsdtToExfer,
+    /// Sell EXFER for BNB. User locks EXFER first.
+    ExferToBnb,
+    /// Buy EXFER with BNB. User locks BNB (on BSC) first.
+    BnbToExfer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,20 +119,18 @@ pub struct SwapRecord {
     /// Human-readable amounts (for UI).
     pub amount_in: String,
     pub amount_out: String,
-    /// Smallest-unit amounts (EXFER=8dp, USDT=18dp on BSC).
+    /// Smallest-unit amounts (EXFER=8dp, BNB=18dp on BSC).
     pub amount_in_units: String,
     pub amount_out_units: String,
 
     // ---- quote-derived params needed to drive both legs ----
     /// Pool's EXFER pubkey (receiver of the user's EXFER lock; sell direction).
     pub pool_exfer_pubkey: Option<String>,
-    /// Pool's BSC address (recipient of the user's USDT lock; buy direction).
+    /// Pool's BSC address (recipient of the user's BNB lock; buy direction).
     pub pool_bsc_address: Option<String>,
     /// HTLC contract address on BSC (from the quote, never hardcoded).
     pub htlc_contract: Option<String>,
-    /// USDT token address on BSC.
-    pub usdt_token: Option<String>,
-    /// Our own BSC address (recipient of pool's USDT lock; sell direction).
+    /// Our own BSC address (recipient of pool's BNB lock; sell direction).
     pub our_bsc_address: Option<String>,
     /// Our own EXFER address/pubkey (recipient of pool's EXFER lock; buy direction).
     pub our_exfer_address: Option<String>,
@@ -279,8 +277,6 @@ pub struct PoolClient {
 struct BscInstr {
     #[serde(rename = "htlcContract")]
     htlc_contract: String,
-    #[serde(rename = "usdtToken")]
-    usdt_token: String,
     recipient: String,
     #[serde(rename = "timeoutSec")]
     timeout_sec: u64,
@@ -312,11 +308,9 @@ struct QuoteResp {
     amount_out_units: String,
     expires_at: u64,
     // Present for both directions (sell only carries an EXFER lock in
-    // `instructions`, but we still need the BSC contract refs to verify/relay).
+    // `instructions`, but we still need the BSC contract ref to verify/relay).
     #[serde(default)]
     htlc_contract: Option<String>,
-    #[serde(default)]
-    usdt_token: Option<String>,
     instructions: Instructions,
 }
 
@@ -337,8 +331,8 @@ impl PoolClient {
         user_exfer_address: Option<&str>,
     ) -> Result<QuoteResp> {
         let dir = match direction {
-            Direction::ExferToUsdt => "exfer_to_usdt",
-            Direction::UsdtToExfer => "usdt_to_exfer",
+            Direction::ExferToBnb => "exfer_to_bnb",
+            Direction::BnbToExfer => "bnb_to_exfer",
         };
         let body = serde_json::json!({
             "direction": dir,
@@ -413,8 +407,6 @@ pub struct EngineConfig {
     pub pool_url: String,
     pub bsc_rpc_url: String,
     pub bsc_chain_id: u64,
-    /// USDT (BEP-20) token address on BSC, for the buy-direction balance check.
-    pub bsc_usdt_address: String,
 }
 
 /// Owns the full swap lifecycle. Secrets stay in the daemon; the engine signs
@@ -428,8 +420,6 @@ pub struct SwapEngine {
     evm: EvmClient,
     pool: PoolClient,
     journal: Arc<Journal>,
-    /// USDT token address on BSC (for the buy-direction balance pre-flight).
-    bsc_usdt: String,
     /// Serializes BSC sends from our single derived account (nonce safety).
     bsc_lock: tokio::sync::Mutex<()>,
 }
@@ -462,7 +452,6 @@ impl SwapEngine {
             evm,
             pool,
             journal,
-            bsc_usdt: cfg.bsc_usdt_address.clone(),
             bsc_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -471,7 +460,7 @@ impl SwapEngine {
         &self.journal
     }
 
-    /// Derived BSC address (EIP-55) for receiving USDT / funding gas.
+    /// Derived BSC address (EIP-55) for receiving / depositing BNB.
     pub fn bsc_address(&self) -> Result<String> {
         let secret = self.store.evm_secret()?;
         evm_address(&secret)
@@ -485,46 +474,35 @@ impl SwapEngine {
             .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))?
     }
 
-    /// `(bnb_wei, usdt_units)` for the derived BSC address. Lets the UI
-    /// pre-flight a buy (needs USDT + BNB gas).
-    pub async fn bsc_balances(&self) -> Result<(String, String)> {
+    /// Native BNB balance (wei) for the derived BSC address, as a decimal
+    /// string. Lets the UI pre-flight a buy (BNB is both principal and gas).
+    pub async fn bsc_balances(&self) -> Result<String> {
         let secret = self.store.evm_secret()?;
         let addr = secret_address(&secret)?;
         let bnb = self.evm.bnb_balance(addr).await?;
-        // Real USDT balance (best-effort: a bad token addr / RPC blip → "0").
-        let usdt = match self.bsc_usdt.parse::<alloy::primitives::Address>() {
-            Ok(token) => self
-                .evm
-                .erc20_balance(token, addr)
-                .await
-                .unwrap_or(alloy::primitives::U256::ZERO),
-            Err(_) => alloy::primitives::U256::ZERO,
-        };
-        Ok((bnb.to_string(), usdt.to_string()))
+        Ok(bnb.to_string())
     }
 
-    /// Withdraw USDT from the derived BSC address to an external wallet
-    /// (MetaMask / exchange). `amount_human` is in USDT (18 dp on BSC); empty
-    /// or "max" sends the whole balance. Needs BNB for gas. Returns the tx hash.
-    pub async fn send_usdt(&self, to: &str, amount_human: &str) -> Result<String> {
+    /// Withdraw native BNB from the derived BSC address to an external wallet
+    /// (exchange / another wallet). `amount_human` is in BNB (18 dp); empty or
+    /// "max" sends the whole balance minus a gas reserve. Returns the tx hash.
+    pub async fn send_bnb(&self, to: &str, amount_human: &str) -> Result<String> {
         let secret = self.store.evm_secret()?;
         let addr = secret_address(&secret)?;
-        let token = self
-            .bsc_usdt
-            .parse::<alloy::primitives::Address>()
-            .map_err(|e| Error::Internal(format!("bad USDT token address: {e}")))?;
         let amount = if amount_human.trim().is_empty() || amount_human.eq_ignore_ascii_case("max") {
-            self.evm.erc20_balance(token, addr).await?
+            // Leave a small reserve for the transfer's own gas.
+            let bal = self.evm.bnb_balance(addr).await?;
+            let reserve = alloy::primitives::U256::from(300_000u64)
+                .saturating_mul(alloy::primitives::U256::from(5_000_000_000u64)); // ~gas*price
+            bal.saturating_sub(reserve)
         } else {
             parse_units_18(amount_human)?
         };
         if amount.is_zero() {
-            return Err(Error::BadParams("nothing to send (zero USDT)".into()));
+            return Err(Error::BadParams("nothing to send (zero BNB after gas reserve)".into()));
         }
         let _guard = self.bsc_lock.lock().await;
-        self.evm
-            .erc20_transfer(&secret, &self.bsc_usdt, to, amount)
-            .await
+        self.evm.send_bnb(&secret, to, amount).await
     }
 
     /// Quote + reserve a swap. Generates the preimage (kept secret), persists a
@@ -550,8 +528,8 @@ impl SwapEngine {
         let preimage = format!("0x{}", hex::encode(pre));
 
         let (user_bsc, user_exfer) = match direction {
-            Direction::ExferToUsdt => (Some(our_bsc.as_str()), None),
-            Direction::UsdtToExfer => (None, Some(our_pubkey.as_str())),
+            Direction::ExferToBnb => (Some(our_bsc.as_str()), None),
+            Direction::BnbToExfer => (None, Some(our_pubkey.as_str())),
         };
         let q = self
             .pool
@@ -579,10 +557,6 @@ impl SwapEngine {
                 .htlc_contract
                 .clone()
                 .or_else(|| q.instructions.bsc.as_ref().map(|b| b.htlc_contract.clone())),
-            usdt_token: q
-                .usdt_token
-                .clone()
-                .or_else(|| q.instructions.bsc.as_ref().map(|b| b.usdt_token.clone())),
             our_bsc_address: Some(our_bsc),
             our_exfer_address: Some(from_exfer),
             user_lock_tx: None,
@@ -600,7 +574,7 @@ impl SwapEngine {
         Ok(rec)
     }
 
-    /// Execute the user's first leg (sell: lock EXFER; buy: approve+lock USDT).
+    /// Execute the user's first leg (sell: lock EXFER; buy: lock native BNB).
     pub async fn execute(&self, swap_id: &str) -> Result<SwapRecord> {
         let rec = self
             .journal
@@ -621,7 +595,7 @@ impl SwapEngine {
         }
 
         match rec.direction {
-            Direction::ExferToUsdt => {
+            Direction::ExferToBnb => {
                 let from = rec
                     .our_exfer_address
                     .clone()
@@ -670,16 +644,12 @@ impl SwapEngine {
                     r.user_lock_tx = Some(receipt.tx_id);
                 })?;
             }
-            Direction::UsdtToExfer => {
+            Direction::BnbToExfer => {
                 let secret = self.store.evm_secret()?;
                 let htlc = rec
                     .htlc_contract
                     .clone()
                     .ok_or_else(|| Error::Internal("missing HTLC contract".into()))?;
-                let token = rec
-                    .usdt_token
-                    .clone()
-                    .ok_or_else(|| Error::Internal("missing USDT token".into()))?;
                 let recipient = rec
                     .pool_bsc_address
                     .clone()
@@ -689,38 +659,28 @@ impl SwapEngine {
                     .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
                 if timeout < now_secs() + MIN_BSC_LOCK_SECS {
                     return Err(Error::BadParams(
-                        "pool returned an unsafe (too-short) USDT lock timeout".into(),
+                        "pool returned an unsafe (too-short) BNB lock timeout".into(),
                     ));
                 }
+                // Amount of native BNB to lock (msg.value), 18-dp wei.
                 let amount = alloy::primitives::U256::from_str_radix(&rec.amount_in_units, 10)
-                    .map_err(|e| Error::Internal(format!("bad USDT amount: {e}")))?;
+                    .map_err(|e| Error::Internal(format!("bad BNB amount: {e}")))?;
 
                 let our_addr = secret_address(&secret)?;
-                // Pre-flight: need BNB for gas.
+                // Pre-flight: BNB is both the principal and the gas — need at
+                // least the lock amount plus a little headroom for gas.
                 let bnb = self.evm.bnb_balance(our_addr).await?;
-                if bnb.is_zero() {
+                if bnb <= amount {
                     return Err(Error::BadParams(
-                        "BSC address has no BNB for gas; fund it before buying".into(),
+                        "not enough BNB: need the swap amount plus a little for gas".into(),
                     ));
                 }
 
                 let _guard = self.bsc_lock.lock().await;
-                // Approve once if allowance is short.
-                let allowance = self.evm.allowance(&token, our_addr, &htlc).await?;
-                if allowance < amount {
-                    let _ = self.evm.approve_max(&secret, &token, &htlc).await?;
-                }
+                // Native lock — value is sent inline, no token / no approve.
                 let tx = self
                     .evm
-                    .htlc_lock(
-                        &secret,
-                        &htlc,
-                        &rec.hashlock,
-                        &recipient,
-                        &token,
-                        amount,
-                        timeout,
-                    )
+                    .htlc_lock(&secret, &htlc, &rec.hashlock, &recipient, amount, timeout)
                     .await?;
                 self.journal.update(swap_id, now_secs(), |r| {
                     r.status = SwapStatus::UserLocked;
@@ -771,7 +731,7 @@ impl SwapEngine {
             // us, amount covers the quote, and enough time left to claim). Only
             // then do we advance to PoolLocked (which triggers the preimage
             // reveal). This is the funds-safety gate for the sell direction.
-            (SwapStatus::UserLocked, Direction::ExferToUsdt) => {
+            (SwapStatus::UserLocked, Direction::ExferToBnb) => {
                 if !self.verify_pool_bsc_lock(rec).await? {
                     return Ok(()); // pool's USDT lock not yet verified on-chain; retry
                 }
@@ -789,7 +749,7 @@ impl SwapEngine {
             // status hint here — we never reveal the preimage on a pool say-so;
             // the actual claim (PoolLocked branch) reconstructs the pool's EXFER
             // lock from authoritative indexer data and only reveals if it exists.
-            (SwapStatus::UserLocked, Direction::UsdtToExfer) => {
+            (SwapStatus::UserLocked, Direction::BnbToExfer) => {
                 let pj = self.pool.get_swap(&rec.swap_id).await?;
                 let pstatus = pj.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 if matches!(pstatus, "pool_locked" | "preimage_seen" | "completed") {
@@ -804,7 +764,7 @@ impl SwapEngine {
                 }
             }
             // Sell: claim the pool's USDT (gasless relay, with self-claim fallback).
-            (SwapStatus::PoolLocked, Direction::ExferToUsdt) => {
+            (SwapStatus::PoolLocked, Direction::ExferToBnb) => {
                 match self.pool.relay_claim(&rec.swap_id, &rec.preimage).await {
                     Ok(v) => {
                         let tx = v.get("txhash").and_then(|x| x.as_str()).map(str::to_string);
@@ -832,7 +792,7 @@ impl SwapEngine {
                 }
             }
             // Buy: claim the pool's EXFER lock, revealing the preimage on-chain.
-            (SwapStatus::PoolLocked, Direction::UsdtToExfer) => {
+            (SwapStatus::PoolLocked, Direction::BnbToExfer) => {
                 let indexer = self.indexer.as_ref().ok_or_else(|| {
                     Error::Internal("indexer required for buy-direction claim".into())
                 })?;
@@ -903,13 +863,13 @@ impl SwapEngine {
     /// can succeed). Sell: EXFER block height ≥ timeout. Buy: unix time ≥ timeout.
     async fn refundable(&self, rec: &SwapRecord) -> bool {
         match rec.direction {
-            Direction::ExferToUsdt => {
+            Direction::ExferToBnb => {
                 match (rec.exfer_timeout_height, self.node.get_block_height().await) {
                     (Some(t), Ok(tip)) => tip.height >= t,
                     _ => false,
                 }
             }
-            Direction::UsdtToExfer => rec
+            Direction::BnbToExfer => rec
                 .bsc_timeout_sec
                 .map(|t| now_secs() >= t)
                 .unwrap_or(false),
@@ -932,7 +892,7 @@ impl SwapEngine {
             .ok_or_else(|| Error::BadParams("nothing locked yet for this swap".into()))?;
 
         match rec.direction {
-            Direction::ExferToUsdt => {
+            Direction::ExferToBnb => {
                 let from = rec.our_exfer_address.clone().unwrap_or_default();
                 let signer = self.load_signer(&from).await?;
                 let receiver = crate::tx::decode_hash(strip0x(
@@ -954,7 +914,7 @@ impl SwapEngine {
                     r.refund_tx = Some(receipt.tx_id);
                 })?;
             }
-            Direction::UsdtToExfer => {
+            Direction::BnbToExfer => {
                 let secret = self.store.evm_secret()?;
                 let htlc = rec.htlc_contract.clone().unwrap_or_default();
                 let _guard = self.bsc_lock.lock().await;
@@ -1029,7 +989,7 @@ mod tests {
     fn sample(id: &str, now: u64) -> SwapRecord {
         SwapRecord {
             swap_id: id.into(),
-            direction: Direction::ExferToUsdt,
+            direction: Direction::ExferToBnb,
             status: SwapStatus::Quoted,
             hashlock: "0x".to_string() + &"ab".repeat(32),
             preimage: "0x".to_string() + &"cd".repeat(32),
@@ -1040,7 +1000,6 @@ mod tests {
             pool_exfer_pubkey: None,
             pool_bsc_address: None,
             htlc_contract: None,
-            usdt_token: None,
             our_bsc_address: None,
             our_exfer_address: None,
             user_lock_tx: None,

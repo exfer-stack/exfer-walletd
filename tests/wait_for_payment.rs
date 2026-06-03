@@ -151,6 +151,7 @@ async fn wait_for_payment_returns_on_sse_nudge() {
         tip_rx,
         indexer: None,
         events,
+        engine: None,
     };
 
     let req = RpcRequest {

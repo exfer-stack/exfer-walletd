@@ -331,7 +331,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "simulate_transfer" => simulate::simulate_transfer_method(state, req.params).await,
         "simulate_htlc_lock" => simulate::simulate_htlc_lock_method(state, req.params).await,
 
-        // ---- cross-chain swap (EXFER ↔ USDT-BSC), needs --swap-pool ----
+        // ---- cross-chain swap (EXFER ↔ BNB), needs --swap-pool ----
         "swap_get_quote" => swap::swap_get_quote(state, req.params).await,
         "swap_execute" => swap::swap_execute(state, req.params).await,
         "swap_refund" => swap::swap_refund(state, req.params).await,
@@ -339,7 +339,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "swap_list" => swap::swap_list(state).await,
         "bsc_get_address" => swap::bsc_get_address(state).await,
         "bsc_get_balances" => swap::bsc_get_balances(state).await,
-        "bsc_send_usdt" => swap::bsc_send_usdt(state, req.params).await,
+        "bsc_send_bnb" => swap::bsc_send_bnb(state, req.params).await,
 
         // ---- payment URI codec (pure) ----
         "payment_uri_encode" => payment_uri::payment_uri_encode(req.params).await,

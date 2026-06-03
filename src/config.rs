@@ -200,13 +200,13 @@ pub struct Config {
     #[arg(long, env = "WALLETD_INDEXER_TIMEOUT_SECS")]
     pub indexer_timeout_secs: Option<u64>,
 
-    /// exfer-pool base URL (the market-maker bot for EXFER↔USDT swaps). When
+    /// exfer-pool base URL (the market-maker bot for EXFER↔BNB swaps). When
     /// set, the swap engine + monitor light up and the `swap_*` / `bsc_*` RPCs
     /// become answerable. Unset → swaps return -32602 ("swap not configured").
     #[arg(long, env = "WALLETD_SWAP_POOL")]
     pub swap_pool_url: Option<String>,
 
-    /// BSC JSON-RPC endpoint for the swap engine's USDT leg. Defaults to BSC
+    /// BSC JSON-RPC endpoint for the swap engine's BNB leg. Defaults to BSC
     /// mainnet; point at a testnet dataseed (chain 97) for QA.
     #[arg(
         long,
@@ -218,16 +218,6 @@ pub struct Config {
     /// BSC chain id (56 mainnet, 97 Chapel testnet).
     #[arg(long, env = "WALLETD_BSC_CHAIN_ID", default_value_t = 56)]
     pub bsc_chain_id: u64,
-
-    /// USDT (BEP-20) token address on BSC — used to show the derived address's
-    /// USDT balance for the buy-direction pre-flight. Defaults to mainnet USDT;
-    /// override for testnet.
-    #[arg(
-        long,
-        env = "WALLETD_BSC_USDT",
-        default_value = "0x55d398326f99059fF775485246999027B3197955"
-    )]
-    pub bsc_usdt_address: String,
 }
 
 impl Config {
@@ -324,7 +314,6 @@ mod tests {
             swap_pool_url: None,
             bsc_rpc_url: "https://bsc-dataseed1.binance.org".into(),
             bsc_chain_id: 56,
-            bsc_usdt_address: "0x55d398326f99059fF775485246999027B3197955".into(),
         }
     }
 

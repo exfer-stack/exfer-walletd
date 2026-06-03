@@ -32,6 +32,7 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
         tip_rx,
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
+        engine: None,
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -168,6 +169,7 @@ async fn boot_scoped(
         tip_rx,
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
+        engine: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -327,6 +329,7 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
         tip_rx,
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
+        engine: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

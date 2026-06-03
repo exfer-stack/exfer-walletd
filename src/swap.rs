@@ -385,6 +385,8 @@ pub struct EngineConfig {
     pub pool_url: String,
     pub bsc_rpc_url: String,
     pub bsc_chain_id: u64,
+    /// USDT (BEP-20) token address on BSC, for the buy-direction balance check.
+    pub bsc_usdt_address: String,
 }
 
 /// Owns the full swap lifecycle. Secrets stay in the daemon; the engine signs
@@ -398,6 +400,8 @@ pub struct SwapEngine {
     evm: EvmClient,
     pool: PoolClient,
     journal: Arc<Journal>,
+    /// USDT token address on BSC (for the buy-direction balance pre-flight).
+    bsc_usdt: String,
     /// Serializes BSC sends from our single derived account (nonce safety).
     bsc_lock: tokio::sync::Mutex<()>,
 }
@@ -430,6 +434,7 @@ impl SwapEngine {
             evm,
             pool,
             journal,
+            bsc_usdt: cfg.bsc_usdt_address.clone(),
             bsc_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -458,7 +463,16 @@ impl SwapEngine {
         let secret = self.store.evm_secret()?;
         let addr = secret_address(&secret)?;
         let bnb = self.evm.bnb_balance(addr).await?;
-        Ok((bnb.to_string(), "0".to_string()))
+        // Real USDT balance (best-effort: a bad token addr / RPC blip → "0").
+        let usdt = match self.bsc_usdt.parse::<alloy::primitives::Address>() {
+            Ok(token) => self
+                .evm
+                .erc20_balance(token, addr)
+                .await
+                .unwrap_or(alloy::primitives::U256::ZERO),
+            Err(_) => alloy::primitives::U256::ZERO,
+        };
+        Ok((bnb.to_string(), usdt.to_string()))
     }
 
     /// Quote + reserve a swap. Generates the preimage (kept secret), persists a

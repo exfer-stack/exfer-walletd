@@ -453,6 +453,36 @@ mod tests {
     }
 
     #[test]
+    fn abi_encode_approve_lock_golden() {
+        // Golden selectors (keccak256(sig)[..4]) + ABI lengths for the two
+        // write calls the engine signs. Catches any drift in the sol! ABI.
+        let approve = approveCall {
+            spender: Address::repeat_byte(0x01),
+            value: U256::from(123u64),
+        }
+        .abi_encode();
+        assert_eq!(
+            &approve[..4],
+            &alloy::primitives::keccak256("approve(address,uint256)")[..4]
+        );
+        assert_eq!(approve.len(), 4 + 32 * 2);
+
+        let lock = lockCall {
+            hashlock: B256::repeat_byte(0xAA),
+            recipient: Address::repeat_byte(0x02),
+            token: Address::repeat_byte(0x03),
+            amount: U256::from(1u64),
+            timeoutSec: 42u64,
+        }
+        .abi_encode();
+        assert_eq!(
+            &lock[..4],
+            &alloy::primitives::keccak256("lock(bytes32,address,address,uint256,uint64)")[..4]
+        );
+        assert_eq!(lock.len(), 4 + 32 * 5);
+    }
+
+    #[test]
     fn abi_encode_claim_has_selector() {
         let data = claimCall {
             preimage: B256::repeat_byte(0xAB),

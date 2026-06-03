@@ -42,6 +42,14 @@ fn now_secs() -> u64 {
 const JOURNAL_AAD: &[u8] = b"exfer-walletd/v1/swap-journal";
 const JOURNAL_FILE: &str = "swaps.enc";
 
+/// Margin before the pool's BSC lock expiry within which we still consider it
+/// safe to reveal the preimage (the claim needs time to mine).
+const CLAIM_MARGIN_SECS: u64 = 600;
+/// Minimum user-leg lock duration we'll accept from the pool, so the user keeps
+/// a generous reclaim window even if the pool stalls/vanishes.
+const MIN_EXFER_LOCK_BLOCKS: u64 = 360; // ~1h at 10s blocks
+const MIN_BSC_LOCK_SECS: u64 = 2 * 3600;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -556,6 +564,15 @@ impl SwapEngine {
                 let timeout = rec
                     .exfer_timeout_height
                     .ok_or_else(|| Error::Internal("missing EXFER timeout height".into()))?;
+                // Funds-safety: refuse a too-short user-leg timeout (the pool
+                // supplies it). We must keep a long window to reclaim if the swap
+                // stalls; otherwise a malicious pool could starve our reclaim.
+                let tip = self.node.get_block_height().await?.height;
+                if timeout < tip + MIN_EXFER_LOCK_BLOCKS {
+                    return Err(Error::BadParams(
+                        "pool returned an unsafe (too-short) EXFER lock timeout".into(),
+                    ));
+                }
                 let amount: u64 = rec
                     .amount_in_units
                     .parse()
@@ -598,6 +615,11 @@ impl SwapEngine {
                 let timeout = rec
                     .bsc_timeout_sec
                     .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
+                if timeout < now_secs() + MIN_BSC_LOCK_SECS {
+                    return Err(Error::BadParams(
+                        "pool returned an unsafe (too-short) USDT lock timeout".into(),
+                    ));
+                }
                 let amount = alloy::primitives::U256::from_str_radix(&rec.amount_in_units, 10)
                     .map_err(|e| Error::Internal(format!("bad USDT amount: {e}")))?;
 
@@ -637,12 +659,59 @@ impl SwapEngine {
         Ok(self.journal.get(swap_id).unwrap_or(rec))
     }
 
+    /// Funds-safety gate (sell direction): verify the pool's USDT lock exists
+    /// on BSC and is safe to claim against BEFORE we reveal the preimage. Must
+    /// be Locked, paid to OUR address, cover the quoted output, and have enough
+    /// time left to claim. Never trust the pool's self-reported status for this.
+    async fn verify_pool_bsc_lock(&self, rec: &SwapRecord) -> Result<bool> {
+        let htlc = match rec.htlc_contract.as_deref() {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        let our = match rec.our_bsc_address.as_deref() {
+            Some(a) => a
+                .parse::<alloy::primitives::Address>()
+                .map_err(|e| Error::Internal(format!("bad our BSC address: {e}")))?,
+            None => return Ok(false),
+        };
+        let want_out = alloy::primitives::U256::from_str_radix(&rec.amount_out_units, 10)
+            .map_err(|e| Error::Internal(format!("bad amount_out_units: {e}")))?;
+        let oc = self.evm.get_htlc_swap(htlc, &rec.hashlock).await?;
+        Ok(oc.state == crate::evm::HtlcState::Locked
+            && oc.recipient == our
+            && oc.amount >= want_out
+            && now_secs() + CLAIM_MARGIN_SECS < oc.timeout_sec)
+    }
+
     /// One monitor tick for a single swap: advance toward settlement, or refund
     /// after timeout. Errors are logged by the caller and retried next tick.
     pub async fn advance(&self, rec: &SwapRecord) -> Result<()> {
         match (rec.status, rec.direction) {
-            // Wait for the pool to mirror our lock.
-            (SwapStatus::UserLocked, _) => {
+            // Sell: the pool must mirror with a USDT lock on BSC. We DO NOT trust
+            // the pool's self-reported status to decide it's safe to reveal the
+            // preimage — we verify the lock on-chain (state Locked, recipient is
+            // us, amount covers the quote, and enough time left to claim). Only
+            // then do we advance to PoolLocked (which triggers the preimage
+            // reveal). This is the funds-safety gate for the sell direction.
+            (SwapStatus::UserLocked, Direction::ExferToUsdt) => {
+                if !self.verify_pool_bsc_lock(rec).await? {
+                    return Ok(()); // pool's USDT lock not yet verified on-chain; retry
+                }
+                let plr = self.pool.get_swap(&rec.swap_id).await.ok().and_then(|pj| {
+                    pj.get("poolLockTxhash")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                });
+                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::PoolLocked;
+                    r.pool_lock_ref = plr;
+                })?;
+            }
+            // Buy: the pool mirrors with an EXFER lock. Safe to gate on the pool's
+            // status hint here — we never reveal the preimage on a pool say-so;
+            // the actual claim (PoolLocked branch) reconstructs the pool's EXFER
+            // lock from authoritative indexer data and only reveals if it exists.
+            (SwapStatus::UserLocked, Direction::UsdtToExfer) => {
                 let pj = self.pool.get_swap(&rec.swap_id).await?;
                 let pstatus = pj.get("status").and_then(|v| v.as_str()).unwrap_or("");
                 if matches!(pstatus, "pool_locked" | "preimage_seen" | "completed") {

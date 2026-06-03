@@ -207,6 +207,19 @@ impl EvmClient {
         })
     }
 
+    /// String-typed convenience wrapper around [`get_swap`] for the swap engine
+    /// (which holds addresses/hashlocks as hex strings from the quote).
+    pub async fn get_htlc_swap(&self, htlc: &str, hashlock: &str) -> Result<OnChainSwap> {
+        self.get_swap(parse_address(htlc)?, parse_b256(hashlock)?)
+            .await
+    }
+
+    /// EIP-55 checksummed address for a raw secret (so the engine can compare
+    /// the on-chain recipient against our own derived address).
+    pub fn address_of(secret: &[u8; 32]) -> Result<Address> {
+        Ok(signer_from_secret(secret)?.address())
+    }
+
     async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>> {
         let r = self
             .rpc(
@@ -411,6 +424,32 @@ mod tests {
         assert_eq!(HtlcState::from_u8(1), HtlcState::Locked);
         assert_eq!(HtlcState::from_u8(2), HtlcState::Claimed);
         assert_eq!(HtlcState::from_u8(3), HtlcState::Refunded);
+    }
+
+    #[test]
+    fn eip1559_sign_recovers_signer() {
+        // Signing path is correct iff the recovered signer matches the key's
+        // address — this exercises the EIP-1559 signature_hash (which binds
+        // chain_id, EIP-155 replay protection) + secp256k1 sign.
+        let secret = [0x11u8; 32];
+        let signer = PrivateKeySigner::from_slice(&secret).unwrap();
+        let tx = TxEip1559 {
+            chain_id: 56,
+            nonce: 7,
+            gas_limit: 60_000,
+            max_fee_per_gas: 3_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::from(vec![0xde, 0xad]),
+        };
+        let h = tx.signature_hash();
+        let sig = signer.sign_hash_sync(&h).unwrap();
+        assert_eq!(
+            sig.recover_address_from_prehash(&h).unwrap(),
+            signer.address()
+        );
     }
 
     #[test]

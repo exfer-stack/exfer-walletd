@@ -35,9 +35,9 @@ pub struct RetryPolicy {
     /// entirely. Each attempt rotates through every configured node
     /// before counting as failed.
     pub attempts: u32,
-    /// Base backoff in milliseconds. The wait between attempt `k` and
-    /// attempt `k + 1` is `backoff_ms * k`, so backoff grows linearly:
-    /// `backoff_ms`, `2 * backoff_ms`, `3 * backoff_ms`, …
+    /// Base backoff in milliseconds. The wait after attempt `k` (0-indexed)
+    /// is `backoff_ms * 2^k`, capped at 4s — exponential, not linear:
+    /// `backoff_ms`, `2×`, `4×`, `8×`, …
     pub backoff_ms: u64,
 }
 
@@ -54,15 +54,15 @@ impl RetryPolicy {
 }
 
 impl Default for RetryPolicy {
-    /// 4 attempts (= 3 retries after the first failure) with 500ms linear
-    /// backoff. Worst-case extra wall-clock is 500 + 1000 + 1500 = 3s of
-    /// sleep on top of the regular per-call timeout, in exchange for
-    /// surviving a public RPC at ~80–90% reliability with several
-    /// authenticated-output lookups per transfer.
+    /// 6 attempts with a 250ms base, exponential backoff (250, 500, 1000,
+    /// 2000, 4000ms-capped). A flaky network path that drops ~20% of fresh
+    /// connections (e.g. a node that closes every connection, forcing a new
+    /// handshake per call) survives this with ~0.2^6 ≈ 0.006% chance of a
+    /// full failure, while the early retries are quick.
     fn default() -> Self {
         Self {
-            attempts: 4,
-            backoff_ms: 500,
+            attempts: 6,
+            backoff_ms: 250,
         }
     }
 }
@@ -168,11 +168,18 @@ impl ExferNode {
                     Err(other) => return Err(other),
                 }
             }
-            // Whole node sweep failed with only transport errors.
-            // Sleep linear backoff, then try the sweep again — unless
-            // this was the last attempt.
+            // Whole node sweep failed with only transport errors. Back off
+            // EXPONENTIALLY (capped), then try the sweep again — unless this
+            // was the last attempt. Transport drops (e.g. a lost SYN over a
+            // flaky path) are usually gone within a couple of quick retries,
+            // so exponential-with-cap recovers fast without hammering.
             if attempt + 1 < attempts {
-                let wait_ms = self.retry.backoff_ms.saturating_mul((attempt + 1) as u64);
+                let factor = 1u64 << attempt.min(5); // 1,2,4,8,16,32
+                let wait_ms = self
+                    .retry
+                    .backoff_ms
+                    .saturating_mul(factor)
+                    .min(4_000);
                 if wait_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }

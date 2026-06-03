@@ -311,6 +311,12 @@ struct QuoteResp {
     amount_in_units: String,
     amount_out_units: String,
     expires_at: u64,
+    // Present for both directions (sell only carries an EXFER lock in
+    // `instructions`, but we still need the BSC contract refs to verify/relay).
+    #[serde(default)]
+    htlc_contract: Option<String>,
+    #[serde(default)]
+    usdt_token: Option<String>,
     instructions: Instructions,
 }
 
@@ -569,8 +575,14 @@ impl SwapEngine {
                 .as_ref()
                 .map(|e| e.receiver_pubkey.clone()),
             pool_bsc_address: q.instructions.bsc.as_ref().map(|b| b.recipient.clone()),
-            htlc_contract: q.instructions.bsc.as_ref().map(|b| b.htlc_contract.clone()),
-            usdt_token: q.instructions.bsc.as_ref().map(|b| b.usdt_token.clone()),
+            htlc_contract: q
+                .htlc_contract
+                .clone()
+                .or_else(|| q.instructions.bsc.as_ref().map(|b| b.htlc_contract.clone())),
+            usdt_token: q
+                .usdt_token
+                .clone()
+                .or_else(|| q.instructions.bsc.as_ref().map(|b| b.usdt_token.clone())),
             our_bsc_address: Some(our_bsc),
             our_exfer_address: Some(from_exfer),
             user_lock_tx: None,
@@ -737,10 +749,16 @@ impl SwapEngine {
         let want_out = alloy::primitives::U256::from_str_radix(&rec.amount_out_units, 10)
             .map_err(|e| Error::Internal(format!("bad amount_out_units: {e}")))?;
         let oc = self.evm.get_htlc_swap(htlc, &rec.hashlock).await?;
-        Ok(oc.state == crate::evm::HtlcState::Locked
-            && oc.recipient == our
-            && oc.amount >= want_out
-            && now_secs() + CLAIM_MARGIN_SECS < oc.timeout_sec)
+        let cond_state = oc.state == crate::evm::HtlcState::Locked;
+        let cond_recip = oc.recipient == our;
+        let cond_amt = oc.amount >= want_out;
+        let cond_time = now_secs() + CLAIM_MARGIN_SECS < oc.timeout_sec;
+        tracing::debug!(
+            swap = %rec.swap_id,
+            state = ?oc.state, cond_state, cond_recip, cond_amt, cond_time,
+            "verify_pool_bsc_lock"
+        );
+        Ok(cond_state && cond_recip && cond_amt && cond_time)
     }
 
     /// One monitor tick for a single swap: advance toward settlement, or refund

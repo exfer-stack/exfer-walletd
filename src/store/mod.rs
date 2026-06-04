@@ -255,4 +255,66 @@ pub trait WalletStore: Send + Sync + 'static {
         self.reveal_mnemonic(passphrase)?;
         self.evm_secret()
     }
+
+    /// The wallet's usable BSC/EVM address (EIP-55), if any. Returns the
+    /// independent key's address, else the seed-derived address, else `None`
+    /// (seedless wallet with no independent key — the UI prompts to create
+    /// one). MUST NOT error in the no-key case. Default: derive from
+    /// [`evm_secret`], treating [`Error::EvmKeyNotCreated`] as `None`.
+    fn evm_address_opt(&self) -> Result<Option<String>> {
+        match self.evm_secret() {
+            Ok(secret) => Ok(Some(crate::evm::evm_address(&secret)?)),
+            Err(crate::error::Error::EvmKeyNotCreated) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create a fresh independent BSC/EVM key (new 24-word mnemonic → secp256k1
+    /// at `m/44'/60'/0'/0/0`). Refuses if one already exists
+    /// (`WalletAlreadyExists`); on a seeded wallet refuses unless `force` (the
+    /// seed-derived address is canonical). Returns `(eip55_address,
+    /// mnemonic_words)`. Default: unsupported.
+    fn create_evm_key(&self, _force: bool) -> Result<(String, Vec<String>)> {
+        Err(crate::error::Error::BadParams(
+            "independent BSC/EVM key creation is not supported by this store".into(),
+        ))
+    }
+
+    /// Verify `passphrase` and reveal the EVM key's 24-word recovery phrase.
+    /// Generated / mnemonic-imported keys reveal their own phrase; a seeded
+    /// wallet without an independent key reveals the SEED phrase; a raw-key
+    /// import has no phrase (`BadParams`). Default: unsupported.
+    fn reveal_evm_mnemonic(&self, _passphrase: &[u8]) -> Result<Vec<String>> {
+        Err(crate::error::Error::BadParams(
+            "BSC/EVM mnemonic reveal is not supported by this store".into(),
+        ))
+    }
+
+    /// Import a 12- or 24-word BIP-39 phrase as THE independent BSC/EVM key
+    /// (derived at `m/44'/60'/0'/0/0`). Needs `overwrite` if a key already
+    /// exists. Returns the EIP-55 address. Default: unsupported.
+    fn import_evm_mnemonic(&self, _phrase: &str, _overwrite: bool) -> Result<String> {
+        Err(crate::error::Error::BadParams(
+            "BSC/EVM mnemonic import is not supported by this store".into(),
+        ))
+    }
+
+    /// Import a raw 32-byte secp256k1 secret as THE independent BSC/EVM key.
+    /// Validated as a curve scalar before sealing; no mnemonic is stored.
+    /// Needs `overwrite` if a key already exists. Default: unsupported.
+    fn import_evm_key(&self, _secret: &[u8; 32], _overwrite: bool) -> Result<String> {
+        Err(crate::error::Error::BadParams(
+            "BSC/EVM private-key import is not supported by this store".into(),
+        ))
+    }
+
+    /// Verify `passphrase` and delete the independent BSC/EVM key (sealed key
+    /// + mnemonic files, plus the `state.json` record). Distinct from
+    /// [`delete`](Self::delete), which operates on ed25519 addresses.
+    /// Default: unsupported.
+    fn delete_evm_key(&self, _passphrase: &[u8]) -> Result<()> {
+        Err(crate::error::Error::BadParams(
+            "BSC/EVM key deletion is not supported by this store".into(),
+        ))
+    }
 }

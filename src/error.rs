@@ -72,6 +72,13 @@ pub enum Error {
     #[error("wallet error: {0}")]
     Wallet(String),
 
+    /// No BSC/EVM key is available: a seedless wallet that has not yet created
+    /// (or imported) an independent BNB key. Distinct from `BadParams` so the
+    /// UI can branch into a "create your BNB wallet" flow instead of showing a
+    /// raw error.
+    #[error("no BSC/EVM key has been created for this wallet")]
+    EvmKeyNotCreated,
+
     // ---- upstream node --------------------------------------------------
     #[error("upstream node unreachable: {0}")]
     UpstreamUnreachable(String),
@@ -182,6 +189,7 @@ impl Error {
             Error::WalletNotFound(_) => -32010,
             Error::WalletAlreadyExists(_) => -32011,
             Error::KeystoreLocked(_) => -32012,
+            Error::EvmKeyNotCreated => -32013,
             Error::UpstreamUnreachable(_)
             | Error::UpstreamRpc { .. }
             | Error::UpstreamUnexpected(_) => -32020,

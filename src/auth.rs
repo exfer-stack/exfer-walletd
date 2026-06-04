@@ -83,6 +83,10 @@ impl Scope {
             | "swap_execute"
             | "swap_refund"
             | "bsc_send_bnb"
+            // BSC/EVM recovery-phrase reveal exposes key material (same bar as
+            // reveal_evm_private_key); key deletion can strand BNB funds.
+            | "bsc_reveal_mnemonic"
+            | "bsc_delete_key"
             // LP cash-out triggers a pool payout to the user — fund-moving.
             | "lp_withdraw_self" => Scope::Spend,
             "generate_address"
@@ -91,6 +95,12 @@ impl Scope {
             | "import_private_key"
             | "import_mnemonic"
             | "import_standard_mnemonic"
+            // BSC/EVM independent-key lifecycle mutates keystore state but does
+            // not move funds; create/import return key material to the caller
+            // but are user-initiated provisioning, gated at Manage.
+            | "bsc_create_address"
+            | "bsc_import_mnemonic"
+            | "bsc_import_key"
             | "abandon_transfer"
             | "htlc_forget" => Scope::Manage,
             _ => Scope::Read,

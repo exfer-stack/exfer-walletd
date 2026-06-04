@@ -94,9 +94,120 @@ pub async fn swap_price_klines(state: &ApiState, params: Value) -> Result<Value>
     engine(state)?.price_klines(interval, limit).await
 }
 
+/// Return the wallet's BSC/EVM address (EIP-55) and whether one exists.
+/// Hits the store directly (not the swap engine) so it answers even with the
+/// pool unconfigured, and NEVER errors when no key exists — `created:false`
+/// is the signal for the UI to offer "create your BNB wallet".
 pub async fn bsc_get_address(state: &ApiState) -> Result<Value> {
-    let addr = engine(state)?.bsc_address()?;
-    Ok(serde_json::json!({ "address": addr }))
+    let addr = state.store.evm_address_opt()?;
+    Ok(serde_json::json!({ "address": addr, "created": addr.is_some() }))
+}
+
+#[derive(Deserialize)]
+struct CreateEvmParams {
+    /// Force creation of an independent key on a seeded wallet (the
+    /// seed-derived BSC address would no longer be used).
+    #[serde(default)]
+    force: bool,
+}
+
+/// Create a fresh independent BNB wallet (24-word mnemonic → secp256k1).
+/// Returns `{address, mnemonic:[…]}`. Argon2id sealing blocks, so run on a
+/// blocking thread.
+pub async fn bsc_create_address(state: &ApiState, params: Value) -> Result<Value> {
+    let p: CreateEvmParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_create_address params: {e}")))?;
+    let store = state.store.clone();
+    let (address, mnemonic) = tokio::task::spawn_blocking(move || store.create_evm_key(p.force))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(%address, "bsc_create_address served — fresh BNB key created");
+    Ok(serde_json::json!({ "address": address, "mnemonic": mnemonic }))
+}
+
+#[derive(Deserialize)]
+struct PassphraseParams {
+    passphrase: String,
+}
+
+/// Reveal the BNB wallet's 24-word recovery phrase (passphrase-gated, Spend).
+pub async fn bsc_reveal_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
+    let p: PassphraseParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_reveal_mnemonic params: {e}")))?;
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let words = tokio::task::spawn_blocking(move || store.reveal_evm_mnemonic(pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(count = words.len(), "bsc_reveal_mnemonic served — sensitive output");
+    Ok(serde_json::json!({ "mnemonic": words }))
+}
+
+#[derive(Deserialize)]
+struct ImportEvmMnemonicParams {
+    mnemonic: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Import a MetaMask-style BIP-39 phrase (12 or 24 words) as the BNB wallet.
+pub async fn bsc_import_mnemonic(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ImportEvmMnemonicParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_import_mnemonic params: {e}")))?;
+    let store = state.store.clone();
+    let phrase = p.mnemonic;
+    let overwrite = p.overwrite;
+    let address =
+        tokio::task::spawn_blocking(move || store.import_evm_mnemonic(&phrase, overwrite))
+            .await
+            .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!(%address, "bsc_import_mnemonic served — BNB key imported");
+    Ok(serde_json::json!({ "address": address }))
+}
+
+#[derive(Deserialize)]
+struct ImportEvmKeyParams {
+    /// 0x-prefixed (or bare) 64-hex secp256k1 private key.
+    private_key_hex: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Import a MetaMask-style raw private key as the BNB wallet.
+pub async fn bsc_import_key(state: &ApiState, params: Value) -> Result<Value> {
+    let p: ImportEvmKeyParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_import_key params: {e}")))?;
+    let h = p.private_key_hex.trim();
+    let h = h.strip_prefix("0x").unwrap_or(h);
+    let raw =
+        hex::decode(h).map_err(|e| Error::BadHex(format!("bsc_import_key private_key: {e}")))?;
+    let secret: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::BadParams("private key must be 32 bytes (64 hex chars)".into()))?;
+    let store = state.store.clone();
+    let overwrite = p.overwrite;
+    let mut secret = zeroize::Zeroizing::new(secret);
+    let s = *secret;
+    let address = tokio::task::spawn_blocking(move || store.import_evm_key(&s, overwrite))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    secret.iter_mut().for_each(|b| *b = 0);
+    tracing::warn!(%address, "bsc_import_key served — BNB key imported");
+    Ok(serde_json::json!({ "address": address }))
+}
+
+/// Delete the BNB wallet's independent key (passphrase-gated, Spend).
+pub async fn bsc_delete_key(state: &ApiState, params: Value) -> Result<Value> {
+    let p: PassphraseParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("bsc_delete_key params: {e}")))?;
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    tokio::task::spawn_blocking(move || store.delete_evm_key(pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    tracing::warn!("bsc_delete_key served — BNB key deleted");
+    Ok(serde_json::json!({ "deleted": true }))
 }
 
 // ── liquidity-provider proxies ──

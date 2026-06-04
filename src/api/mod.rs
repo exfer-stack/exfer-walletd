@@ -345,6 +345,11 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "lp_deposit_status" => swap::lp_deposit_status(state, req.params).await,
         "lp_withdraw_self" => swap::lp_withdraw_self(state, req.params).await,
         "bsc_get_address" => swap::bsc_get_address(state).await,
+        "bsc_create_address" => swap::bsc_create_address(state, req.params).await,
+        "bsc_reveal_mnemonic" => swap::bsc_reveal_mnemonic(state, req.params).await,
+        "bsc_import_mnemonic" => swap::bsc_import_mnemonic(state, req.params).await,
+        "bsc_import_key" => swap::bsc_import_key(state, req.params).await,
+        "bsc_delete_key" => swap::bsc_delete_key(state, req.params).await,
         "bsc_get_balances" => swap::bsc_get_balances(state).await,
         "bsc_send_bnb" => swap::bsc_send_bnb(state, req.params).await,
 

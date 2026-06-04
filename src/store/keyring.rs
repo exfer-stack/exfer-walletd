@@ -69,6 +69,44 @@ const MNEMONIC_SUFFIX: &str = ".mnemonic.enc";
 /// address. Verified against an exfer.dev test vector in the tests below.
 const STD_MNEMONIC_DOMAIN: &[u8] = b"EXFER-MNEMONIC-ED25519-V1";
 
+// ---- independent BSC/EVM key (secp256k1) ----------------------------------
+//
+// The wallet's BSC/EVM identity can be a *first-class independent* secp256k1
+// key with its OWN BIP-39 mnemonic, stored under `imported/`. This makes the
+// BNB wallet work on a seedless keyring (the common in-app case) and lets a
+// seeded wallet later create an independent BNB key without disturbing its
+// existing seed-derived BSC address. See [`KeyringStore::evm_secret`].
+
+/// Sealed 32-byte secp256k1 secret for the independent EVM key.
+const EVM_KEY_FILE: &str = "evm.key.enc";
+/// Sealed BIP-39 entropy of the independent EVM key's own mnemonic (absent
+/// when the key was imported as a raw private key — no phrase to reveal).
+const EVM_MNEMONIC_FILE: &str = "evm.mnemonic.enc";
+/// AAD domain-separating the sealed EVM secret from every other sealed blob.
+const EVM_KEY_AAD: &[u8] = b"exfer-walletd/v1/evm-key";
+/// AAD for the EVM key's sealed mnemonic entropy.
+const EVM_MNEMONIC_AAD: &[u8] = b"exfer-walletd/v1/evm-mnemonic";
+/// Standard Ethereum derivation path — byte-identical to the seed-derived
+/// path in [`KeyringStore::evm_secret`], so a fresh mnemonic is MetaMask
+/// importable (yields the same address at this path).
+const EVM_PATH: &str = "m/44'/60'/0'/0/0";
+
+/// secp256k1 secret from a BIP-39 mnemonic at the standard Ethereum path
+/// (`m/44'/60'/0'/0/0`, empty BIP-39 passphrase = MetaMask default). This is
+/// byte-for-byte the same derivation the seed path uses, so the resulting BSC
+/// address matches what MetaMask shows for the same mnemonic.
+fn evm_secret_from_mnemonic(m: &Mnemonic) -> Result<Zeroizing<[u8; 32]>> {
+    let seed = m.to_seed(""); // empty BIP-39 passphrase — MetaMask default
+    let path: bip32::DerivationPath = EVM_PATH
+        .parse()
+        .map_err(|e| Error::Internal(format!("bad EVM path: {e}")))?;
+    let xprv = bip32::XPrv::derive_from_path(&seed[..], &path)
+        .map_err(|e| Error::Internal(format!("EVM derive failed: {e}")))?;
+    let mut b = [0u8; 32];
+    b.copy_from_slice(xprv.private_key().to_bytes().as_slice());
+    Ok(Zeroizing::new(b))
+}
+
 /// Standard scheme: `secret = SHA-256(STD_MNEMONIC_DOMAIN || BIP39_seed(phrase))`.
 /// The BIP-39 seed uses an empty passphrase (the keystore passphrase protects
 /// the entropy at rest, not the seed). One-way, so the entropy is sealed
@@ -111,6 +149,32 @@ fn seal_standard_mnemonic(
 // Persisted state
 // ============================================================================
 
+/// How the independent EVM key entered the keystore. Decides whether a
+/// recovery phrase can be revealed: a raw-key import (MetaMask "Private Key")
+/// has NO mnemonic, so reveal must refuse rather than fabricate one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum EvmKeySource {
+    /// Freshly generated here (24-word mnemonic → secp256k1).
+    Generated,
+    /// Imported from a BIP-39 mnemonic (its entropy is sealed alongside).
+    ImportedMnemonic,
+    /// Imported from a raw 0x private key (no mnemonic exists).
+    ImportedKey,
+}
+
+/// Metadata for the wallet's independent BSC/EVM key. Persisted in
+/// `state.json`; absent (`None`) on legacy wallets and any wallet that
+/// still uses its seed-derived BSC address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EvmKeyMeta {
+    /// EIP-55 checksummed address this key controls.
+    address: String,
+    /// Unix seconds when the key was created/imported.
+    created_at: u64,
+    /// Provenance — gates mnemonic reveal.
+    source: EvmKeySource,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct State {
     #[serde(default)]
@@ -127,6 +191,11 @@ struct State {
     /// secret lives in `imported/<addr>.key.enc`.
     #[serde(default)]
     imported: Vec<String>,
+    /// The wallet's independent BSC/EVM key, if one was created/imported.
+    /// `#[serde(default)]` keeps legacy `state.json` (no such field) parsing
+    /// to `None` — those wallets fall back to seed-derived BSC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evm_key: Option<EvmKeyMeta>,
 }
 
 impl State {
@@ -487,6 +556,73 @@ impl KeyringStore {
         })?;
         Ok(Zeroizing::new(arr))
     }
+
+    /// Refuse to replace an existing independent EVM key unless `overwrite`.
+    fn guard_evm_overwrite(&self, overwrite: bool) -> Result<()> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.evm_key.is_some() && !overwrite {
+            return Err(Error::WalletAlreadyExists(
+                "an independent BSC/EVM key already exists; pass overwrite to replace it".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Seal the EVM secret (and, when present, its mnemonic entropy) to disk
+    /// and record `state.evm_key`. Atomic-ish: the key file is written first,
+    /// then state; on a state-write failure the orphan key file is removed.
+    fn persist_evm_key(
+        &self,
+        secret: &[u8; 32],
+        mnemonic: Option<&Mnemonic>,
+        address: &str,
+        source: EvmKeySource,
+    ) -> Result<()> {
+        let kpath = self.root.join(IMPORTED_DIR).join(EVM_KEY_FILE);
+        let mpath = self.root.join(IMPORTED_DIR).join(EVM_MNEMONIC_FILE);
+
+        let key_blob = sealed::seal(&self.passphrase, EVM_KEY_AAD, secret)?;
+        atomic_write_0600(&kpath, &key_blob)?;
+
+        // Seal the mnemonic entropy (so reveal can return the phrase); zeroize
+        // entropy immediately after. Raw-key imports have no mnemonic.
+        if let Some(m) = mnemonic {
+            let mut entropy = m.to_entropy();
+            let sealed = sealed::seal(&self.passphrase, EVM_MNEMONIC_AAD, &entropy);
+            entropy.zeroize();
+            match sealed {
+                Ok(blob) => {
+                    if let Err(e) = atomic_write_0600(&mpath, &blob) {
+                        let _ = std::fs::remove_file(&kpath);
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&kpath);
+                    return Err(e);
+                }
+            }
+        } else if mpath.exists() {
+            // Overwriting a mnemonic-backed key with a raw key: drop the stale
+            // phrase so reveal can't return a mismatched one.
+            let _ = std::fs::remove_file(&mpath);
+        }
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.evm_key = Some(EvmKeyMeta {
+            address: address.to_string(),
+            created_at: now_unix(),
+            source,
+        });
+        if let Err(e) = state.save_atomic(&self.root.join(STATE_FILE)) {
+            // Roll back the on-disk files so a half-write doesn't leave an
+            // unreferenced key sealed on disk.
+            let _ = std::fs::remove_file(&kpath);
+            let _ = std::fs::remove_file(&mpath);
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 /// BIP-39 seed: PBKDF2-HMAC-SHA512(mnemonic_phrase, "mnemonic" || ""),
@@ -495,6 +631,13 @@ impl KeyringStore {
 fn entropy_to_seed64(entropy: &[u8; 32]) -> [u8; 64] {
     let mnemonic = Mnemonic::from_entropy(entropy).expect("32-byte entropy is valid for 24 words");
     mnemonic.to_seed("")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -607,23 +750,185 @@ impl WalletStore for KeyringStore {
     }
 
     fn evm_secret(&self) -> Result<Zeroizing<[u8; 32]>> {
-        let seed = self.seed.as_ref().ok_or_else(|| {
-            Error::BadParams(
-                "cross-chain swap requires a seeded wallet (no seed.enc present)".into(),
-            )
-        })?;
-        // BIP-32 secp256k1 derivation at the standard Ethereum path. Uses the
-        // same 64-byte BIP-39 seed the ed25519 keys derive from, so this BSC
-        // address matches what MetaMask shows for the user's mnemonic.
-        let path: bip32::DerivationPath = "m/44'/60'/0'/0/0"
-            .parse()
-            .map_err(|e| Error::Internal(format!("bad EVM derivation path: {e}")))?;
-        let xprv = bip32::XPrv::derive_from_path(&seed[..], &path)
-            .map_err(|e| Error::Internal(format!("EVM key derivation failed: {e}")))?;
-        let fb = xprv.private_key().to_bytes();
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(fb.as_slice());
-        Ok(Zeroizing::new(bytes))
+        // Resolution order is LOAD-BEARING and must not be reordered:
+        //
+        //   1. independent EVM key (works seedless) — ALWAYS first, so a
+        //      seeded wallet that later creates an independent key never
+        //      splits funds across two BSC addresses.
+        //   2. seed-derivation (UNCHANGED — existing operator wallets).
+        //   3. neither → typed `EvmKeyNotCreated` (UI shows "create BNB
+        //      wallet"). NEVER auto-create here.
+        let p = self.root.join(IMPORTED_DIR).join(EVM_KEY_FILE);
+        if p.exists() {
+            let blob = std::fs::read(&p)?;
+            let v = sealed::unseal(&self.passphrase, EVM_KEY_AAD, &blob)?;
+            let arr: [u8; 32] = v
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::Internal("evm.key.enc wrong length".into()))?;
+            return Ok(Zeroizing::new(arr));
+        }
+
+        if let Some(seed) = self.seed.as_ref() {
+            // BIP-32 secp256k1 derivation at the standard Ethereum path. Uses
+            // the same 64-byte BIP-39 seed the ed25519 keys derive from, so
+            // this BSC address matches what MetaMask shows for the user's
+            // mnemonic. UNCHANGED from the original seed path — backward compat.
+            let path: bip32::DerivationPath = EVM_PATH
+                .parse()
+                .map_err(|e| Error::Internal(format!("bad EVM derivation path: {e}")))?;
+            let xprv = bip32::XPrv::derive_from_path(&seed[..], &path)
+                .map_err(|e| Error::Internal(format!("EVM key derivation failed: {e}")))?;
+            let fb = xprv.private_key().to_bytes();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(fb.as_slice());
+            return Ok(Zeroizing::new(bytes));
+        }
+
+        Err(Error::EvmKeyNotCreated)
+    }
+
+    fn evm_address_opt(&self) -> Result<Option<String>> {
+        // Independent key → its recorded EIP-55 address.
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(meta) = state.evm_key.as_ref() {
+                return Ok(Some(meta.address.clone()));
+            }
+        }
+        // Seed-derived BSC address (legacy/operator wallets). Never errors
+        // for the seedless-no-key case — that just means "no BNB wallet yet".
+        if self.seed.is_some() {
+            let secret = self.evm_secret()?;
+            return Ok(Some(crate::evm::evm_address(&secret)?));
+        }
+        Ok(None)
+    }
+
+    fn create_evm_key(&self, force: bool) -> Result<(String, Vec<String>)> {
+        // Refuse to clobber an existing key (would strand BNB on the old one).
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.evm_key.is_some() {
+                return Err(Error::WalletAlreadyExists(
+                    "an independent BSC/EVM key already exists".into(),
+                ));
+            }
+        }
+        // On a seeded wallet the seed-derived address is canonical; creating
+        // an independent key shadows it (evm_secret prefers the independent
+        // key). Only do that on an explicit force.
+        if self.seed.is_some() && !force {
+            return Err(Error::BadParams(
+                "this wallet already has a seed-derived BSC address; pass force \
+                 to create a separate independent BNB key (the seed address \
+                 would no longer be used)"
+                    .into(),
+            ));
+        }
+
+        let mnemonic = Mnemonic::generate_in(Language::English, 24)
+            .map_err(|e| Error::Internal(format!("mnemonic generation failed: {e}")))?;
+        let secret = evm_secret_from_mnemonic(&mnemonic)?;
+        let address = crate::evm::evm_address(&secret)?;
+        let words: Vec<String> = mnemonic.words().map(|w| w.to_string()).collect();
+
+        self.persist_evm_key(&secret, Some(&mnemonic), &address, EvmKeySource::Generated)?;
+        Ok((address, words))
+    }
+
+    fn reveal_evm_mnemonic(&self, passphrase: &[u8]) -> Result<Vec<String>> {
+        self.verify_passphrase(passphrase)?;
+
+        let source = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.evm_key.as_ref().map(|m| m.source.clone())
+        };
+
+        match source {
+            Some(EvmKeySource::Generated) | Some(EvmKeySource::ImportedMnemonic) => {
+                let mpath = self.root.join(IMPORTED_DIR).join(EVM_MNEMONIC_FILE);
+                let blob = std::fs::read(&mpath)?;
+                let entropy = sealed::unseal(passphrase, EVM_MNEMONIC_AAD, &blob)?;
+                let mnemonic = Mnemonic::from_entropy(&entropy)
+                    .map_err(|e| Error::Internal(format!("mnemonic from entropy: {e}")))?;
+                Ok(mnemonic.words().map(|w| w.to_string()).collect())
+            }
+            Some(EvmKeySource::ImportedKey) => Err(Error::BadParams(
+                "this BNB wallet was imported by raw private key; export the \
+                 private key instead"
+                    .into(),
+            )),
+            // No independent key: a seeded wallet's BSC address comes from the
+            // SEED phrase, which is what reproduces it (and is MetaMask-derivable
+            // at m/44'/60'/0'/0/0).
+            None => Self::reveal_mnemonic(self, passphrase),
+        }
+    }
+
+    fn import_evm_mnemonic(&self, phrase: &str, overwrite: bool) -> Result<String> {
+        self.guard_evm_overwrite(overwrite)?;
+        let mnemonic = Mnemonic::parse_in(Language::English, phrase.trim())
+            .map_err(|e| Error::BadParams(format!("invalid recovery phrase: {e}")))?;
+        // Accept 12- or 24-word BIP-39 (16- or 32-byte entropy).
+        let elen = mnemonic.to_entropy().len();
+        if elen != 16 && elen != 32 {
+            return Err(Error::BadParams(
+                "recovery phrase must be 12 or 24 words (BIP-39)".into(),
+            ));
+        }
+        let secret = evm_secret_from_mnemonic(&mnemonic)?;
+        let address = crate::evm::evm_address(&secret)?;
+        self.persist_evm_key(
+            &secret,
+            Some(&mnemonic),
+            &address,
+            EvmKeySource::ImportedMnemonic,
+        )?;
+        Ok(address)
+    }
+
+    fn import_evm_key(&self, secret: &[u8; 32], overwrite: bool) -> Result<String> {
+        self.guard_evm_overwrite(overwrite)?;
+        // Validate as a real secp256k1 scalar (rejects zero / >= curve order)
+        // before sealing a key that could never sign.
+        let address = crate::evm::evm_address(secret)
+            .map_err(|_| Error::BadParams("invalid secp256k1 private key".into()))?;
+        let s = Zeroizing::new(*secret);
+        self.persist_evm_key(&s, None, &address, EvmKeySource::ImportedKey)?;
+        Ok(address)
+    }
+
+    fn delete_evm_key(&self, passphrase: &[u8]) -> Result<()> {
+        self.verify_passphrase(passphrase)?;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.evm_key.is_none() {
+                return Err(Error::WalletNotFound("no independent BSC/EVM key".into()));
+            }
+            // Cryptographically gate the delete on the supplied passphrase by
+            // unsealing the EVM key with it. verify_passphrase() above is a no-op
+            // on a pure-EVM seedless keyring (no ed25519 key to check against);
+            // unsealing evm.key.enc fails on a wrong passphrase, so a bad one
+            // can't drop the key.
+            let kp = self.root.join(IMPORTED_DIR).join(EVM_KEY_FILE);
+            if kp.exists() {
+                let blob = std::fs::read(&kp)?;
+                sealed::unseal(passphrase, EVM_KEY_AAD, &blob)?;
+            }
+            state.evm_key = None;
+            state.save_atomic(&self.root.join(STATE_FILE))?;
+        }
+        // Remove both sealed files (mnemonic absent for raw-key imports).
+        let kpath = self.root.join(IMPORTED_DIR).join(EVM_KEY_FILE);
+        if kpath.exists() {
+            std::fs::remove_file(&kpath)?;
+        }
+        let mpath = self.root.join(IMPORTED_DIR).join(EVM_MNEMONIC_FILE);
+        if mpath.exists() {
+            let _ = std::fs::remove_file(&mpath);
+        }
+        Ok(())
     }
 
     fn seal_aux(&self, aad: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
@@ -1461,5 +1766,207 @@ mod tests {
         let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
         let res = store.load_by_address(&"ab".repeat(32));
         assert!(matches!(res, Err(Error::WalletNotFound(_))));
+    }
+
+    // ---- independent BSC/EVM key -------------------------------------------
+
+    /// MetaMask-importable: a fresh mnemonic derives the SAME secp256k1 key at
+    /// m/44'/60'/0'/0/0 as the canonical anvil test vector.
+    #[test]
+    fn evm_mnemonic_derivation_matches_metamask_vector() {
+        let m = Mnemonic::parse_in(
+            Language::English,
+            "test test test test test test test test test test test junk",
+        )
+        .unwrap();
+        let secret = evm_secret_from_mnemonic(&m).unwrap();
+        assert_eq!(
+            crate::evm::evm_address(&secret).unwrap(),
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        );
+    }
+
+    /// REGRESSION GUARD: a seeded wallet's seed-derived BSC address must stay
+    /// byte-identical and keep working — the independent-key change is purely
+    /// additive for seeded wallets that never create an independent key.
+    #[test]
+    fn seeded_bsc_address_unchanged_and_first_in_resolution() {
+        let dir = temp();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+        let _ = store.take_fresh_mnemonic();
+
+        let seed_secret = store.evm_secret().unwrap();
+        let seed_addr = crate::evm::evm_address(&seed_secret).unwrap();
+        // evm_address_opt agrees and never errors.
+        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(seed_addr.as_str()));
+        // reveal_evm_mnemonic on a seeded-without-independent wallet returns the
+        // SEED phrase (24 words), and that phrase reproduces the same address.
+        let words = store.reveal_evm_mnemonic(b"pw").unwrap();
+        let from_seed_phrase =
+            evm_secret_from_mnemonic(&Mnemonic::parse_in(Language::English, &words.join(" ")).unwrap())
+                .unwrap();
+        assert_eq!(crate::evm::evm_address(&from_seed_phrase).unwrap(), seed_addr);
+    }
+
+    /// VERIFIER REGRESSION: restore a wallet from a FIXED known seed phrase and
+    /// assert its seed-derived BSC address equals an EXTERNAL fixed vector
+    /// (the canonical anvil mnemonic → 0xf39Fd6…92266 at m/44'/60'/0'/0/0).
+    /// This pins the seed→BSC derivation byte-for-byte against an address that
+    /// existing operator wallets already hold funds on, independent of any
+    /// other code path. If this address ever changes, seeded wallets' BNB is
+    /// stranded — the exact funds-loss this change must NOT cause.
+    #[test]
+    fn verifier_seeded_restore_bsc_address_matches_external_vector() {
+        // A FIXED, public 24-word BIP-39 vector (the canonical "abandon…art"
+        // zero-entropy mnemonic). Its m/44'/60'/0'/0/0 secp256k1 address is a
+        // well-known external value (e.g. Trezor/MetaMask derive the same).
+        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon abandon abandon abandon \
+            abandon abandon abandon abandon abandon abandon abandon abandon \
+            abandon art";
+        // m/44'/60'/0'/0/0 (Ethereum path) address for this phrase — the
+        // canonical "abandon…art" account #0 ETH address (publicly known).
+        const EXPECTED: &str = "0xF278cF59F82eDcf871d630F28EcC8056f25C1cdb";
+
+        // Cross-check the EXTERNAL vector against the pure derivation helper,
+        // independent of the keystore — pins the path/derivation itself.
+        let direct = evm_secret_from_mnemonic(
+            &Mnemonic::parse_in(Language::English, PHRASE).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(crate::evm::evm_address(&direct).unwrap(), EXPECTED);
+
+        let dir = temp();
+        KeyringStore::init_from_mnemonic(dir.path(), b"pw", PHRASE).unwrap();
+        let store = KeyringStore::open_or_init_fresh(dir.path(), b"pw").unwrap();
+
+        // The seeded wallet resolves its BSC key via the SEED branch (no
+        // independent key present), and it must equal the external vector.
+        let secret = store.evm_secret().unwrap();
+        assert_eq!(crate::evm::evm_address(&secret).unwrap(), EXPECTED);
+        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(EXPECTED));
+
+        // Creating an independent key (force) must NOT silently move the
+        // canonical address: it shadows it, and evm_secret now resolves the
+        // NEW key — but the seed address is still recoverable from the phrase,
+        // proving no destructive in-place mutation of the seed material.
+        let (ind_addr, _w) = store.create_evm_key(true).unwrap();
+        assert_ne!(ind_addr, EXPECTED);
+        let reseed = evm_secret_from_mnemonic(
+            &Mnemonic::parse_in(Language::English, PHRASE).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(crate::evm::evm_address(&reseed).unwrap(), EXPECTED);
+    }
+
+    /// On a seedless wallet evm_secret is a typed EvmKeyNotCreated until a key
+    /// is created; create→reveal→delete round-trips and reveal reproduces it.
+    #[test]
+    fn seedless_create_reveal_roundtrip() {
+        let dir = temp();
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        assert!(matches!(store.evm_secret(), Err(Error::EvmKeyNotCreated)));
+        assert_eq!(store.evm_address_opt().unwrap(), None);
+
+        let (addr, words) = store.create_evm_key(false).unwrap();
+        assert_eq!(words.len(), 24);
+        // The independent key is now THE BSC key.
+        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(addr.as_str()));
+        let secret = store.evm_secret().unwrap();
+        assert_eq!(crate::evm::evm_address(&secret).unwrap(), addr);
+
+        // Reveal returns its own phrase, which reproduces the address.
+        let revealed = store.reveal_evm_mnemonic(b"pw").unwrap();
+        assert_eq!(revealed, words);
+        let m = Mnemonic::parse_in(Language::English, &revealed.join(" ")).unwrap();
+        assert_eq!(
+            crate::evm::evm_address(&evm_secret_from_mnemonic(&m).unwrap()).unwrap(),
+            addr
+        );
+        // Wrong passphrase can't reveal.
+        assert!(store.reveal_evm_mnemonic(b"nope").is_err());
+
+        // Survives a reopen.
+        drop(store);
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(addr.as_str()));
+
+        // Delete clears state + both files.
+        store.delete_evm_key(b"pw").unwrap();
+        assert_eq!(store.evm_address_opt().unwrap(), None);
+        assert!(!dir.path().join("imported").join(EVM_KEY_FILE).exists());
+        assert!(!dir.path().join("imported").join(EVM_MNEMONIC_FILE).exists());
+    }
+
+    /// create twice without overwrite is refused; create on a seeded wallet is
+    /// refused unless force.
+    #[test]
+    fn evm_key_overwrite_and_seeded_force_guards() {
+        // Seedless: second create rejected.
+        let dir = temp();
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        let _ = store.create_evm_key(false).unwrap();
+        assert!(matches!(
+            store.create_evm_key(false),
+            Err(Error::WalletAlreadyExists(_))
+        ));
+
+        // Seeded: create refused without force, accepted with force, and the
+        // independent key then shadows the seed-derived one.
+        let sdir = temp();
+        let seeded = KeyringStore::open_or_init_fresh(sdir.path(), b"pw").unwrap();
+        let _ = seeded.take_fresh_mnemonic();
+        let seed_addr = seeded.evm_address_opt().unwrap().unwrap();
+        assert!(matches!(seeded.create_evm_key(false), Err(Error::BadParams(_))));
+        let (ind_addr, _) = seeded.create_evm_key(true).unwrap();
+        assert_ne!(ind_addr, seed_addr);
+        assert_eq!(seeded.evm_address_opt().unwrap().as_deref(), Some(ind_addr.as_str()));
+    }
+
+    /// Import a MetaMask mnemonic and a raw key; raw-key reveal is refused.
+    #[test]
+    fn evm_import_mnemonic_and_raw_key() {
+        let dir = temp();
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+
+        // 12-word import works; address matches direct derivation.
+        let phrase = "test test test test test test test test test test test junk";
+        let addr = store.import_evm_mnemonic(phrase, false).unwrap();
+        let expected = crate::evm::evm_address(
+            &evm_secret_from_mnemonic(&Mnemonic::parse_in(Language::English, phrase).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(addr, expected);
+        // Re-import without overwrite rejected.
+        assert!(matches!(
+            store.import_evm_mnemonic(phrase, false),
+            Err(Error::WalletAlreadyExists(_))
+        ));
+
+        // Overwrite with a raw key: no mnemonic, reveal refused with BadParams.
+        let raw = [0x11u8; 32];
+        let raw_addr = store.import_evm_key(&raw, true).unwrap();
+        assert_eq!(raw_addr, crate::evm::evm_address(&raw).unwrap());
+        assert!(!dir.path().join("imported").join(EVM_MNEMONIC_FILE).exists());
+        assert!(matches!(
+            store.reveal_evm_mnemonic(b"pw"),
+            Err(Error::BadParams(_))
+        ));
+        // But the raw secret is usable for signing.
+        assert_eq!(crate::evm::evm_address(&store.evm_secret().unwrap()).unwrap(), raw_addr);
+    }
+
+    /// A zero / invalid scalar is rejected before sealing a dead key.
+    #[test]
+    fn evm_import_rejects_invalid_scalar() {
+        let dir = temp();
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        assert!(matches!(
+            store.import_evm_key(&[0u8; 32], false),
+            Err(Error::BadParams(_))
+        ));
+        // Nothing was persisted.
+        assert_eq!(store.evm_address_opt().unwrap(), None);
     }
 }

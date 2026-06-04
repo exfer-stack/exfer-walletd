@@ -482,9 +482,15 @@ impl SwapEngine {
     /// `{ mid_price_bnb_per_exfer, fee_bps }`. Best-effort.
     pub async fn pool_info(&self) -> Result<serde_json::Value> {
         let v = self.pool.pool_info().await?;
+        let reserves = v.get("reserves");
         Ok(serde_json::json!({
             "mid_price_bnb_per_exfer": v.get("mid_price_bnb_per_exfer").cloned().unwrap_or(serde_json::Value::Null),
             "fee_bps": v.get("fee_bps").cloned().unwrap_or(serde_json::Value::Null),
+            "max_swap_bps": v.get("max_swap_bps").cloned().unwrap_or(serde_json::Value::Null),
+            // Human reserves so the UI can pre-warn when an amount exceeds what
+            // the pool can fill (rather than only erroring on Review).
+            "exfer_reserve": reserves.and_then(|r| r.get("exfer")).cloned().unwrap_or(serde_json::Value::Null),
+            "bnb_reserve": reserves.and_then(|r| r.get("bnb")).cloned().unwrap_or(serde_json::Value::Null),
         }))
     }
 
@@ -828,6 +834,7 @@ impl SwapEngine {
                 let from = rec.our_exfer_address.clone().unwrap_or_default();
                 let signer = self.load_signer(&from).await?;
                 let our_pubkey = hex::encode(signer.pubkey());
+                let our_addr = strip0x(&from).to_lowercase();
                 let resp = indexer
                     .htlc_lookup_by_hashlock(
                         serde_json::json!({ "hash_lock": strip0x(&rec.hashlock) }),
@@ -838,15 +845,27 @@ impl SwapEngine {
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
+                // The pool's lock pays US — match the indexed receiver against our
+                // pubkey OR our address (indexers differ on which they store).
                 let pool_lock = htlcs.iter().find(|h| {
                     h.get("params")
                         .and_then(|p| p.get("receiver"))
                         .and_then(|v| v.as_str())
-                        .map(|r| r.eq_ignore_ascii_case(&our_pubkey))
+                        .map(|r| {
+                            let r = r.to_lowercase();
+                            r == our_pubkey.to_lowercase() || r == our_addr
+                        })
                         .unwrap_or(false)
                 });
                 let Some(pl) = pool_lock else {
-                    return Ok(()); // pool's EXFER lock not indexed yet; retry next tick
+                    // Not yet indexed (lag) — or never matched. Surface it so a
+                    // persistently-stuck buy is diagnosable, not silent.
+                    tracing::warn!(
+                        swap = %rec.swap_id,
+                        htlcs = htlcs.len(),
+                        "buy claim: pool EXFER lock not found by hashlock yet; will retry"
+                    );
+                    return Ok(()); // retry next tick
                 };
                 let params = pl.get("params").cloned().unwrap_or_default();
                 let lock_tx_id =
@@ -988,9 +1007,10 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
                 }
                 continue;
             }
-            // Otherwise drive it forward.
+            // Otherwise drive it forward. Logged at warn (not debug) so a swap
+            // that's silently stuck mid-settlement is actually visible in logs.
             if let Err(e) = engine.advance(&rec).await {
-                tracing::debug!(swap = %rec.swap_id, error = %e, "swap advance retry");
+                tracing::warn!(swap = %rec.swap_id, status = ?rec.status, error = %e, "swap advance retry");
             }
         }
     }

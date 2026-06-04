@@ -543,6 +543,11 @@ impl SwapEngine {
     pub async fn lp_pool_info(&self) -> Result<serde_json::Value> {
         self.pool.lp_get("/api/lp").await
     }
+    pub async fn price_klines(&self, interval: &str, limit: u32) -> Result<serde_json::Value> {
+        self.pool
+            .lp_get(&format!("/api/price/klines?interval={interval}&limit={limit}"))
+            .await
+    }
     pub async fn lp_position(&self, exfer_address: &str) -> Result<serde_json::Value> {
         self.pool.lp_get(&format!("/api/lp/position/{exfer_address}")).await
     }

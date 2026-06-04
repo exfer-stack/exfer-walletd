@@ -82,6 +82,18 @@ pub async fn swap_pool_info(state: &ApiState) -> Result<Value> {
     engine(state)?.pool_info().await
 }
 
+pub async fn swap_price_klines(state: &ApiState, params: Value) -> Result<Value> {
+    let interval = params.get("interval").and_then(|v| v.as_str()).unwrap_or("1d");
+    // Keep the interval token URL-safe; the pool clamps the limit itself.
+    let interval = if interval.len() <= 4 && interval.chars().all(|c| c.is_ascii_alphanumeric()) {
+        interval
+    } else {
+        "1d"
+    };
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(120).min(500) as u32;
+    engine(state)?.price_klines(interval, limit).await
+}
+
 pub async fn bsc_get_address(state: &ApiState) -> Result<Value> {
     let addr = engine(state)?.bsc_address()?;
     Ok(serde_json::json!({ "address": addr }))

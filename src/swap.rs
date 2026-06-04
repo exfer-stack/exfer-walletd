@@ -59,6 +59,27 @@ fn parse_units_18(s: &str) -> Result<alloy::primitives::U256> {
         .map_err(|e| Error::BadParams(format!("bad amount: {e}")))
 }
 
+/// The funds-safety reveal-gate, as a pure predicate so it can be unit-tested
+/// without any network. Returns true ONLY when the pool's on-chain BNB lock is
+/// safe to claim against — i.e. safe to reveal our preimage. ALL must hold:
+///   - state == Locked (not None/Claimed/Refunded),
+///   - recipient == our derived BSC address (it pays US),
+///   - amount >= the quoted output (we get at least what we were promised),
+///   - enough time left before the lock's timeout to land our claim.
+/// If any is false we must NOT reveal the preimage (we'd give away the EXFER
+/// leg with nothing guaranteed in return).
+fn pool_lock_safe_to_claim(
+    oc: &crate::evm::OnChainSwap,
+    our: alloy::primitives::Address,
+    want_out: alloy::primitives::U256,
+    now: u64,
+) -> bool {
+    oc.state == crate::evm::HtlcState::Locked
+        && oc.recipient == our
+        && oc.amount >= want_out
+        && now + CLAIM_MARGIN_SECS < oc.timeout_sec
+}
+
 /// AAD binding the sealed journal to its purpose (domain separation from the
 /// seed/vault blobs).
 const JOURNAL_AAD: &[u8] = b"exfer-walletd/v1/swap-journal";
@@ -726,10 +747,12 @@ impl SwapEngine {
         Ok(self.journal.get(swap_id).unwrap_or(rec))
     }
 
-    /// Funds-safety gate (sell direction): verify the pool's USDT lock exists
+    /// Funds-safety gate (sell direction): verify the pool's BNB lock exists
     /// on BSC and is safe to claim against BEFORE we reveal the preimage. Must
     /// be Locked, paid to OUR address, cover the quoted output, and have enough
     /// time left to claim. Never trust the pool's self-reported status for this.
+    /// The decision itself is the pure [`pool_lock_safe_to_claim`] (unit-tested);
+    /// this method only does the I/O (read the on-chain swap) around it.
     async fn verify_pool_bsc_lock(&self, rec: &SwapRecord) -> Result<bool> {
         let htlc = match rec.htlc_contract.as_deref() {
             Some(h) => h,
@@ -744,16 +767,9 @@ impl SwapEngine {
         let want_out = alloy::primitives::U256::from_str_radix(&rec.amount_out_units, 10)
             .map_err(|e| Error::Internal(format!("bad amount_out_units: {e}")))?;
         let oc = self.evm.get_htlc_swap(htlc, &rec.hashlock).await?;
-        let cond_state = oc.state == crate::evm::HtlcState::Locked;
-        let cond_recip = oc.recipient == our;
-        let cond_amt = oc.amount >= want_out;
-        let cond_time = now_secs() + CLAIM_MARGIN_SECS < oc.timeout_sec;
-        tracing::debug!(
-            swap = %rec.swap_id,
-            state = ?oc.state, cond_state, cond_recip, cond_amt, cond_time,
-            "verify_pool_bsc_lock"
-        );
-        Ok(cond_state && cond_recip && cond_amt && cond_time)
+        let safe = pool_lock_safe_to_claim(&oc, our, want_out, now_secs());
+        tracing::debug!(swap = %rec.swap_id, state = ?oc.state, safe, "verify_pool_bsc_lock");
+        Ok(safe)
     }
 
     /// One monitor tick for a single swap: advance toward settlement, or refund
@@ -1104,6 +1120,95 @@ mod tests {
         assert!(
             res.is_err(),
             "wrong passphrase must not decrypt the journal"
+        );
+    }
+
+    // ---- funds-safety reveal-gate (the most important check in the engine) ----
+
+    use crate::evm::{HtlcState, OnChainSwap};
+    use alloy::primitives::{Address, U256};
+
+    fn locked_swap(recipient: Address, amount: U256, timeout_sec: u64) -> OnChainSwap {
+        OnChainSwap { recipient, amount, timeout_sec, state: HtlcState::Locked }
+    }
+
+    #[test]
+    fn reveal_gate_passes_only_when_all_conditions_hold() {
+        let us = Address::repeat_byte(0x11);
+        let want = U256::from(1000u64);
+        let now = 10_000u64;
+        // Healthy lock: Locked, pays us, covers the quote, plenty of time.
+        let oc = locked_swap(us, want, now + CLAIM_MARGIN_SECS + 60);
+        assert!(pool_lock_safe_to_claim(&oc, us, want, now));
+        // Over-collateralized (amount > want) is fine.
+        let oc = locked_swap(us, want + U256::from(1u64), now + CLAIM_MARGIN_SECS + 60);
+        assert!(pool_lock_safe_to_claim(&oc, us, want, now));
+    }
+
+    #[test]
+    fn reveal_gate_blocks_unsafe_locks() {
+        let us = Address::repeat_byte(0x11);
+        let attacker = Address::repeat_byte(0x22);
+        let want = U256::from(1000u64);
+        let now = 10_000u64;
+        let far = now + CLAIM_MARGIN_SECS + 60;
+
+        // Wrong recipient (lock pays someone else) → never reveal.
+        assert!(!pool_lock_safe_to_claim(&locked_swap(attacker, want, far), us, want, now));
+        // Underfunded (amount < quoted out) → never reveal.
+        assert!(!pool_lock_safe_to_claim(
+            &locked_swap(us, want - U256::from(1u64), far), us, want, now
+        ));
+        // Not enough time left before timeout to land our claim → never reveal.
+        assert!(!pool_lock_safe_to_claim(
+            &locked_swap(us, want, now + CLAIM_MARGIN_SECS - 1), us, want, now
+        ));
+        // Not in Locked state → never reveal.
+        for st in [HtlcState::None, HtlcState::Claimed, HtlcState::Refunded] {
+            let oc = OnChainSwap { recipient: us, amount: want, timeout_sec: far, state: st };
+            assert!(!pool_lock_safe_to_claim(&oc, us, want, now), "state {st:?} must block");
+        }
+    }
+
+    // ---- amount parsing (a wrong parse = wrong amount locked) ----
+
+    #[test]
+    fn parse_units_18_basics() {
+        use alloy::primitives::U256;
+        assert_eq!(parse_units_18("1").unwrap(), U256::from(10u64).pow(U256::from(18u64)));
+        assert_eq!(parse_units_18("0").unwrap(), U256::ZERO);
+        // 0.5 BNB = 5e17 wei
+        assert_eq!(
+            parse_units_18("0.5").unwrap(),
+            U256::from(5u64) * U256::from(10u64).pow(U256::from(17u64))
+        );
+        // full 18-dp precision
+        assert_eq!(parse_units_18("0.000000000000000001").unwrap(), U256::from(1u64));
+    }
+
+    #[test]
+    fn parse_units_18_rejects_bad_input() {
+        assert!(parse_units_18("abc").is_err());
+        assert!(parse_units_18("1.2.3").is_err());
+        // more than 18 fractional digits must be rejected, not silently truncated
+        assert!(parse_units_18("0.0000000000000000001").is_err());
+    }
+
+    #[test]
+    fn direction_serde_matches_wire_strings() {
+        // The pool + mobile speak these exact snake_case strings; a drift here
+        // would route the wrong leg.
+        assert_eq!(
+            serde_json::to_string(&Direction::ExferToBnb).unwrap(),
+            "\"exfer_to_bnb\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Direction::BnbToExfer).unwrap(),
+            "\"bnb_to_exfer\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Direction>("\"exfer_to_bnb\"").unwrap(),
+            Direction::ExferToBnb
         );
     }
 }

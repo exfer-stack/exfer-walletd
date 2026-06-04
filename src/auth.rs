@@ -73,7 +73,14 @@ impl Scope {
             | "export_address"
             | "import_vault"
             // Deletion is destructive and can strand funds.
-            | "delete_address" => Scope::Spend,
+            | "delete_address"
+            // Cross-chain swap moves funds (quote reserves a preimage + seals
+            // the journal; execute/refund lock/reclaim on both legs) and
+            // bsc_send_bnb withdraws BNB — all require Spend, not Read.
+            | "swap_get_quote"
+            | "swap_execute"
+            | "swap_refund"
+            | "bsc_send_bnb" => Scope::Spend,
             "generate_address"
             | "generate_independent_address"
             | "generate_standard_address"

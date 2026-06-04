@@ -692,6 +692,38 @@ async fn delete_address(state: &ApiState, params: Value) -> Result<Value> {
                 )));
             }
         }
+
+        // Off-chain LP guard. The on-chain balance check above is blind to the
+        // pool's off-chain LP share ledger: an address with a 0 on-chain
+        // balance can still own a position, and deleting it strands the funds
+        // (a self-serve withdrawal auto-returns EXFER to this now-unspendable
+        // address). When swap is configured, ask the pool for the position; a
+        // non-zero share count — OR an unreachable pool we can't clear — blocks
+        // the (irreversible) delete unless `force` is set. Fail CLOSED.
+        if let Some(engine) = state.engine.as_ref() {
+            match engine.lp_position(&address).await {
+                Ok(pos) => {
+                    let has = pos.get("has_position").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let shares = pos.get("shares").and_then(|v| v.as_str()).unwrap_or("0");
+                    let has_shares = shares != "0" && !shares.is_empty();
+                    if has || has_shares {
+                        return Err(Error::BadParams(format!(
+                            "address {address} still owns liquidity-pool shares ({shares}) — \
+                             withdraw the position first, or pass \"force\": true to delete \
+                             anyway (the LP funds are stranded if you do)."
+                        )));
+                    }
+                }
+                Err(e) => {
+                    return Err(Error::BadParams(format!(
+                        "could not verify the liquidity-pool position of {address} ({e}); \
+                         refusing to delete a key that might still own LP shares. Retry when \
+                         the pool is reachable, or pass \"force\": true to delete without \
+                         checking."
+                    )));
+                }
+            }
+        }
     }
 
     let store = state.store.clone();

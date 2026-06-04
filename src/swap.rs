@@ -148,6 +148,9 @@ pub struct SwapRecord {
     pub bsc_timeout_sec: Option<u64>,
     /// Quote expiry (unix seconds); after this an unexecuted quote is dead.
     pub expires_at: u64,
+    /// AMM fee in basis points (e.g. 30 = 0.30%), reflected in amount_out.
+    #[serde(default)]
+    pub fee_bps: u32,
 
     pub error: Option<String>,
     pub created_at: u64,
@@ -307,6 +310,8 @@ struct QuoteResp {
     amount_in_units: String,
     amount_out_units: String,
     expires_at: u64,
+    #[serde(default)]
+    fee_bps: u32,
     // Present for both directions (sell only carries an EXFER lock in
     // `instructions`, but we still need the BSC contract ref to verify/relay).
     #[serde(default)]
@@ -357,6 +362,19 @@ impl PoolClient {
         resp.json::<QuoteResp>()
             .await
             .map_err(|e| Error::UpstreamUnexpected(format!("pool quote decode: {e}")))
+    }
+
+    /// GET /api/pool → indicative pool stats (mid price + fee) for the UI's
+    /// pre-quote rate preview. Best-effort: a flaky pool just hides the preview.
+    async fn pool_info(&self) -> Result<serde_json::Value> {
+        self.http
+            .get(format!("{}/api/pool", self.base_url))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool /api/pool: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("pool info decode: {e}")))
     }
 
     async fn get_swap(&self, id: &str) -> Result<serde_json::Value> {
@@ -458,6 +476,16 @@ impl SwapEngine {
 
     pub fn journal(&self) -> &Arc<Journal> {
         &self.journal
+    }
+
+    /// Indicative pool stats for the UI's pre-quote rate preview:
+    /// `{ mid_price_bnb_per_exfer, fee_bps }`. Best-effort.
+    pub async fn pool_info(&self) -> Result<serde_json::Value> {
+        let v = self.pool.pool_info().await?;
+        Ok(serde_json::json!({
+            "mid_price_bnb_per_exfer": v.get("mid_price_bnb_per_exfer").cloned().unwrap_or(serde_json::Value::Null),
+            "fee_bps": v.get("fee_bps").cloned().unwrap_or(serde_json::Value::Null),
+        }))
     }
 
     /// Derived BSC address (EIP-55) for receiving / depositing BNB.
@@ -566,6 +594,7 @@ impl SwapEngine {
             exfer_timeout_height: q.instructions.exfer.as_ref().map(|e| e.timeout_height),
             bsc_timeout_sec: q.instructions.bsc.as_ref().map(|b| b.timeout_sec),
             expires_at: q.expires_at,
+            fee_bps: q.fee_bps,
             error: None,
             created_at: now,
             updated_at: now,
@@ -1009,6 +1038,7 @@ mod tests {
             exfer_timeout_height: None,
             bsc_timeout_sec: None,
             expires_at: now + 600,
+            fee_bps: 30,
             error: None,
             created_at: now,
             updated_at: now,

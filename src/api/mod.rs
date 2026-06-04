@@ -337,6 +337,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "swap_refund" => swap::swap_refund(state, req.params).await,
         "swap_status" => swap::swap_status(state, req.params).await,
         "swap_list" => swap::swap_list(state).await,
+        "swap_pool_info" => swap::swap_pool_info(state).await,
         "bsc_get_address" => swap::bsc_get_address(state).await,
         "bsc_get_balances" => swap::bsc_get_balances(state).await,
         "bsc_send_bnb" => swap::bsc_send_bnb(state, req.params).await,

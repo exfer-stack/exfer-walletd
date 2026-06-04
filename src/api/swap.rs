@@ -78,6 +78,10 @@ pub async fn swap_list(state: &ApiState) -> Result<Value> {
     to_value(engine(state)?.journal().list())
 }
 
+pub async fn swap_pool_info(state: &ApiState) -> Result<Value> {
+    engine(state)?.pool_info().await
+}
+
 pub async fn bsc_get_address(state: &ApiState) -> Result<Value> {
     let addr = engine(state)?.bsc_address()?;
     Ok(serde_json::json!({ "address": addr }))

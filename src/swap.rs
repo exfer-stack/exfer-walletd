@@ -950,6 +950,35 @@ impl SwapEngine {
                     .get("timeout_height")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+
+                // Funds-safety reveal-gate (buy direction, #8): claiming reveals our
+                // preimage on-chain, which lets the pool collect our full BNB lock.
+                // So BEFORE revealing we verify the pool's EXFER lock actually covers
+                // the quote from AUTHORITATIVE indexer data: it must lock at least
+                // amount_out_units, and its timeout must leave us a safe reclaim
+                // margin. A malicious/underfunded pool could otherwise lock too
+                // little EXFER (or one about to expire) yet still claim our BNB. On
+                // any failure we ABORT here WITHOUT revealing the preimage.
+                let lock_amount = pl.get("amount").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    Error::UpstreamUnexpected("indexed htlc missing amount".into())
+                })?;
+                let want_out: u64 = rec.amount_out_units.parse().map_err(|e| {
+                    Error::Internal(format!("bad amount_out_units: {e}"))
+                })?;
+                if lock_amount < want_out {
+                    return Err(Error::UpstreamUnexpected(format!(
+                        "pool EXFER lock underfunded: locked {lock_amount} < quoted {want_out}; \
+                         refusing to reveal preimage"
+                    )));
+                }
+                let tip = self.node.get_block_height().await?.height;
+                if timeout < tip + MIN_EXFER_LOCK_BLOCKS {
+                    return Err(Error::UpstreamUnexpected(format!(
+                        "pool EXFER lock timeout too short: {timeout} < tip {tip} + \
+                         {MIN_EXFER_LOCK_BLOCKS}; refusing to reveal preimage"
+                    )));
+                }
+
                 let preimage = hex::decode(strip0x(&rec.preimage))
                     .map_err(|e| Error::Internal(format!("bad preimage: {e}")))?;
                 let receipt = crate::tx::htlc::htlc_claim(

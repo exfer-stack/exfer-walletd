@@ -341,11 +341,27 @@ struct QuoteResp {
 }
 
 impl PoolClient {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-        }
+    pub fn new(base_url: impl Into<String>, ca_pem: Option<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        // When a pool CA is pinned, trust ONLY it (disable the public CA bundle)
+        // so a self-signed pool cert is verified, but a MITM holding any
+        // CA-signed cert cannot impersonate the pool and tamper with quotes /
+        // deposit addresses. Absent → default client (public roots / plain HTTP).
+        let http = match ca_pem {
+            Some(pem) if !pem.trim().is_empty() => reqwest::Certificate::from_pem(pem.as_bytes())
+                .and_then(|cert| {
+                    reqwest::Client::builder()
+                        .add_root_certificate(cert)
+                        .tls_built_in_root_certs(false)
+                        .build()
+                })
+                .unwrap_or_else(|e| {
+                    tracing::error!("pinned pool CA invalid ({e}); using default TLS client");
+                    reqwest::Client::new()
+                }),
+            _ => reqwest::Client::new(),
+        };
+        Self { http, base_url }
     }
 
     async fn quote(
@@ -468,6 +484,8 @@ impl PoolClient {
 #[derive(Clone)]
 pub struct EngineConfig {
     pub pool_url: String,
+    /// PEM of the pool's TLS cert to pin (self-signed HTTPS). None → default TLS.
+    pub pool_ca_pem: Option<String>,
     pub bsc_rpc_url: String,
     pub bsc_chain_id: u64,
 }
@@ -506,7 +524,7 @@ impl SwapEngine {
         cfg: EngineConfig,
     ) -> Self {
         let evm = EvmClient::new(cfg.bsc_rpc_url.clone(), cfg.bsc_chain_id);
-        let pool = PoolClient::new(cfg.pool_url.clone());
+        let pool = PoolClient::new(cfg.pool_url.clone(), cfg.pool_ca_pem.clone());
         Self {
             store,
             node,

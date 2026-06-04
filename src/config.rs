@@ -206,6 +206,13 @@ pub struct Config {
     #[arg(long, env = "WALLETD_SWAP_POOL")]
     pub swap_pool_url: Option<String>,
 
+    /// PEM of the swap pool's TLS certificate to PIN: trust ONLY this cert for
+    /// the pool connection (the public CA bundle is disabled for it). Lets the
+    /// pool use a self-signed cert while still preventing a MITM from tampering
+    /// with quotes / deposit addresses. Unset → default TLS roots / plain HTTP.
+    #[arg(long, env = "WALLETD_SWAP_POOL_CA")]
+    pub swap_pool_ca: Option<String>,
+
     /// BSC JSON-RPC endpoint for the swap engine's BNB leg. Defaults to BSC
     /// mainnet; point at a testnet dataseed (chain 97) for QA.
     #[arg(
@@ -312,6 +319,7 @@ mod tests {
             indexer_token: None,
             indexer_timeout_secs: None,
             swap_pool_url: None,
+            swap_pool_ca: None,
             bsc_rpc_url: "https://bsc-dataseed1.binance.org".into(),
             bsc_chain_id: 56,
         }

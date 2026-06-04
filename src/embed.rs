@@ -254,6 +254,7 @@ pub async fn run_embedded(
                 journal,
                 crate::swap::EngineConfig {
                     pool_url,
+                    pool_ca_pem: cfg.swap_pool_ca.clone(),
                     bsc_rpc_url: cfg.bsc_rpc_url.clone(),
                     bsc_chain_id: cfg.bsc_chain_id,
                 },

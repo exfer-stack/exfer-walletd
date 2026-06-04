@@ -241,4 +241,18 @@ pub trait WalletStore: Send + Sync + 'static {
         address_hex: &str,
         passphrase: &[u8],
     ) -> Result<zeroize::Zeroizing<[u8; 32]>>;
+
+    /// Verify `passphrase` and return the raw 32-byte secp256k1 secret for the
+    /// BSC/EVM address (the `m/44'/60'/0'/0/0` key). Lets the user export their
+    /// BNB key into MetaMask-style wallets. Wrong passphrase → `KeystoreLocked`;
+    /// seedless wallet → `BadParams`. Sensitive — only on explicit opt-in.
+    fn reveal_evm_secret(
+        &self,
+        passphrase: &[u8],
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        // Default: re-use the passphrase check the seed-backed store already
+        // does for mnemonics, then hand back the EVM secret.
+        self.reveal_mnemonic(passphrase)?;
+        self.evm_secret()
+    }
 }

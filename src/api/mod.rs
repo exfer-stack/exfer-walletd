@@ -396,6 +396,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- sensitive recovery export (passphrase-gated, spend-scope) ----
         "reveal_mnemonic" => reveal_mnemonic(state, req.params).await,
         "reveal_private_key" => reveal_private_key(state, req.params).await,
+        "reveal_evm_private_key" => reveal_evm_private_key(state, req.params).await,
         "reveal_address_mnemonic" => reveal_address_mnemonic(state, req.params).await,
 
         // ---- wallet-side conveniences ----
@@ -1215,6 +1216,32 @@ async fn reveal_private_key(state: &ApiState, params: Value) -> Result<Value> {
     Ok(serde_json::json!({
         "address":    address,
         "secret_hex": secret_hex,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct RevealEvmKeyParams {
+    passphrase: String,
+}
+
+/// Reveal the BSC/EVM (secp256k1) private key for the wallet's BNB address —
+/// the `m/44'/60'/0'/0/0` key — so the user can import it into MetaMask-style
+/// wallets ("Import account → Private key"). Returns the 0x-prefixed hex plus
+/// the address it controls, for confirmation. Spend-scoped + passphrase-gated.
+async fn reveal_evm_private_key(state: &ApiState, params: Value) -> Result<Value> {
+    let p: RevealEvmKeyParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("reveal_evm_private_key params: {e}")))?;
+    let store = state.store.clone();
+    let pass = p.passphrase;
+    let secret = tokio::task::spawn_blocking(move || store.reveal_evm_secret(pass.as_bytes()))
+        .await
+        .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
+    let address = crate::evm::evm_address(&secret)?;
+    let private_key_hex = format!("0x{}", hex::encode(secret.as_ref()));
+    tracing::warn!(address = %address, "reveal_evm_private_key served — sensitive output");
+    Ok(serde_json::json!({
+        "address":         address,
+        "private_key_hex": private_key_hex,
     }))
 }
 

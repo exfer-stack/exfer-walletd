@@ -600,6 +600,12 @@ impl WalletStore for KeyringStore {
         Ok(signer)
     }
 
+    fn reveal_evm_secret(&self, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        // Same gate as reveal_mnemonic: wrong passphrase → KeystoreLocked.
+        self.verify_passphrase(passphrase)?;
+        self.evm_secret()
+    }
+
     fn evm_secret(&self) -> Result<Zeroizing<[u8; 32]>> {
         let seed = self.seed.as_ref().ok_or_else(|| {
             Error::BadParams(

@@ -65,6 +65,8 @@ impl Scope {
             | "sign_message"
             | "reveal_mnemonic"
             | "reveal_private_key"
+            // BSC/EVM private key export (for MetaMask import).
+            | "reveal_evm_private_key"
             // Per-address recovery phrase reveals raw key material.
             | "reveal_address_mnemonic"
             // Vault export/import move raw key material; gate at the

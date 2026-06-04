@@ -409,6 +409,30 @@ impl PoolClient {
             .map_err(|e| Error::UpstreamUnexpected(format!("pool swap decode: {e}")))
     }
 
+    // ── liquidity-provider proxies (thin pass-throughs to the pool's /api/lp) ──
+    async fn lp_get(&self, path: &str) -> Result<serde_json::Value> {
+        self.http
+            .get(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool {path}: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("pool {path} decode: {e}")))
+    }
+
+    async fn lp_post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+        self.http
+            .post(format!("{}{}", self.base_url, path))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool {path}: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("pool {path} decode: {e}")))
+    }
+
     async fn notify_exfer_lock(&self, id: &str, tx_id: &str) -> Result<()> {
         self.http
             .post(format!("{}/api/swap/{id}/notify-exfer-lock", self.base_url))
@@ -513,6 +537,27 @@ impl SwapEngine {
             "exfer_reserve": reserves.and_then(|r| r.get("exfer")).cloned().unwrap_or(serde_json::Value::Null),
             "bnb_reserve": reserves.and_then(|r| r.get("bnb")).cloned().unwrap_or(serde_json::Value::Null),
         }))
+    }
+
+    // ── liquidity-provider proxies (pass the pool's /api/lp through to the app) ──
+    pub async fn lp_pool_info(&self) -> Result<serde_json::Value> {
+        self.pool.lp_get("/api/lp").await
+    }
+    pub async fn lp_position(&self, exfer_address: &str) -> Result<serde_json::Value> {
+        self.pool.lp_get(&format!("/api/lp/position/{exfer_address}")).await
+    }
+    pub async fn lp_deposit_start(&self, exfer_address: &str, bsc_address: &str) -> Result<serde_json::Value> {
+        self.pool
+            .lp_post("/api/lp/deposit/start", serde_json::json!({ "exfer_address": exfer_address, "bsc_address": bsc_address }))
+            .await
+    }
+    pub async fn lp_deposit_status(&self, id: &str) -> Result<serde_json::Value> {
+        self.pool.lp_get(&format!("/api/lp/deposit/{id}")).await
+    }
+    pub async fn lp_withdraw_self(&self, exfer_address: &str, shares: &str) -> Result<serde_json::Value> {
+        self.pool
+            .lp_post("/api/lp/withdraw/self", serde_json::json!({ "exfer_address": exfer_address, "shares": shares }))
+            .await
     }
 
     /// Derived BSC address (EIP-55) for receiving / depositing BNB.

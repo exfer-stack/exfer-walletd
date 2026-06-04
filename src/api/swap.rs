@@ -87,6 +87,50 @@ pub async fn bsc_get_address(state: &ApiState) -> Result<Value> {
     Ok(serde_json::json!({ "address": addr }))
 }
 
+// ── liquidity-provider proxies ──
+#[derive(Deserialize)]
+struct LpAddrParams {
+    address: String,
+}
+#[derive(Deserialize)]
+struct LpDepositStartParams {
+    exfer_address: String,
+    bsc_address: String,
+}
+#[derive(Deserialize)]
+struct LpIdParams {
+    id: String,
+}
+#[derive(Deserialize)]
+struct LpWithdrawParams {
+    exfer_address: String,
+    shares: String,
+}
+
+pub async fn lp_pool_info(state: &ApiState) -> Result<Value> {
+    engine(state)?.lp_pool_info().await
+}
+pub async fn lp_position(state: &ApiState, params: Value) -> Result<Value> {
+    let p: LpAddrParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("lp_position params: {e}")))?;
+    engine(state)?.lp_position(&p.address).await
+}
+pub async fn lp_deposit_start(state: &ApiState, params: Value) -> Result<Value> {
+    let p: LpDepositStartParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("lp_deposit_start params: {e}")))?;
+    engine(state)?.lp_deposit_start(&p.exfer_address, &p.bsc_address).await
+}
+pub async fn lp_deposit_status(state: &ApiState, params: Value) -> Result<Value> {
+    let p: LpIdParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("lp_deposit_status params: {e}")))?;
+    engine(state)?.lp_deposit_status(&p.id).await
+}
+pub async fn lp_withdraw_self(state: &ApiState, params: Value) -> Result<Value> {
+    let p: LpWithdrawParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("lp_withdraw_self params: {e}")))?;
+    engine(state)?.lp_withdraw_self(&p.exfer_address, &p.shares).await
+}
+
 pub async fn bsc_get_balances(state: &ApiState) -> Result<Value> {
     let bnb = engine(state)?.bsc_balances().await?;
     Ok(serde_json::json!({ "bnb_wei": bnb }))

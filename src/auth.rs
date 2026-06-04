@@ -82,7 +82,9 @@ impl Scope {
             | "swap_get_quote"
             | "swap_execute"
             | "swap_refund"
-            | "bsc_send_bnb" => Scope::Spend,
+            | "bsc_send_bnb"
+            // LP cash-out triggers a pool payout to the user — fund-moving.
+            | "lp_withdraw_self" => Scope::Spend,
             "generate_address"
             | "generate_independent_address"
             | "generate_standard_address"

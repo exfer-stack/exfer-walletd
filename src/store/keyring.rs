@@ -623,6 +623,82 @@ impl KeyringStore {
         }
         Ok(())
     }
+
+    /// Build the vault's `evm_key` section: the independent BNB key's secret
+    /// (+ its mnemonic entropy when it has one) so a full-wallet vault restore
+    /// brings back the BNB identity too. None when there's no independent key.
+    /// NOT folded into the ed25519 `keys[]` — that array is rebuilt as ed25519.
+    fn export_evm_for_vault(&self) -> Result<Option<serde_json::Value>> {
+        let source = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            match state.evm_key.as_ref() {
+                None => return Ok(None),
+                Some(m) => m.source.clone(),
+            }
+        };
+        let secret = self.evm_secret()?;
+        let mut obj = serde_json::Map::new();
+        obj.insert("secret_hex".into(), serde_json::json!(hex::encode(*secret)));
+        obj.insert(
+            "source".into(),
+            serde_json::to_value(&source)
+                .map_err(|e| Error::Internal(format!("evm source serialize: {e}")))?,
+        );
+        if matches!(source, EvmKeySource::Generated | EvmKeySource::ImportedMnemonic) {
+            let mpath = self.root.join(IMPORTED_DIR).join(EVM_MNEMONIC_FILE);
+            if mpath.exists() {
+                let blob = std::fs::read(&mpath)?;
+                let entropy = sealed::unseal(&self.passphrase, EVM_MNEMONIC_AAD, &blob)?;
+                obj.insert(
+                    "mnemonic_entropy_hex".into(),
+                    serde_json::json!(hex::encode(&entropy[..])),
+                );
+            }
+        }
+        Ok(Some(serde_json::Value::Object(obj)))
+    }
+
+    /// Restore the BNB key from a vault's `evm_key` section. No-op (keeps the
+    /// existing one) if this wallet already has an independent EVM key, so a
+    /// restore never clobbers funds. The address is re-derived from the secret
+    /// (which also validates it), not trusted from the doc.
+    fn restore_evm_from_vault(&self, evm: &serde_json::Value) -> Result<()> {
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.evm_key.is_some() {
+                return Ok(());
+            }
+        }
+        let secret_hex = evm
+            .get("secret_hex")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::ParseError("vault evm_key missing secret_hex".into()))?;
+        let raw =
+            hex::decode(secret_hex).map_err(|e| Error::BadHex(format!("vault evm secret: {e}")))?;
+        let arr: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::ParseError("vault evm secret not 32 bytes".into()))?;
+        let secret = Zeroizing::new(arr);
+        let address = crate::evm::evm_address(&secret)
+            .map_err(|_| Error::ParseError("vault evm secret is not a valid key".into()))?;
+        let source: EvmKeySource = evm
+            .get("source")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or(EvmKeySource::ImportedKey);
+        let mnemonic = match evm.get("mnemonic_entropy_hex").and_then(|v| v.as_str()) {
+            Some(h) => {
+                let ent =
+                    hex::decode(h).map_err(|e| Error::BadHex(format!("vault evm entropy: {e}")))?;
+                Some(
+                    Mnemonic::from_entropy(&ent)
+                        .map_err(|e| Error::ParseError(format!("vault evm mnemonic: {e}")))?,
+                )
+            }
+            None => None,
+        };
+        self.persist_evm_key(&secret, mnemonic.as_ref(), &address, source)
+    }
 }
 
 /// BIP-39 seed: PBKDF2-HMAC-SHA512(mnemonic_phrase, "mnemonic" || ""),
@@ -1079,7 +1155,15 @@ impl WalletStore for KeyringStore {
                 "label": e.label,
             }));
         }
-        let doc = serde_json::json!({ "version": 1, "keys": keys });
+        let mut doc = serde_json::json!({ "version": 1, "keys": keys });
+        // A full-wallet vault (empty selection) also carries the independent
+        // BNB/EVM key so a restore brings back the BNB identity. Selective
+        // address exports don't (the EVM key isn't one of the picked addresses).
+        if addresses.is_empty() {
+            if let Some(evm) = self.export_evm_for_vault()? {
+                doc["evm_key"] = evm;
+            }
+        }
         let bytes = serde_json::to_vec(&doc)
             .map_err(|e| Error::Internal(format!("vault serialize: {e}")))?;
         sealed::seal(passphrase, VAULT_AAD, &bytes)
@@ -1227,6 +1311,11 @@ impl WalletStore for KeyringStore {
                 continue;
             }
             imported.push(self.import(&secret, label)?);
+        }
+        // Restore the independent BNB/EVM key if the vault carried one (newer
+        // full-wallet exports). No-op if this wallet already has one.
+        if let Some(evm) = doc.get("evm_key") {
+            self.restore_evm_from_vault(evm)?;
         }
         Ok(imported)
     }
@@ -1968,5 +2057,33 @@ mod tests {
         ));
         // Nothing was persisted.
         assert_eq!(store.evm_address_opt().unwrap(), None);
+    }
+
+    /// A full-wallet vault carries the independent BNB key: export → import into
+    /// a fresh wallet restores the same BSC address AND its recovery phrase.
+    #[test]
+    fn vault_roundtrips_the_evm_key() {
+        let dir = temp();
+        let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
+        let (evm_addr, words) = store.create_evm_key(false).unwrap();
+        let vault = store.export_vault(b"pw").unwrap();
+
+        // Import into a brand-new wallet that has no BNB key yet.
+        let dir2 = temp();
+        let store2 = KeyringStore::open_keyring(dir2.path(), b"pw").unwrap();
+        assert_eq!(store2.evm_address_opt().unwrap(), None);
+        store2.import_vault(&vault, b"pw").unwrap();
+
+        // Same BSC address + same recovery phrase came back, and it signs.
+        assert_eq!(store2.evm_address_opt().unwrap(), Some(evm_addr.clone()));
+        assert_eq!(store2.reveal_evm_mnemonic(b"pw").unwrap(), words);
+        assert_eq!(
+            crate::evm::evm_address(&store2.evm_secret().unwrap()).unwrap(),
+            evm_addr
+        );
+
+        // Re-importing never clobbers the existing key (no-op).
+        store2.import_vault(&vault, b"pw").unwrap();
+        assert_eq!(store2.reveal_evm_mnemonic(b"pw").unwrap(), words);
     }
 }

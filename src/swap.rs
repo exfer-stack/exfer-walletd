@@ -119,6 +119,10 @@ pub enum SwapStatus {
     Refunding,
     /// First lock reclaimed after timeout.
     Refunded,
+    /// A quote the user never executed — its validity window lapsed. NOT a
+    /// failure (no funds ever moved); it's a price quote that was never acted
+    /// on. Surfaced separately so it isn't shown as a failed swap.
+    Expired,
     /// Unrecoverable error (see `error`).
     Failed,
 }
@@ -187,7 +191,10 @@ impl SwapRecord {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            SwapStatus::Completed | SwapStatus::Refunded | SwapStatus::Failed
+            SwapStatus::Completed
+                | SwapStatus::Refunded
+                | SwapStatus::Expired
+                | SwapStatus::Failed
         )
     }
 }
@@ -1112,8 +1119,11 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
             if rec.status == SwapStatus::Quoted {
                 if now_secs() >= rec.expires_at {
                     let _ = engine.journal().update(&rec.swap_id, now_secs(), |r| {
-                        r.status = SwapStatus::Failed;
-                        r.error = Some("quote expired (never executed)".into());
+                        // A quote the user never executed is NOT a failure — no
+                        // funds moved. Mark it Expired (benign) so it isn't shown
+                        // as a failed swap.
+                        r.status = SwapStatus::Expired;
+                        r.error = None;
                     });
                 }
                 continue;

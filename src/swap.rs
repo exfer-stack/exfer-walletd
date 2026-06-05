@@ -172,6 +172,10 @@ pub struct SwapRecord {
     /// AMM fee in basis points (e.g. 30 = 0.30%), reflected in amount_out.
     #[serde(default)]
     pub fee_bps: u32,
+    /// Network fee (human BNB) the pool kept to cover its settlement gas —
+    /// already deducted from amount_out. Surfaced so the client can disclose it.
+    #[serde(default)]
+    pub network_fee_bnb: Option<String>,
 
     pub error: Option<String>,
     pub created_at: u64,
@@ -333,6 +337,8 @@ struct QuoteResp {
     expires_at: u64,
     #[serde(default)]
     fee_bps: u32,
+    #[serde(default)]
+    network_fee_bnb: Option<String>,
     // Present for both directions (sell only carries an EXFER lock in
     // `instructions`, but we still need the BSC contract ref to verify/relay).
     #[serde(default)]
@@ -690,6 +696,7 @@ impl SwapEngine {
             bsc_timeout_sec: q.instructions.bsc.as_ref().map(|b| b.timeout_sec),
             expires_at: q.expires_at,
             fee_bps: q.fee_bps,
+            network_fee_bnb: q.network_fee_bnb,
             error: None,
             created_at: now,
             updated_at: now,

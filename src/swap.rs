@@ -266,6 +266,17 @@ impl Journal {
         self.persist_locked(&map)
     }
 
+    /// Remove a record entirely (and persist). Used to prune un-executed quotes
+    /// that expired — they hold no funds and need no recovery, so keeping them
+    /// only clutters the user's history. Idempotent.
+    pub fn remove(&self, swap_id: &str) -> Result<()> {
+        let mut map = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if map.remove(swap_id).is_some() {
+            self.persist_locked(&map)?;
+        }
+        Ok(())
+    }
+
     pub fn get(&self, swap_id: &str) -> Option<SwapRecord> {
         self.records
             .lock()
@@ -1115,16 +1126,14 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
             _ = tokio::time::sleep(TICK) => {}
         }
         for rec in engine.journal().pending() {
-            // Expire quotes the user never executed.
+            // A quote the user never executed: once its validity lapses, just
+            // PRUNE it. No funds ever moved and there's nothing to recover, so a
+            // harmless price check shouldn't linger (as Expired) or — worse, as
+            // older builds did — show up as a failed swap. Deleting keeps the
+            // journal (and the user's history) to swaps they actually made.
             if rec.status == SwapStatus::Quoted {
                 if now_secs() >= rec.expires_at {
-                    let _ = engine.journal().update(&rec.swap_id, now_secs(), |r| {
-                        // A quote the user never executed is NOT a failure — no
-                        // funds moved. Mark it Expired (benign) so it isn't shown
-                        // as a failed swap.
-                        r.status = SwapStatus::Expired;
-                        r.error = None;
-                    });
+                    let _ = engine.journal().remove(&rec.swap_id);
                 }
                 continue;
             }

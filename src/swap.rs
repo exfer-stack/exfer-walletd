@@ -1115,8 +1115,18 @@ impl SwapEngine {
                     if let Ok(sw) = self.evm.get_htlc_swap(&htlc, &rec.hashlock).await {
                         match sw.state {
                             crate::evm::HtlcState::Claimed => {
+                                // Backfill the counterparty (pool's BNB) lock ref if
+                                // a flaky get_swap at the PoolLocked transition missed
+                                // it, so the detail view shows all legs (not just 2).
+                                let pool_lock = match rec.pool_lock_ref.clone() {
+                                    Some(p) => Some(p),
+                                    None => self.pool.get_swap(&rec.swap_id).await.ok().and_then(|pj| {
+                                        pj.get("poolLockTxhash").and_then(|v| v.as_str()).map(str::to_string)
+                                    }),
+                                };
                                 self.journal.update(&rec.swap_id, now_secs(), |r| {
                                     r.status = SwapStatus::Completed;
+                                    r.pool_lock_ref = pool_lock;
                                     r.error = None;
                                 })?;
                                 return Ok(());
@@ -1231,9 +1241,16 @@ impl SwapEngine {
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
                         .or_else(|| rec.claim_tx.clone());
+                    // Backfill the counterparty (pool's EXFER) lock ref if a flaky
+                    // get_swap at the PoolLocked transition missed it — the indexed
+                    // lock_tx_id is authoritative — so the detail view shows all legs.
+                    let pool_lock = rec.pool_lock_ref.clone().or_else(|| {
+                        pl.get("lock_tx_id").and_then(|v| v.as_str()).map(str::to_string)
+                    });
                     self.journal.update(&rec.swap_id, now_secs(), |r| {
                         r.status = SwapStatus::Completed;
                         r.claim_tx = claim_tx;
+                        r.pool_lock_ref = pool_lock;
                         r.error = None;
                     })?;
                     return Ok(());

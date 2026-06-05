@@ -1488,14 +1488,25 @@ impl SwapEngine {
 /// expire stale quotes, and reclaim past-deadline locks. Runs until shutdown.
 pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::CancellationToken) {
     const TICK: std::time::Duration = std::time::Duration::from_secs(3);
+    // Periodic safety net: re-verify "completed" swaps against authoritative
+    // on-chain state. A claim is marked Completed once it's IN a block — final
+    // enough almost always, but a deep reorg could orphan it after the fact. So
+    // rather than make every swap wait N confirmations (slower for everyone, for
+    // a rare event), we just re-check completed swaps on a timer: if a claim is
+    // no longer on-chain, reconcile_completed drops it back to re-settle (re-claim,
+    // or refund at timeout). Also recovers swaps an older build mismarked.
+    const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
     tracing::info!("swap monitor started");
-    // Recover any swap an older build falsely marked Completed before its claim
-    // actually confirmed (reorg/eviction), so the asset still gets settled.
     engine.reconcile_completed().await;
+    let mut last_reconcile = std::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(TICK) => {}
+        }
+        if last_reconcile.elapsed() >= RECONCILE_EVERY {
+            engine.reconcile_completed().await;
+            last_reconcile = std::time::Instant::now();
         }
         for rec in engine.journal().pending() {
             // A quote the user never executed: once its validity lapses, just

@@ -527,6 +527,13 @@ pub struct SwapEngine {
     journal: Arc<Journal>,
     /// Serializes BSC sends from our single derived account (nonce safety).
     bsc_lock: tokio::sync::Mutex<()>,
+    /// Per-swap_id async locks. execute()/refund() are check-then-act across long
+    /// awaits (broadcast a lock, then flip status); without this a double-tapped
+    /// or retried call would pass the status guard twice and lock the first leg
+    /// twice (extra BNB / orphaned EXFER lock / wasted gas). Holding a per-swap
+    /// lock serializes them so the loser re-reads a now non-Quoted status and
+    /// returns the existing record (idempotent).
+    swap_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 fn strip0x(s: &str) -> &str {
@@ -558,11 +565,22 @@ impl SwapEngine {
             pool,
             journal,
             bsc_lock: tokio::sync::Mutex::new(()),
+            swap_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn journal(&self) -> &Arc<Journal> {
         &self.journal
+    }
+
+    /// A lock unique to `swap_id`, so concurrent execute()/refund() calls for the
+    /// same swap run one-at-a-time. Entries are cheap and few (a wallet makes few
+    /// swaps), so they're left in the map rather than reaped.
+    fn swap_lock(&self, swap_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.swap_locks.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(swap_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Indicative pool stats for the UI's pre-quote rate preview:
@@ -623,11 +641,15 @@ impl SwapEngine {
 
     /// Native BNB balance (wei) for the derived BSC address, as a decimal
     /// string. Lets the UI pre-flight a buy (BNB is both principal and gas).
-    pub async fn bsc_balances(&self) -> Result<String> {
+    /// Returns `(bnb_wei, sweep_reserve_wei)` — the live balance and the wei the
+    /// UI should hold back when offering a "send everything" amount, so it can
+    /// show a real number (balance − reserve) instead of a placeholder.
+    pub async fn bsc_balances(&self) -> Result<(String, String)> {
         let secret = self.store.evm_secret()?;
         let addr = secret_address(&secret)?;
         let bnb = self.evm.bnb_balance(addr).await?;
-        Ok(bnb.to_string())
+        let reserve = self.evm.sweep_gas_reserve().await;
+        Ok((bnb.to_string(), reserve.to_string()))
     }
 
     /// Withdraw native BNB from the derived BSC address to an external wallet
@@ -637,11 +659,9 @@ impl SwapEngine {
         let secret = self.store.evm_secret()?;
         let addr = secret_address(&secret)?;
         let amount = if amount_human.trim().is_empty() || amount_human.eq_ignore_ascii_case("max") {
-            // Leave a small reserve for the transfer's own gas.
+            // Leave a (live-priced) reserve for the transfer's own gas.
             let bal = self.evm.bnb_balance(addr).await?;
-            let reserve = alloy::primitives::U256::from(300_000u64)
-                .saturating_mul(alloy::primitives::U256::from(5_000_000_000u64)); // ~gas*price
-            bal.saturating_sub(reserve)
+            bal.saturating_sub(self.evm.sweep_gas_reserve().await)
         } else {
             parse_units_18(amount_human)?
         };
@@ -725,6 +745,12 @@ impl SwapEngine {
 
     /// Execute the user's first leg (sell: lock EXFER; buy: lock native BNB).
     pub async fn execute(&self, swap_id: &str) -> Result<SwapRecord> {
+        // Hold the per-swap lock across the whole execute so a concurrent
+        // double-tap/retry can't also pass the Quoted guard and lock a second
+        // first-leg. The loser blocks here, then re-reads a non-Quoted status
+        // below and returns the existing record.
+        let swap_lock = self.swap_lock(swap_id);
+        let _guard = swap_lock.lock().await;
         let rec = self
             .journal
             .get(swap_id)
@@ -1065,6 +1091,10 @@ impl SwapEngine {
     /// Reclaim the user's first leg after its timeout. No funds are ever lost:
     /// the user always controls the refund arm of their own lock.
     pub async fn refund(&self, swap_id: &str) -> Result<SwapRecord> {
+        // Same per-swap lock as execute(): a double-tapped refund (or a UI refund
+        // racing the monitor's refund) must not broadcast two reclaims.
+        let swap_lock = self.swap_lock(swap_id);
+        let _guard = swap_lock.lock().await;
         let rec = self
             .journal
             .get(swap_id)

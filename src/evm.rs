@@ -107,6 +107,12 @@ pub struct EvmClient {
 const MIN_PRIORITY_FEE_WEI: u128 = 1_000_000_000;
 /// Hard cap on gas limit so a bad estimate can't drain BNB.
 const GAS_LIMIT_CAP: u64 = 800_000;
+/// Gas to hold back when sweeping the whole native balance. A plain BNB send is
+/// 21k gas; 60k leaves ~2.3× headroom (the estimator's +25%, a contract
+/// recipient, a price bump between read and send) while leaving far less dust
+/// than a fixed reserve. Fallback price when the node can't be reached.
+const SWEEP_GAS_BUDGET: u64 = 60_000;
+const FALLBACK_GAS_PRICE_WEI: u128 = 5_000_000_000;
 
 impl EvmClient {
     pub fn new(rpc_url: impl Into<String>, chain_id: u64) -> Self {
@@ -227,6 +233,17 @@ impl EvmClient {
     async fn gas_price(&self) -> Result<u128> {
         let r = self.rpc("eth_gasPrice", json!([])).await?;
         Self::hex_to_u128(Self::result_hex(&r)?)
+    }
+
+    /// Wei to hold back from a full-balance sweep so the transfer's own gas is
+    /// covered. Priced at the live gas price + priority fee (falling back to a
+    /// fixed price if the node is unreachable) over [`SWEEP_GAS_BUDGET`]. The
+    /// real fee is lower — the surplus stays in the wallet — but this guarantees
+    /// the sweep never under-funds its own gas.
+    pub async fn sweep_gas_reserve(&self) -> U256 {
+        let gas_price = self.gas_price().await.unwrap_or(FALLBACK_GAS_PRICE_WEI);
+        let max_fee = gas_price.saturating_add(MIN_PRIORITY_FEE_WEI);
+        U256::from(SWEEP_GAS_BUDGET).saturating_mul(U256::from(max_fee))
     }
 
     async fn estimate_gas_value(

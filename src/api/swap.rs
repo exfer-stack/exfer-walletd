@@ -255,8 +255,8 @@ pub async fn lp_withdraw_self(state: &ApiState, params: Value) -> Result<Value> 
 }
 
 pub async fn bsc_get_balances(state: &ApiState) -> Result<Value> {
-    let bnb = engine(state)?.bsc_balances().await?;
-    Ok(serde_json::json!({ "bnb_wei": bnb }))
+    let (bnb, gas_reserve) = engine(state)?.bsc_balances().await?;
+    Ok(serde_json::json!({ "bnb_wei": bnb, "gas_reserve_wei": gas_reserve }))
 }
 
 #[derive(Deserialize)]

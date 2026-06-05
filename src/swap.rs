@@ -97,6 +97,10 @@ const CLAIM_MARGIN_SECS: u64 = 600;
 /// a generous reclaim window even if the pool stalls/vanishes.
 const MIN_EXFER_LOCK_BLOCKS: u64 = 360; // ~1h at 10s blocks
 const MIN_BSC_LOCK_SECS: u64 = 2 * 3600;
+/// While a claim is broadcast but not yet confirmed on-chain, re-broadcast it at
+/// most this often if it hasn't landed (covers a reorg/mempool eviction without
+/// spamming the network every monitor tick).
+const CLAIM_REBROADCAST_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1101,26 +1105,65 @@ impl SwapEngine {
                     })?;
                 }
             }
-            // Sell: claim the pool's USDT (gasless relay, with self-claim fallback).
-            (SwapStatus::PoolLocked, Direction::ExferToBnb) => {
+            // Sell: claim the pool's BNB (gasless relay, with self-claim fallback).
+            // Completion is driven off the BSC HTLC state, not the claim broadcast,
+            // so a dropped/unmined claim is retried until the chain shows it claimed.
+            (SwapStatus::PoolLocked | SwapStatus::Claiming, Direction::ExferToBnb) => {
+                let htlc = rec.htlc_contract.clone().unwrap_or_default();
+                // Authoritative completion: read the on-chain HTLC state.
+                if !htlc.is_empty() {
+                    if let Ok(sw) = self.evm.get_htlc_swap(&htlc, &rec.hashlock).await {
+                        match sw.state {
+                            crate::evm::HtlcState::Claimed => {
+                                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                                    r.status = SwapStatus::Completed;
+                                    r.error = None;
+                                })?;
+                                return Ok(());
+                            }
+                            crate::evm::HtlcState::Refunded => {
+                                // Pool reclaimed its BNB (we never claimed in time) →
+                                // the swap failed; reclaim the user's EXFER lock.
+                                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                                    r.status = SwapStatus::Refunding;
+                                    r.error = Some(
+                                        "BNB claim never confirmed; pool refunded its lock — reclaiming your EXFER"
+                                            .into(),
+                                    );
+                                })?;
+                                return Ok(());
+                            }
+                            _ => {} // Locked / None → (re)claim below
+                        }
+                    }
+                }
+                // Throttle re-sends: send on first entry, then at most every
+                // CLAIM_REBROADCAST_SECS while awaiting confirmation (relay_claim is
+                // idempotent; a double on-chain claim just reverts — harmless).
+                let first = rec.status == SwapStatus::PoolLocked;
+                let due = now_secs().saturating_sub(rec.updated_at) >= CLAIM_REBROADCAST_SECS;
+                if !(first || due) {
+                    return Ok(());
+                }
                 match self.pool.relay_claim(&rec.swap_id, &rec.preimage).await {
                     Ok(v) => {
                         let tx = v.get("txhash").and_then(|x| x.as_str()).map(str::to_string);
                         self.journal.update(&rec.swap_id, now_secs(), |r| {
-                            r.status = SwapStatus::Completed;
-                            r.claim_tx = tx;
+                            r.status = SwapStatus::Claiming;
+                            if tx.is_some() {
+                                r.claim_tx = tx;
+                            }
                         })?;
                     }
                     Err(e) => {
                         // Fallback: self-submit if we hold BNB for gas.
                         let secret = self.store.evm_secret()?;
-                        let htlc = rec.htlc_contract.clone().unwrap_or_default();
                         let our = secret_address(&secret)?;
                         if !htlc.is_empty() && !self.evm.bnb_balance(our).await?.is_zero() {
                             let _guard = self.bsc_lock.lock().await;
                             let tx = self.evm.htlc_claim(&secret, &htlc, &rec.preimage).await?;
                             self.journal.update(&rec.swap_id, now_secs(), |r| {
-                                r.status = SwapStatus::Completed;
+                                r.status = SwapStatus::Claiming;
                                 r.claim_tx = Some(tx);
                             })?;
                         } else {
@@ -1129,8 +1172,15 @@ impl SwapEngine {
                     }
                 }
             }
-            // Buy: claim the pool's EXFER lock, revealing the preimage on-chain.
-            (SwapStatus::PoolLocked, Direction::BnbToExfer) => {
+            // Buy: claim the pool's EXFER lock, revealing the preimage. Completion
+            // is driven off the AUTHORITATIVE indexed HTLC state, never off the
+            // mere broadcast: a claim orphaned by a reorg/mempool eviction is
+            // re-sent until the chain shows it claimed. (The old code marked
+            // Completed right after broadcasting, leaving swaps falsely "completed"
+            // when the claim never confirmed — funds safe, but stuck + a dead
+            // explorer link.) Handles both first-claim (PoolLocked) and awaiting/
+            // re-sending (Claiming).
+            (SwapStatus::PoolLocked | SwapStatus::Claiming, Direction::BnbToExfer) => {
                 let indexer = self.indexer.as_ref().ok_or_else(|| {
                     Error::Internal("indexer required for buy-direction claim".into())
                 })?;
@@ -1170,38 +1220,68 @@ impl SwapEngine {
                     );
                     return Ok(()); // retry next tick
                 };
-                let params = pl.get("params").cloned().unwrap_or_default();
-                let lock_tx_id =
-                    pl.get("lock_tx_id")
+                let state = pl.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                // CLAIMED on-chain → settled. Record the AUTHORITATIVE claim tx_id
+                // (the indexed mined tx) so the explorer link always resolves — the
+                // self-broadcast hash we held may have been a dropped attempt.
+                if state == "claimed" {
+                    let claim_tx = pl
+                        .get("claim")
+                        .and_then(|c| c.get("tx_id"))
                         .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            Error::UpstreamUnexpected("indexed htlc missing lock_tx_id".into())
-                        })?;
-                let sender = params
-                    .get("sender")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        Error::UpstreamUnexpected("indexed htlc missing sender".into())
+                        .map(str::to_string)
+                        .or_else(|| rec.claim_tx.clone());
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::Completed;
+                        r.claim_tx = claim_tx;
+                        r.error = None;
                     })?;
-                let timeout = params
-                    .get("timeout_height")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                    return Ok(());
+                }
+                // RECLAIMED → the pool took its EXFER back because we never finalised
+                // the claim before the lock timed out. The swap failed; drop to
+                // Refunding so the user's BNB lock is reclaimed.
+                if state == "reclaimed" {
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::Refunding;
+                        r.error = Some(
+                            "EXFER claim never confirmed; pool reclaimed its lock — refunding your BNB"
+                                .into(),
+                        );
+                    })?;
+                    return Ok(());
+                }
+                // Still LOCKED. Re-broadcast the claim ONLY if our previous attempt
+                // is no longer on-chain/in mempool (dropped) — otherwise wait for it
+                // to mine and the indexer to flip to "claimed". First entry
+                // (PoolLocked, no claim_tx yet) always sends.
+                let prior_live = match rec.claim_tx.as_deref() {
+                    Some(tx) => self.node.get_transaction(tx).await.is_ok(),
+                    None => false,
+                };
+                if prior_live {
+                    return Ok(()); // claim in flight; awaiting confirmation
+                }
 
-                // Funds-safety reveal-gate (buy direction, #8): claiming reveals our
-                // preimage on-chain, which lets the pool collect our full BNB lock.
-                // So BEFORE revealing we verify the pool's EXFER lock actually covers
-                // the quote from AUTHORITATIVE indexer data: it must lock at least
-                // amount_out_units, and its timeout must leave us a safe reclaim
-                // margin. A malicious/underfunded pool could otherwise lock too
-                // little EXFER (or one about to expire) yet still claim our BNB. On
-                // any failure we ABORT here WITHOUT revealing the preimage.
+                let params = pl.get("params").cloned().unwrap_or_default();
+                let lock_tx_id = pl.get("lock_tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::UpstreamUnexpected("indexed htlc missing lock_tx_id".into())
+                })?;
+                let sender = params.get("sender").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::UpstreamUnexpected("indexed htlc missing sender".into())
+                })?;
+                let timeout = params.get("timeout_height").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                // Funds-safety reveal-gate (buy direction, #8) — re-checked before
+                // EVERY (re)send: the pool's EXFER lock must cover the quote and
+                // leave a safe reclaim margin, else we ABORT without revealing.
                 let lock_amount = pl.get("amount").and_then(|v| v.as_u64()).ok_or_else(|| {
                     Error::UpstreamUnexpected("indexed htlc missing amount".into())
                 })?;
-                let want_out: u64 = rec.amount_out_units.parse().map_err(|e| {
-                    Error::Internal(format!("bad amount_out_units: {e}"))
-                })?;
+                let want_out: u64 = rec
+                    .amount_out_units
+                    .parse()
+                    .map_err(|e| Error::Internal(format!("bad amount_out_units: {e}")))?;
                 if lock_amount < want_out {
                     return Err(Error::UpstreamUnexpected(format!(
                         "pool EXFER lock underfunded: locked {lock_amount} < quoted {want_out}; \
@@ -1215,7 +1295,6 @@ impl SwapEngine {
                          {MIN_EXFER_LOCK_BLOCKS}; refusing to reveal preimage"
                     )));
                 }
-
                 let preimage = hex::decode(strip0x(&rec.preimage))
                     .map_err(|e| Error::Internal(format!("bad preimage: {e}")))?;
                 let receipt = crate::tx::htlc::htlc_claim(
@@ -1229,8 +1308,10 @@ impl SwapEngine {
                     &self.node,
                 )
                 .await?;
+                // Claiming (not Completed): the indexer "claimed" state above is
+                // what finally completes it, after this confirms.
                 self.journal.update(&rec.swap_id, now_secs(), |r| {
-                    r.status = SwapStatus::Completed;
+                    r.status = SwapStatus::Claiming;
                     r.claim_tx = Some(receipt.tx_id);
                 })?;
             }
@@ -1241,6 +1322,79 @@ impl SwapEngine {
 
     /// Whether the user's first leg is past its refund deadline (so a reclaim
     /// can succeed). Sell: EXFER block height ≥ timeout. Buy: unix time ≥ timeout.
+    /// One-time startup reconcile (see [`run_monitor`]): an older build marked a
+    /// swap Completed right after BROADCASTING the claim, so a claim later orphaned
+    /// by a reorg left it falsely "completed" — funds safe, but the asset never
+    /// arrived. Re-verify recently-completed swaps against authoritative on-chain
+    /// state; if the claim isn't actually there, drop back to PoolLocked so the
+    /// monitor re-settles (re-claims, or refunds at timeout). Best-effort: any
+    /// lookup error leaves the record untouched.
+    pub async fn reconcile_completed(&self) {
+        let now = now_secs();
+        const WINDOW_SECS: u64 = 48 * 3600; // beyond the timeout window it's final
+        for rec in self.journal.list() {
+            if rec.status != SwapStatus::Completed
+                || now.saturating_sub(rec.updated_at) > WINDOW_SECS
+            {
+                continue;
+            }
+            if self.claim_is_confirmed(&rec).await == Some(false) {
+                let _ = self.journal.update(&rec.swap_id, now, |r| {
+                    r.status = SwapStatus::PoolLocked;
+                    r.error = Some("recovered: claim was not confirmed on-chain — re-settling".into());
+                });
+                tracing::warn!(
+                    swap = %rec.swap_id, direction = ?rec.direction,
+                    "reconcile: completed swap had no confirmed on-chain claim; re-settling"
+                );
+            }
+        }
+    }
+
+    /// Authoritative "did the claim actually land on-chain?" — Some(true)=claimed,
+    /// Some(false)=the lock exists but isn't claimed (re-claimable / refundable),
+    /// None=unknown (lookup failed; don't touch the record).
+    async fn claim_is_confirmed(&self, rec: &SwapRecord) -> Option<bool> {
+        match rec.direction {
+            Direction::BnbToExfer => {
+                let indexer = self.indexer.as_ref()?;
+                let from = rec.our_exfer_address.clone()?;
+                let signer = self.load_signer(&from).await.ok()?;
+                let our_pubkey = hex::encode(signer.pubkey()).to_lowercase();
+                let our_addr = strip0x(&from).to_lowercase();
+                let resp = indexer
+                    .htlc_lookup_by_hashlock(serde_json::json!({ "hash_lock": strip0x(&rec.hashlock) }))
+                    .await
+                    .ok()?;
+                let htlcs = resp.get("htlcs")?.as_array()?;
+                let pl = htlcs.iter().find(|h| {
+                    h.get("params")
+                        .and_then(|p| p.get("receiver"))
+                        .and_then(|v| v.as_str())
+                        .map(|r| {
+                            let r = r.to_lowercase();
+                            r == our_pubkey || r == our_addr
+                        })
+                        .unwrap_or(false)
+                })?;
+                match pl.get("state").and_then(|v| v.as_str()).unwrap_or("") {
+                    "claimed" => Some(true),
+                    "locked" | "reclaimed" => Some(false),
+                    _ => None,
+                }
+            }
+            Direction::ExferToBnb => {
+                let htlc = rec.htlc_contract.as_deref()?;
+                let sw = self.evm.get_htlc_swap(htlc, &rec.hashlock).await.ok()?;
+                match sw.state {
+                    crate::evm::HtlcState::Claimed => Some(true),
+                    crate::evm::HtlcState::Locked | crate::evm::HtlcState::Refunded => Some(false),
+                    crate::evm::HtlcState::None => None,
+                }
+            }
+        }
+    }
+
     async fn refundable(&self, rec: &SwapRecord) -> bool {
         match rec.direction {
             Direction::ExferToBnb => {
@@ -1318,6 +1472,9 @@ impl SwapEngine {
 pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::CancellationToken) {
     const TICK: std::time::Duration = std::time::Duration::from_secs(3);
     tracing::info!("swap monitor started");
+    // Recover any swap an older build falsely marked Completed before its claim
+    // actually confirmed (reorg/eviction), so the asset still gets settled.
+    engine.reconcile_completed().await;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -1335,9 +1492,17 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
                 }
                 continue;
             }
-            // Past the refund deadline → reclaim the user's lock.
-            if matches!(rec.status, SwapStatus::UserLocked | SwapStatus::PoolLocked)
-                && engine.refundable(&rec).await
+            // Past the refund deadline → reclaim the user's lock. Includes
+            // Claiming (a claim that never confirmed in the whole timeout window)
+            // and Refunding (we already detected the counterparty reclaimed and are
+            // waiting for our own lock's timeout to recover it).
+            if matches!(
+                rec.status,
+                SwapStatus::UserLocked
+                    | SwapStatus::PoolLocked
+                    | SwapStatus::Claiming
+                    | SwapStatus::Refunding
+            ) && engine.refundable(&rec).await
             {
                 if let Err(e) = engine.refund(&rec.swap_id).await {
                     tracing::debug!(swap = %rec.swap_id, error = %e, "swap refund retry");

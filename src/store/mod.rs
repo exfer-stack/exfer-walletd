@@ -318,3 +318,22 @@ pub trait WalletStore: Send + Sync + 'static {
         ))
     }
 }
+
+/// Validate a vault blob WITHOUT a keystore: confirm it decrypts with
+/// `passphrase` and is well-formed, returning how many addresses it carries.
+/// Lets onboarding check the file + backup password BEFORE creating a wallet —
+/// a wrong password must NOT leave a half-created wallet behind, because the app
+/// auto-navigates into the wallet the moment walletd reports "ready". A wrong
+/// password / non-vault file fails the AEAD unseal here, before anything is made.
+pub fn validate_vault(blob: &[u8], passphrase: &[u8]) -> Result<usize> {
+    // Same AAD as keyring::{export,import}_vault.
+    const VAULT_AAD: &[u8] = b"exfer-walletd/v1/vault";
+    let bytes = sealed::unseal(passphrase, VAULT_AAD, blob)?;
+    let doc: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| crate::error::Error::ParseError(format!("vault: {e}")))?;
+    let keys = doc
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| crate::error::Error::ParseError("vault: missing `keys`".into()))?;
+    Ok(keys.len())
+}

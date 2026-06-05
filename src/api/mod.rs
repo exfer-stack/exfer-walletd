@@ -352,6 +352,7 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         "bsc_delete_key" => swap::bsc_delete_key(state, req.params).await,
         "bsc_get_balances" => swap::bsc_get_balances(state).await,
         "bsc_send_bnb" => swap::bsc_send_bnb(state, req.params).await,
+        "bsc_tx_history" => swap::bsc_tx_history(state).await,
 
         // ---- payment URI codec (pure) ----
         "payment_uri_encode" => payment_uri::payment_uri_encode(req.params).await,

@@ -106,6 +106,7 @@ fn build_config(datadir: std::path::PathBuf) -> Config {
         indexer_token: None,
         indexer_timeout_secs: None,
         swap_pool_url: None,
+        swap_pool_ca: None,
         bsc_rpc_url: "https://bsc-dataseed1.binance.org".into(),
         bsc_chain_id: 56,
     }

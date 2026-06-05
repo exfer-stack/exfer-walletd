@@ -273,3 +273,7 @@ pub async fn bsc_send_bnb(state: &ApiState, params: Value) -> Result<Value> {
     let txhash = engine(state)?.send_bnb(&p.to, &p.amount).await?;
     Ok(serde_json::json!({ "txhash": txhash }))
 }
+
+pub async fn bsc_tx_history(state: &ApiState) -> Result<Value> {
+    engine(state)?.bnb_tx_history().await
+}

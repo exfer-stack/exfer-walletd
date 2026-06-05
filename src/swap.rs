@@ -85,6 +85,11 @@ fn pool_lock_safe_to_claim(
 const JOURNAL_AAD: &[u8] = b"exfer-walletd/v1/swap-journal";
 const JOURNAL_FILE: &str = "swaps.enc";
 
+/// AAD + filename for the native-BNB transfer log (a separate domain from the
+/// swap journal so a blob from one can never be decrypted as the other).
+const BNBLOG_AAD: &[u8] = b"exfer-walletd/v1/bnb-txlog";
+const BNBLOG_FILE: &str = "bnb-txs.enc";
+
 /// Margin before the pool's BSC lock expiry within which we still consider it
 /// safe to reveal the preimage (the claim needs time to mine).
 const CLAIM_MARGIN_SECS: u64 = 600;
@@ -310,6 +315,119 @@ impl Journal {
     }
 }
 
+// ───────────────────────── BNB tx log ─────────────────────────
+
+/// One native-BNB transfer we initiated. `status` starts "pending" and the
+/// monitor flips it to "confirmed"/"failed" from the on-chain receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BnbTx {
+    /// 0x-prefixed 32-byte tx hash (routes to BscScan in the UI).
+    pub hash: String,
+    /// "out" for a withdrawal we sent. (Deposits, when added, will be "in".)
+    pub direction: String,
+    /// Our derived BSC address (the sender).
+    pub from: String,
+    /// The counterparty address.
+    pub to: String,
+    /// Value moved, in wei (18 dp).
+    pub amount_wei: String,
+    /// "pending" | "confirmed" | "failed".
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Encrypted, crash-safe log of native-BNB transfers we initiated. No indexer
+/// watches the BSC address, so without this a withdrawal's txhash would be lost
+/// the moment its toast faded; the Activity feed reads this to show a sent-BNB
+/// row with an explorer link. Sealed at the same bar as the swap journal.
+pub struct BnbTxLog {
+    file: PathBuf,
+    store: Arc<dyn WalletStore>,
+    records: Mutex<Vec<BnbTx>>,
+}
+
+impl BnbTxLog {
+    pub fn open(dir: impl AsRef<Path>, store: Arc<dyn WalletStore>) -> Result<Self> {
+        let file = dir.as_ref().join(BNBLOG_FILE);
+        let records: Vec<BnbTx> = if file.exists() {
+            let blob = std::fs::read(&file)
+                .map_err(|e| Error::Internal(format!("read bnb txlog: {e}")))?;
+            let plain = store.unseal_aux(BNBLOG_AAD, &blob)?;
+            serde_json::from_slice(&plain)
+                .map_err(|e| Error::Internal(format!("parse bnb txlog: {e}")))?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            file,
+            store,
+            records: Mutex::new(records),
+        })
+    }
+
+    fn persist_locked(&self, list: &[BnbTx]) -> Result<()> {
+        let plain =
+            serde_json::to_vec(list).map_err(|e| Error::Internal(format!("ser bnb txlog: {e}")))?;
+        let blob = self.store.seal_aux(BNBLOG_AAD, &plain)?;
+        let tmp = self.file.with_extension("enc.tmp");
+        std::fs::write(&tmp, &blob).map_err(|e| Error::Internal(format!("write bnb txlog: {e}")))?;
+        std::fs::rename(&tmp, &self.file)
+            .map_err(|e| Error::Internal(format!("rename bnb txlog: {e}")))?;
+        Ok(())
+    }
+
+    /// Append a transfer (idempotent on hash), then persist.
+    pub fn record(&self, tx: BnbTx) -> Result<()> {
+        let mut list = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if list.iter().any(|t| t.hash.eq_ignore_ascii_case(&tx.hash)) {
+            return Ok(());
+        }
+        list.push(tx);
+        self.persist_locked(&list)
+    }
+
+    /// Flip a tx's status (e.g. pending → confirmed); persists only on change.
+    pub fn set_status(&self, hash: &str, status: &str, now: u64) -> Result<()> {
+        let mut list = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for t in list.iter_mut() {
+            if t.hash.eq_ignore_ascii_case(hash) && t.status != status {
+                t.status = status.to_string();
+                t.updated_at = now;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist_locked(&list)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// All transfers, newest first.
+    pub fn list(&self) -> Vec<BnbTx> {
+        let mut v = self
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        v.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+        v
+    }
+
+    /// Hashes still awaiting a receipt — the set the history call re-checks.
+    pub fn pending_hashes(&self) -> Vec<String> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|t| t.status == "pending")
+            .map(|t| t.hash.clone())
+            .collect()
+    }
+}
+
 // ───────────────────────── pool client ─────────────────────────
 
 /// HTTP client for the exfer-pool market-maker bot.
@@ -525,6 +643,11 @@ pub struct SwapEngine {
     evm: EvmClient,
     pool: PoolClient,
     journal: Arc<Journal>,
+    /// Local log of native-BNB transfers we initiated, for the Activity feed.
+    bnb_log: Arc<BnbTxLog>,
+    /// BSC chain id (56 mainnet / 97 testnet) — surfaced so the UI picks the
+    /// right explorer base.
+    bsc_chain_id: u64,
     /// Serializes BSC sends from our single derived account (nonce safety).
     bsc_lock: tokio::sync::Mutex<()>,
     /// Per-swap_id async locks. execute()/refund() are check-then-act across long
@@ -552,6 +675,7 @@ impl SwapEngine {
         inflight: Arc<InFlightUtxos>,
         indexer: Option<IndexerClient>,
         journal: Arc<Journal>,
+        bnb_log: Arc<BnbTxLog>,
         cfg: EngineConfig,
     ) -> Self {
         let evm = EvmClient::new(cfg.bsc_rpc_url.clone(), cfg.bsc_chain_id);
@@ -564,6 +688,8 @@ impl SwapEngine {
             evm,
             pool,
             journal,
+            bnb_log,
+            bsc_chain_id: cfg.bsc_chain_id,
             bsc_lock: tokio::sync::Mutex::new(()),
             swap_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -668,8 +794,50 @@ impl SwapEngine {
         if amount.is_zero() {
             return Err(Error::BadParams("nothing to send (zero BNB after gas reserve)".into()));
         }
-        let _guard = self.bsc_lock.lock().await;
-        self.evm.send_bnb(&secret, to, amount).await
+        let hash = {
+            let _guard = self.bsc_lock.lock().await;
+            self.evm.send_bnb(&secret, to, amount).await?
+        };
+        // Record it so the Activity feed can show this withdrawal (txhash +
+        // explorer link). Best-effort: a log failure must not lose the txhash
+        // the user needs, so we return it regardless.
+        let now = now_secs();
+        if let Err(e) = self.bnb_log.record(BnbTx {
+            hash: hash.clone(),
+            direction: "out".into(),
+            from: addr.to_checksum(None),
+            to: to.to_string(),
+            amount_wei: amount.to_string(),
+            status: "pending".into(),
+            created_at: now,
+            updated_at: now,
+        }) {
+            tracing::warn!(err = %e, "failed to record BNB withdrawal in txlog");
+        }
+        Ok(hash)
+    }
+
+    /// Native-BNB transfer history (currently withdrawals we initiated). Before
+    /// returning, it refreshes any still-pending tx from its on-chain receipt so
+    /// the UI sees confirmations without a separate monitor. `chain_id` lets the
+    /// client route the explorer (56 → bscscan.com, 97 → testnet.bscscan.com).
+    pub async fn bnb_tx_history(&self) -> Result<serde_json::Value> {
+        for hash in self.bnb_log.pending_hashes() {
+            match self.evm.receipt_status(&hash).await {
+                Ok(Some(true)) => {
+                    let _ = self.bnb_log.set_status(&hash, "confirmed", now_secs());
+                }
+                Ok(Some(false)) => {
+                    let _ = self.bnb_log.set_status(&hash, "failed", now_secs());
+                }
+                // Not yet mined, or a transient RPC error — leave it pending.
+                _ => {}
+            }
+        }
+        Ok(serde_json::json!({
+            "chain_id": self.bsc_chain_id,
+            "txs": self.bnb_log.list(),
+        }))
     }
 
     /// Quote + reserve a swap. Generates the preimage (kept secret), persists a
@@ -1228,6 +1396,7 @@ mod tests {
             bsc_timeout_sec: None,
             expires_at: now + 600,
             fee_bps: 30,
+            network_fee_bnb: Some("0.0002".into()),
             error: None,
             created_at: now,
             updated_at: now,

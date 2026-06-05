@@ -246,12 +246,14 @@ pub async fn run_embedded(
     let engine = match cfg.swap_pool_url.clone() {
         Some(pool_url) => {
             let journal = Arc::new(crate::swap::Journal::open(&wallet_dir, store.clone())?);
+            let bnb_log = Arc::new(crate::swap::BnbTxLog::open(&wallet_dir, store.clone())?);
             let eng = Arc::new(crate::swap::SwapEngine::new(
                 store.clone(),
                 node.clone(),
                 inflight.clone(),
                 indexer.clone(),
                 journal,
+                bnb_log,
                 crate::swap::EngineConfig {
                     pool_url,
                     pool_ca_pem: cfg.swap_pool_ca.clone(),

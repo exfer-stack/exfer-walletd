@@ -15,6 +15,10 @@
 - [RPC reference](./rpc-reference.md)
 - [Error codes](./errors.md)
 
+# Standards
+
+- [EXFER-QUOTE (signed price credential)](./quote-spec.md)
+
 # Operating
 
 - [Security model](./security-model.md)

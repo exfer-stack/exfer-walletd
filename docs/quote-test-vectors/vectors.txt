@@ -1,0 +1,211 @@
+==============================================================================
+EXFER-QUOTE TEST VECTORS
+==============================================================================
+ed25519 backend     : pynacl
+issuer/signer seed  : 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+payee seed          : 202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+payer seed          : 404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+signer_pubkey       : 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8
+payee_pubkey        : 29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7
+payer_pubkey        : 2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d
+genesis_block_id    : 0000000000000000000000000000000000000000000000000000000000000000  (TEST DOMAIN: 32 zero bytes)
+image prefix (hex)  : 45584645522d51554f5445  (= ASCII b'EXFER-QUOTE')
+payee_address       : 7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9
+                      = domain_hash(EXFER-ADDR, payee_pubkey)
+==============================================================================
+
+### vec_a_minimal_no_payer_empty_memo  [positive, expected_verify=True]
+    Minimal quote: payer_flag=0 (no payer key), empty memo, ISO currency.
+    JSON fields:
+      version               : 1
+      quote_id              : 000102030405060708090a0b0c0d0e0f
+      currency              : USD
+      amount_minor          : 1250
+      rate_exfers_per_unit  : 4000000000
+      exfer_amount          : 50000000000
+      payee_pubkey          : 29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7
+      payer_pubkey          : None
+      payer_flag            : 0
+      issued_at             : 1781234567
+      expires_at            : 1781234867
+      memo                  : 
+      signer_pubkey         : 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8
+      signature             : bcfc1e3b8e9f4a42ebd1daf1e3f093b8f164028094e75d6bb1ea750c6fe40e4c8d9401c7a350520024498a134888ec7ccff16c9297457817c3a1fd3a46928e05
+    image_len           : 139
+    image_hex           : 45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001000102030405060708090a0b0c0d0e0f0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd700000000006a2b7b87000000006a2b7cb30000
+    signature           : bcfc1e3b8e9f4a42ebd1daf1e3f093b8f164028094e75d6bb1ea750c6fe40e4c8d9401c7a350520024498a134888ec7ccff16c9297457817c3a1fd3a46928e05
+    payee_address       : 7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9
+
+### vec_b_with_payer  [positive, expected_verify=True]
+    Quote bound to a payer: payer_flag=1, payer_pubkey present (non-transferable).
+    JSON fields:
+      version               : 1
+      quote_id              : 9f2c4a1e0b7d3c5a8e6f1029384b5c6d
+      currency              : USD
+      amount_minor          : 1250
+      rate_exfers_per_unit  : 4000000000
+      exfer_amount          : 50000000000
+      payee_pubkey          : 29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7
+      payer_pubkey          : 2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d
+      payer_flag            : 1
+      issued_at             : 1781234567
+      expires_at            : 1781234867
+      memo                  : api-credits/2026-06
+      signer_pubkey         : 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8
+      signature             : 11ec5160924ec6d91efd3900fbeec6798a08ca02aef8db2e2a07afba1b24a0968927fcb20a7c81601bf6a2640ab6e223f46d1f8ee131add0e17b37dd959fe906
+    image_len           : 190
+    image_hex           : 45584645522d51554f54450000000000000000000000000000000000000000000000000000000000000000019f2c4a1e0b7d3c5a8e6f1029384b5c6d0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7012543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d000000006a2b7b87000000006a2b7cb300136170692d637265646974732f323032362d3036
+    signature           : 11ec5160924ec6d91efd3900fbeec6798a08ca02aef8db2e2a07afba1b24a0968927fcb20a7c81601bf6a2640ab6e223f46d1f8ee131add0e17b37dd959fe906
+    payee_address       : 7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9
+
+### vec_c_utf8_memo_noniso_currency  [positive, expected_verify=True]
+    Multi-byte UTF-8 memo (CJK + emoji) and a non-ISO ticker (SATS).
+    JSON fields:
+      version               : 1
+      quote_id              : ffeeddccbbaa99887766554433221100
+      currency              : SATS
+      amount_minor          : 123456
+      rate_exfers_per_unit  : 1
+      exfer_amount          : 123456
+      payee_pubkey          : 29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7
+      payer_pubkey          : None
+      payer_flag            : 0
+      issued_at             : 1781234567
+      expires_at            : 1781234867
+      memo                  : 货到付款 — café 🚀
+      signer_pubkey         : 03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8
+      signature             : 07f427d44873b88f6313c7d11ba394216f12728c7abd18c546add914c66f2eb8e7a683c5fb0adfe056d4ade389b8d01ecbd904fdd51864759e7dbbdedbc5390d
+    image_len           : 167
+    image_hex           : 45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001ffeeddccbbaa998877665544332211000453415453000000000001e2400000000000000001000000000001e24029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd700000000006a2b7b87000000006a2b7cb3001be8b4a7e588b0e4bb98e6acbe20e2809420636166c3a920f09f9a80
+    signature           : 07f427d44873b88f6313c7d11ba394216f12728c7abd18c546add914c66f2eb8e7a683c5fb0adfe056d4ade389b8d01ecbd904fdd51864759e7dbbdedbc5390d
+    payee_address       : 7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9
+
+### vec_d_trailing_byte_reject  [negative, expected_verify=False]
+    Strict-decode MUST reject: image identical to vec_a plus one trailing 0x00 byte after memo. Image length is fully determined by currency_len, payer_flag and memo_len, so any trailing byte is a decode error BEFORE signature check.
+    reject_reason       : trailing bytes after memo (strict-decode failure)
+    image_len           : 140
+    image_hex           : 45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001000102030405060708090a0b0c0d0e0f0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd700000000006a2b7b87000000006a2b7cb3000000
+    signature_over_trailing_image: a2849ec68eff5dc0aff0591b219c2aea52f824d82dd4a5414167dab40e26b8aa50b818416d0b5f6af511236ad6b383623cdf132a8b3c428d07798ed04b977d09
+
+### vec_e_payer_flag_2_reject  [negative, expected_verify=False]
+    Strict-decode MUST reject: payer_flag = 2. The flag MUST be exactly 0 or 1; any other value is a decode error (the decoder cannot even determine whether a payer_pubkey follows). Reject BEFORE signature check.
+    reject_reason       : payer_flag not in {0,1} (value=2) (strict-decode failure)
+    image_len           : 139
+    image_hex           : 45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001000102030405060708090a0b0c0d0e0f0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd702000000006a2b7b87000000006a2b7cb30000
+    signature_over_image  : 9eda833dca996275f170194bebf452b26d7316355e4fd460cefe35b162e5499439b5bd541a1ec2369a14a48e4e4a727cfbcfa338c1f3925825315a3993e6fd04
+
+==============================================================================
+MACHINE-READABLE (JSON)
+==============================================================================
+[
+  {
+    "name": "vec_a_minimal_no_payer_empty_memo",
+    "kind": "positive",
+    "description": "Minimal quote: payer_flag=0 (no payer key), empty memo, ISO currency.",
+    "expected_verify": true,
+    "json": {
+      "version": 1,
+      "quote_id": "000102030405060708090a0b0c0d0e0f",
+      "currency": "USD",
+      "amount_minor": 1250,
+      "rate_exfers_per_unit": 4000000000,
+      "exfer_amount": 50000000000,
+      "payee_pubkey": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+      "payer_pubkey": null,
+      "payer_flag": 0,
+      "issued_at": 1781234567,
+      "expires_at": 1781234867,
+      "memo": "",
+      "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "signature": "bcfc1e3b8e9f4a42ebd1daf1e3f093b8f164028094e75d6bb1ea750c6fe40e4c8d9401c7a350520024498a134888ec7ccff16c9297457817c3a1fd3a46928e05"
+    },
+    "genesis_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image_hex": "45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001000102030405060708090a0b0c0d0e0f0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd700000000006a2b7b87000000006a2b7cb30000",
+    "image_len": 139,
+    "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "signature": "bcfc1e3b8e9f4a42ebd1daf1e3f093b8f164028094e75d6bb1ea750c6fe40e4c8d9401c7a350520024498a134888ec7ccff16c9297457817c3a1fd3a46928e05",
+    "payee_address": "7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9"
+  },
+  {
+    "name": "vec_b_with_payer",
+    "kind": "positive",
+    "description": "Quote bound to a payer: payer_flag=1, payer_pubkey present (non-transferable).",
+    "expected_verify": true,
+    "json": {
+      "version": 1,
+      "quote_id": "9f2c4a1e0b7d3c5a8e6f1029384b5c6d",
+      "currency": "USD",
+      "amount_minor": 1250,
+      "rate_exfers_per_unit": 4000000000,
+      "exfer_amount": 50000000000,
+      "payee_pubkey": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+      "payer_pubkey": "2543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d",
+      "payer_flag": 1,
+      "issued_at": 1781234567,
+      "expires_at": 1781234867,
+      "memo": "api-credits/2026-06",
+      "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "signature": "11ec5160924ec6d91efd3900fbeec6798a08ca02aef8db2e2a07afba1b24a0968927fcb20a7c81601bf6a2640ab6e223f46d1f8ee131add0e17b37dd959fe906"
+    },
+    "genesis_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image_hex": "45584645522d51554f54450000000000000000000000000000000000000000000000000000000000000000019f2c4a1e0b7d3c5a8e6f1029384b5c6d0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7012543b92ff1095511476adc8369db6ddc933665a11978dda1404ee1066ca9559d000000006a2b7b87000000006a2b7cb300136170692d637265646974732f323032362d3036",
+    "image_len": 190,
+    "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "signature": "11ec5160924ec6d91efd3900fbeec6798a08ca02aef8db2e2a07afba1b24a0968927fcb20a7c81601bf6a2640ab6e223f46d1f8ee131add0e17b37dd959fe906",
+    "payee_address": "7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9"
+  },
+  {
+    "name": "vec_c_utf8_memo_noniso_currency",
+    "kind": "positive",
+    "description": "Multi-byte UTF-8 memo (CJK + emoji) and a non-ISO ticker (SATS).",
+    "expected_verify": true,
+    "json": {
+      "version": 1,
+      "quote_id": "ffeeddccbbaa99887766554433221100",
+      "currency": "SATS",
+      "amount_minor": 123456,
+      "rate_exfers_per_unit": 1,
+      "exfer_amount": 123456,
+      "payee_pubkey": "29acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+      "payer_pubkey": null,
+      "payer_flag": 0,
+      "issued_at": 1781234567,
+      "expires_at": 1781234867,
+      "memo": "\u8d27\u5230\u4ed8\u6b3e \u2014 caf\u00e9 \ud83d\ude80",
+      "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+      "signature": "07f427d44873b88f6313c7d11ba394216f12728c7abd18c546add914c66f2eb8e7a683c5fb0adfe056d4ade389b8d01ecbd904fdd51864759e7dbbdedbc5390d"
+    },
+    "genesis_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image_hex": "45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001ffeeddccbbaa998877665544332211000453415453000000000001e2400000000000000001000000000001e24029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd700000000006a2b7b87000000006a2b7cb3001be8b4a7e588b0e4bb98e6acbe20e2809420636166c3a920f09f9a80",
+    "image_len": 167,
+    "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "signature": "07f427d44873b88f6313c7d11ba394216f12728c7abd18c546add914c66f2eb8e7a683c5fb0adfe056d4ade389b8d01ecbd904fdd51864759e7dbbdedbc5390d",
+    "payee_address": "7f90e5febf8366d1240e1a2bdec7d1a2f5361a486ef34afa96a73b3990651fd9"
+  },
+  {
+    "name": "vec_d_trailing_byte_reject",
+    "kind": "negative",
+    "description": "Strict-decode MUST reject: image identical to vec_a plus one trailing 0x00 byte after memo. Image length is fully determined by currency_len, payer_flag and memo_len, so any trailing byte is a decode error BEFORE signature check.",
+    "expected_verify": false,
+    "reject_reason": "trailing bytes after memo (strict-decode failure)",
+    "genesis_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image_hex": "45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001000102030405060708090a0b0c0d0e0f0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd700000000006a2b7b87000000006a2b7cb3000000",
+    "image_len": 140,
+    "valid_image_len": 139,
+    "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "signature_over_trailing_image": "a2849ec68eff5dc0aff0591b219c2aea52f824d82dd4a5414167dab40e26b8aa50b818416d0b5f6af511236ad6b383623cdf132a8b3c428d07798ed04b977d09"
+  },
+  {
+    "name": "vec_e_payer_flag_2_reject",
+    "kind": "negative",
+    "description": "Strict-decode MUST reject: payer_flag = 2. The flag MUST be exactly 0 or 1; any other value is a decode error (the decoder cannot even determine whether a payer_pubkey follows). Reject BEFORE signature check.",
+    "expected_verify": false,
+    "reject_reason": "payer_flag not in {0,1} (value=2) (strict-decode failure)",
+    "genesis_block_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "image_hex": "45584645522d51554f5445000000000000000000000000000000000000000000000000000000000000000001000102030405060708090a0b0c0d0e0f0355534400000000000004e200000000ee6b28000000000ba43b740029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd702000000006a2b7b87000000006a2b7cb30000",
+    "image_len": 139,
+    "payer_flag_value": 2,
+    "signer_pubkey": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+    "signature_over_image": "9eda833dca996275f170194bebf452b26d7316355e4fd460cefe35b162e5499439b5bd541a1ec2369a14a48e4e4a727cfbcfa338c1f3925825315a3993e6fd04"
+  }
+]

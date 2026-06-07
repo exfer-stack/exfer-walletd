@@ -190,7 +190,6 @@ impl EvmClient {
         Self::hex_to_u256(Self::result_hex(&r)?)
     }
 
-
     /// Read a swap entry from the HTLC contract.
     pub async fn get_swap(&self, htlc: Address, hashlock: B256) -> Result<OnChainSwap> {
         let data = getSwapCall { hashlock }.abi_encode();

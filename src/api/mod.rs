@@ -709,7 +709,10 @@ async fn delete_address(state: &ApiState, params: Value) -> Result<Value> {
         if let Some(engine) = state.engine.as_ref() {
             match engine.lp_position(&address).await {
                 Ok(pos) => {
-                    let has = pos.get("has_position").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let has = pos
+                        .get("has_position")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let shares = pos.get("shares").and_then(|v| v.as_str()).unwrap_or("0");
                     let has_shares = shares != "0" && !shares.is_empty();
                     if has || has_shares {

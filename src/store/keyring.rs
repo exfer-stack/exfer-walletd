@@ -644,7 +644,10 @@ impl KeyringStore {
             serde_json::to_value(&source)
                 .map_err(|e| Error::Internal(format!("evm source serialize: {e}")))?,
         );
-        if matches!(source, EvmKeySource::Generated | EvmKeySource::ImportedMnemonic) {
+        if matches!(
+            source,
+            EvmKeySource::Generated | EvmKeySource::ImportedMnemonic
+        ) {
             let mpath = self.root.join(IMPORTED_DIR).join(EVM_MNEMONIC_FILE);
             if mpath.exists() {
                 let blob = std::fs::read(&mpath)?;
@@ -1511,7 +1514,7 @@ mod tests {
         // and that phrase re-derives the same address under the standard scheme.
         let words = store.reveal_address_mnemonic(&addr, b"pw").unwrap();
         assert_eq!(words.len(), 24);
-        let m = Mnemonic::parse_in(Language::English, &words.join(" ")).unwrap();
+        let m = Mnemonic::parse_in(Language::English, words.join(" ")).unwrap();
         let redrived = Signer::from_secret_bytes(&standard_secret_from_mnemonic(&m)).address_hex();
         assert_eq!(redrived, addr, "standard phrase must reproduce the address");
 
@@ -1887,14 +1890,21 @@ mod tests {
         let seed_secret = store.evm_secret().unwrap();
         let seed_addr = crate::evm::evm_address(&seed_secret).unwrap();
         // evm_address_opt agrees and never errors.
-        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(seed_addr.as_str()));
+        assert_eq!(
+            store.evm_address_opt().unwrap().as_deref(),
+            Some(seed_addr.as_str())
+        );
         // reveal_evm_mnemonic on a seeded-without-independent wallet returns the
         // SEED phrase (24 words), and that phrase reproduces the same address.
         let words = store.reveal_evm_mnemonic(b"pw").unwrap();
-        let from_seed_phrase =
-            evm_secret_from_mnemonic(&Mnemonic::parse_in(Language::English, &words.join(" ")).unwrap())
-                .unwrap();
-        assert_eq!(crate::evm::evm_address(&from_seed_phrase).unwrap(), seed_addr);
+        let from_seed_phrase = evm_secret_from_mnemonic(
+            &Mnemonic::parse_in(Language::English, words.join(" ")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::evm::evm_address(&from_seed_phrase).unwrap(),
+            seed_addr
+        );
     }
 
     /// VERIFIER REGRESSION: restore a wallet from a FIXED known seed phrase and
@@ -1919,10 +1929,9 @@ mod tests {
 
         // Cross-check the EXTERNAL vector against the pure derivation helper,
         // independent of the keystore — pins the path/derivation itself.
-        let direct = evm_secret_from_mnemonic(
-            &Mnemonic::parse_in(Language::English, PHRASE).unwrap(),
-        )
-        .unwrap();
+        let direct =
+            evm_secret_from_mnemonic(&Mnemonic::parse_in(Language::English, PHRASE).unwrap())
+                .unwrap();
         assert_eq!(crate::evm::evm_address(&direct).unwrap(), EXPECTED);
 
         let dir = temp();
@@ -1941,10 +1950,9 @@ mod tests {
         // proving no destructive in-place mutation of the seed material.
         let (ind_addr, _w) = store.create_evm_key(true).unwrap();
         assert_ne!(ind_addr, EXPECTED);
-        let reseed = evm_secret_from_mnemonic(
-            &Mnemonic::parse_in(Language::English, PHRASE).unwrap(),
-        )
-        .unwrap();
+        let reseed =
+            evm_secret_from_mnemonic(&Mnemonic::parse_in(Language::English, PHRASE).unwrap())
+                .unwrap();
         assert_eq!(crate::evm::evm_address(&reseed).unwrap(), EXPECTED);
     }
 
@@ -1960,14 +1968,17 @@ mod tests {
         let (addr, words) = store.create_evm_key(false).unwrap();
         assert_eq!(words.len(), 24);
         // The independent key is now THE BSC key.
-        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(addr.as_str()));
+        assert_eq!(
+            store.evm_address_opt().unwrap().as_deref(),
+            Some(addr.as_str())
+        );
         let secret = store.evm_secret().unwrap();
         assert_eq!(crate::evm::evm_address(&secret).unwrap(), addr);
 
         // Reveal returns its own phrase, which reproduces the address.
         let revealed = store.reveal_evm_mnemonic(b"pw").unwrap();
         assert_eq!(revealed, words);
-        let m = Mnemonic::parse_in(Language::English, &revealed.join(" ")).unwrap();
+        let m = Mnemonic::parse_in(Language::English, revealed.join(" ")).unwrap();
         assert_eq!(
             crate::evm::evm_address(&evm_secret_from_mnemonic(&m).unwrap()).unwrap(),
             addr
@@ -1978,7 +1989,10 @@ mod tests {
         // Survives a reopen.
         drop(store);
         let store = KeyringStore::open_keyring(dir.path(), b"pw").unwrap();
-        assert_eq!(store.evm_address_opt().unwrap().as_deref(), Some(addr.as_str()));
+        assert_eq!(
+            store.evm_address_opt().unwrap().as_deref(),
+            Some(addr.as_str())
+        );
 
         // Delete clears state + both files.
         store.delete_evm_key(b"pw").unwrap();
@@ -2006,10 +2020,16 @@ mod tests {
         let seeded = KeyringStore::open_or_init_fresh(sdir.path(), b"pw").unwrap();
         let _ = seeded.take_fresh_mnemonic();
         let seed_addr = seeded.evm_address_opt().unwrap().unwrap();
-        assert!(matches!(seeded.create_evm_key(false), Err(Error::BadParams(_))));
+        assert!(matches!(
+            seeded.create_evm_key(false),
+            Err(Error::BadParams(_))
+        ));
         let (ind_addr, _) = seeded.create_evm_key(true).unwrap();
         assert_ne!(ind_addr, seed_addr);
-        assert_eq!(seeded.evm_address_opt().unwrap().as_deref(), Some(ind_addr.as_str()));
+        assert_eq!(
+            seeded.evm_address_opt().unwrap().as_deref(),
+            Some(ind_addr.as_str())
+        );
     }
 
     /// Import a MetaMask mnemonic and a raw key; raw-key reveal is refused.
@@ -2043,7 +2063,10 @@ mod tests {
             Err(Error::BadParams(_))
         ));
         // But the raw secret is usable for signing.
-        assert_eq!(crate::evm::evm_address(&store.evm_secret().unwrap()).unwrap(), raw_addr);
+        assert_eq!(
+            crate::evm::evm_address(&store.evm_secret().unwrap()).unwrap(),
+            raw_addr
+        );
     }
 
     /// A zero / invalid scalar is rejected before sealing a dead key.

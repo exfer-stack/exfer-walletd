@@ -83,14 +83,21 @@ pub async fn swap_pool_info(state: &ApiState) -> Result<Value> {
 }
 
 pub async fn swap_price_klines(state: &ApiState, params: Value) -> Result<Value> {
-    let interval = params.get("interval").and_then(|v| v.as_str()).unwrap_or("1d");
+    let interval = params
+        .get("interval")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1d");
     // Keep the interval token URL-safe; the pool clamps the limit itself.
     let interval = if interval.len() <= 4 && interval.chars().all(|c| c.is_ascii_alphanumeric()) {
         interval
     } else {
         "1d"
     };
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(120).min(500) as u32;
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(120)
+        .min(500) as u32;
     engine(state)?.price_klines(interval, limit).await
 }
 
@@ -139,7 +146,10 @@ pub async fn bsc_reveal_mnemonic(state: &ApiState, params: Value) -> Result<Valu
     let words = tokio::task::spawn_blocking(move || store.reveal_evm_mnemonic(pass.as_bytes()))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
-    tracing::warn!(count = words.len(), "bsc_reveal_mnemonic served — sensitive output");
+    tracing::warn!(
+        count = words.len(),
+        "bsc_reveal_mnemonic served — sensitive output"
+    );
     Ok(serde_json::json!({ "mnemonic": words }))
 }
 
@@ -241,7 +251,9 @@ pub async fn lp_position(state: &ApiState, params: Value) -> Result<Value> {
 pub async fn lp_deposit_start(state: &ApiState, params: Value) -> Result<Value> {
     let p: LpDepositStartParams = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("lp_deposit_start params: {e}")))?;
-    engine(state)?.lp_deposit_start(&p.exfer_address, &p.bsc_address).await
+    engine(state)?
+        .lp_deposit_start(&p.exfer_address, &p.bsc_address)
+        .await
 }
 pub async fn lp_deposit_status(state: &ApiState, params: Value) -> Result<Value> {
     let p: LpIdParams = serde_json::from_value(params)
@@ -251,7 +263,9 @@ pub async fn lp_deposit_status(state: &ApiState, params: Value) -> Result<Value>
 pub async fn lp_withdraw_self(state: &ApiState, params: Value) -> Result<Value> {
     let p: LpWithdrawParams = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("lp_withdraw_self params: {e}")))?;
-    engine(state)?.lp_withdraw_self(&p.exfer_address, &p.shares).await
+    engine(state)?
+        .lp_withdraw_self(&p.exfer_address, &p.shares)
+        .await
 }
 
 pub async fn bsc_get_balances(state: &ApiState) -> Result<Value> {

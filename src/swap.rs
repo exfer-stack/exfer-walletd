@@ -66,6 +66,7 @@ fn parse_units_18(s: &str) -> Result<alloy::primitives::U256> {
 ///   - recipient == our derived BSC address (it pays US),
 ///   - amount >= the quoted output (we get at least what we were promised),
 ///   - enough time left before the lock's timeout to land our claim.
+///
 /// If any is false we must NOT reveal the preimage (we'd give away the EXFER
 /// leg with nothing guaranteed in return).
 fn pool_lock_safe_to_claim(
@@ -200,10 +201,7 @@ impl SwapRecord {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            SwapStatus::Completed
-                | SwapStatus::Refunded
-                | SwapStatus::Expired
-                | SwapStatus::Failed
+            SwapStatus::Completed | SwapStatus::Refunded | SwapStatus::Expired | SwapStatus::Failed
         )
     }
 }
@@ -375,7 +373,8 @@ impl BnbTxLog {
             serde_json::to_vec(list).map_err(|e| Error::Internal(format!("ser bnb txlog: {e}")))?;
         let blob = self.store.seal_aux(BNBLOG_AAD, &plain)?;
         let tmp = self.file.with_extension("enc.tmp");
-        std::fs::write(&tmp, &blob).map_err(|e| Error::Internal(format!("write bnb txlog: {e}")))?;
+        std::fs::write(&tmp, &blob)
+            .map_err(|e| Error::Internal(format!("write bnb txlog: {e}")))?;
         std::fs::rename(&tmp, &self.file)
             .map_err(|e| Error::Internal(format!("rename bnb txlog: {e}")))?;
         Ok(())
@@ -735,23 +734,41 @@ impl SwapEngine {
     }
     pub async fn price_klines(&self, interval: &str, limit: u32) -> Result<serde_json::Value> {
         self.pool
-            .lp_get(&format!("/api/price/klines?interval={interval}&limit={limit}"))
+            .lp_get(&format!(
+                "/api/price/klines?interval={interval}&limit={limit}"
+            ))
             .await
     }
     pub async fn lp_position(&self, exfer_address: &str) -> Result<serde_json::Value> {
-        self.pool.lp_get(&format!("/api/lp/position/{exfer_address}")).await
-    }
-    pub async fn lp_deposit_start(&self, exfer_address: &str, bsc_address: &str) -> Result<serde_json::Value> {
         self.pool
-            .lp_post("/api/lp/deposit/start", serde_json::json!({ "exfer_address": exfer_address, "bsc_address": bsc_address }))
+            .lp_get(&format!("/api/lp/position/{exfer_address}"))
+            .await
+    }
+    pub async fn lp_deposit_start(
+        &self,
+        exfer_address: &str,
+        bsc_address: &str,
+    ) -> Result<serde_json::Value> {
+        self.pool
+            .lp_post(
+                "/api/lp/deposit/start",
+                serde_json::json!({ "exfer_address": exfer_address, "bsc_address": bsc_address }),
+            )
             .await
     }
     pub async fn lp_deposit_status(&self, id: &str) -> Result<serde_json::Value> {
         self.pool.lp_get(&format!("/api/lp/deposit/{id}")).await
     }
-    pub async fn lp_withdraw_self(&self, exfer_address: &str, shares: &str) -> Result<serde_json::Value> {
+    pub async fn lp_withdraw_self(
+        &self,
+        exfer_address: &str,
+        shares: &str,
+    ) -> Result<serde_json::Value> {
         self.pool
-            .lp_post("/api/lp/withdraw/self", serde_json::json!({ "exfer_address": exfer_address, "shares": shares }))
+            .lp_post(
+                "/api/lp/withdraw/self",
+                serde_json::json!({ "exfer_address": exfer_address, "shares": shares }),
+            )
             .await
     }
 
@@ -796,7 +813,9 @@ impl SwapEngine {
             parse_units_18(amount_human)?
         };
         if amount.is_zero() {
-            return Err(Error::BadParams("nothing to send (zero BNB after gas reserve)".into()));
+            return Err(Error::BadParams(
+                "nothing to send (zero BNB after gas reserve)".into(),
+            ));
         }
         let hash = {
             let _guard = self.bsc_lock.lock().await;
@@ -1120,9 +1139,13 @@ impl SwapEngine {
                                 // it, so the detail view shows all legs (not just 2).
                                 let pool_lock = match rec.pool_lock_ref.clone() {
                                     Some(p) => Some(p),
-                                    None => self.pool.get_swap(&rec.swap_id).await.ok().and_then(|pj| {
-                                        pj.get("poolLockTxhash").and_then(|v| v.as_str()).map(str::to_string)
-                                    }),
+                                    None => {
+                                        self.pool.get_swap(&rec.swap_id).await.ok().and_then(|pj| {
+                                            pj.get("poolLockTxhash")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_string)
+                                        })
+                                    }
                                 };
                                 self.journal.update(&rec.swap_id, now_secs(), |r| {
                                     r.status = SwapStatus::Completed;
@@ -1245,7 +1268,9 @@ impl SwapEngine {
                     // get_swap at the PoolLocked transition missed it — the indexed
                     // lock_tx_id is authoritative — so the detail view shows all legs.
                     let pool_lock = rec.pool_lock_ref.clone().or_else(|| {
-                        pl.get("lock_tx_id").and_then(|v| v.as_str()).map(str::to_string)
+                        pl.get("lock_tx_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
                     });
                     self.journal.update(&rec.swap_id, now_secs(), |r| {
                         r.status = SwapStatus::Completed;
@@ -1281,13 +1306,22 @@ impl SwapEngine {
                 }
 
                 let params = pl.get("params").cloned().unwrap_or_default();
-                let lock_tx_id = pl.get("lock_tx_id").and_then(|v| v.as_str()).ok_or_else(|| {
-                    Error::UpstreamUnexpected("indexed htlc missing lock_tx_id".into())
-                })?;
-                let sender = params.get("sender").and_then(|v| v.as_str()).ok_or_else(|| {
-                    Error::UpstreamUnexpected("indexed htlc missing sender".into())
-                })?;
-                let timeout = params.get("timeout_height").and_then(|v| v.as_u64()).unwrap_or(0);
+                let lock_tx_id =
+                    pl.get("lock_tx_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            Error::UpstreamUnexpected("indexed htlc missing lock_tx_id".into())
+                        })?;
+                let sender = params
+                    .get("sender")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        Error::UpstreamUnexpected("indexed htlc missing sender".into())
+                    })?;
+                let timeout = params
+                    .get("timeout_height")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
 
                 // Funds-safety reveal-gate (buy direction, #8) — re-checked before
                 // EVERY (re)send: the pool's EXFER lock must cover the quote and
@@ -1358,7 +1392,8 @@ impl SwapEngine {
             if self.claim_is_confirmed(&rec).await == Some(false) {
                 let _ = self.journal.update(&rec.swap_id, now, |r| {
                     r.status = SwapStatus::PoolLocked;
-                    r.error = Some("recovered: claim was not confirmed on-chain — re-settling".into());
+                    r.error =
+                        Some("recovered: claim was not confirmed on-chain — re-settling".into());
                 });
                 tracing::warn!(
                     swap = %rec.swap_id, direction = ?rec.direction,
@@ -1380,7 +1415,9 @@ impl SwapEngine {
                 let our_pubkey = hex::encode(signer.pubkey()).to_lowercase();
                 let our_addr = strip0x(&from).to_lowercase();
                 let resp = indexer
-                    .htlc_lookup_by_hashlock(serde_json::json!({ "hash_lock": strip0x(&rec.hashlock) }))
+                    .htlc_lookup_by_hashlock(
+                        serde_json::json!({ "hash_lock": strip0x(&rec.hashlock) }),
+                    )
                     .await
                     .ok()?;
                 let htlcs = resp.get("htlcs")?.as_array()?;
@@ -1644,7 +1681,12 @@ mod tests {
     use alloy::primitives::{Address, U256};
 
     fn locked_swap(recipient: Address, amount: U256, timeout_sec: u64) -> OnChainSwap {
-        OnChainSwap { recipient, amount, timeout_sec, state: HtlcState::Locked }
+        OnChainSwap {
+            recipient,
+            amount,
+            timeout_sec,
+            state: HtlcState::Locked,
+        }
     }
 
     #[test]
@@ -1669,19 +1711,38 @@ mod tests {
         let far = now + CLAIM_MARGIN_SECS + 60;
 
         // Wrong recipient (lock pays someone else) → never reveal.
-        assert!(!pool_lock_safe_to_claim(&locked_swap(attacker, want, far), us, want, now));
+        assert!(!pool_lock_safe_to_claim(
+            &locked_swap(attacker, want, far),
+            us,
+            want,
+            now
+        ));
         // Underfunded (amount < quoted out) → never reveal.
         assert!(!pool_lock_safe_to_claim(
-            &locked_swap(us, want - U256::from(1u64), far), us, want, now
+            &locked_swap(us, want - U256::from(1u64), far),
+            us,
+            want,
+            now
         ));
         // Not enough time left before timeout to land our claim → never reveal.
         assert!(!pool_lock_safe_to_claim(
-            &locked_swap(us, want, now + CLAIM_MARGIN_SECS - 1), us, want, now
+            &locked_swap(us, want, now + CLAIM_MARGIN_SECS - 1),
+            us,
+            want,
+            now
         ));
         // Not in Locked state → never reveal.
         for st in [HtlcState::None, HtlcState::Claimed, HtlcState::Refunded] {
-            let oc = OnChainSwap { recipient: us, amount: want, timeout_sec: far, state: st };
-            assert!(!pool_lock_safe_to_claim(&oc, us, want, now), "state {st:?} must block");
+            let oc = OnChainSwap {
+                recipient: us,
+                amount: want,
+                timeout_sec: far,
+                state: st,
+            };
+            assert!(
+                !pool_lock_safe_to_claim(&oc, us, want, now),
+                "state {st:?} must block"
+            );
         }
     }
 
@@ -1690,7 +1751,10 @@ mod tests {
     #[test]
     fn parse_units_18_basics() {
         use alloy::primitives::U256;
-        assert_eq!(parse_units_18("1").unwrap(), U256::from(10u64).pow(U256::from(18u64)));
+        assert_eq!(
+            parse_units_18("1").unwrap(),
+            U256::from(10u64).pow(U256::from(18u64))
+        );
         assert_eq!(parse_units_18("0").unwrap(), U256::ZERO);
         // 0.5 BNB = 5e17 wei
         assert_eq!(
@@ -1698,7 +1762,10 @@ mod tests {
             U256::from(5u64) * U256::from(10u64).pow(U256::from(17u64))
         );
         // full 18-dp precision
-        assert_eq!(parse_units_18("0.000000000000000001").unwrap(), U256::from(1u64));
+        assert_eq!(
+            parse_units_18("0.000000000000000001").unwrap(),
+            U256::from(1u64)
+        );
     }
 
     #[test]

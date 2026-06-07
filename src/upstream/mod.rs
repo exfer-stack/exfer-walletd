@@ -175,11 +175,7 @@ impl ExferNode {
             // so exponential-with-cap recovers fast without hammering.
             if attempt + 1 < attempts {
                 let factor = 1u64 << attempt.min(5); // 1,2,4,8,16,32
-                let wait_ms = self
-                    .retry
-                    .backoff_ms
-                    .saturating_mul(factor)
-                    .min(4_000);
+                let wait_ms = self.retry.backoff_ms.saturating_mul(factor).min(4_000);
                 if wait_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }

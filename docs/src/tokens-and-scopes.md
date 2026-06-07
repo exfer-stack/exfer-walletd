@@ -6,15 +6,20 @@ Walletd uses bearer-token authentication on every request except
 
 ## Three scoped tokens
 
-v1.0 issues **three** tokens, one per scope. On first start walletd
+Walletd issues **three** tokens, one per scope. On first start it
 auto-generates them at `<datadir>/token-{read,manage,spend}` (mode
 `0600`).
 
+The authoritative scope of every method is `Scope::for_method` in
+`src/auth.rs`; anything not listed below as `manage` or `spend` is
+`read`. The [RPC reference](./rpc-reference.md) tags each method with
+its scope.
+
 | Scope    | Methods                                                                                            |
 | -------- | -------------------------------------------------------------------------------------------------- |
-| `read`   | `ping`, `validate_address`, `get_*` family, `list_addresses`, `verify_message`, `get_status`, `get_wallet_balance` |
-| `manage` | `generate_address`, `abandon_transfer`                                                              |
-| `spend`  | `transfer`, `send_raw_transaction`, `sign_message`                                                  |
+| `read`   | `ping`, `validate_address`, the `get_*` family, `list_addresses`, `list_settlements`, `verify_message`, `get_status`, `get_wallet_balance`, `htlc_status`/`htlc_list`/`htlc_lookup_by_hashlock`, `simulate_*`, `wait_for_tx`/`wait_for_payment`, `payment_uri_*`, `swap_status`/`swap_list`/`swap_pool_info`/`swap_price_klines`, `lp_pool_info`/`lp_position`/`lp_deposit_status`, `bsc_get_address`/`bsc_get_balances`/`bsc_tx_history`, `contract_stats`, `get_attestation_edges` |
+| `manage` | `generate_address`, `generate_independent_address`, `generate_standard_address`, `import_private_key`, `import_mnemonic`, `import_standard_mnemonic`, `bsc_create_address`, `bsc_import_mnemonic`, `bsc_import_key`, `abandon_transfer`, `htlc_forget` |
+| `spend`  | `transfer`, `send_raw_transaction`, `sign_message`, `htlc_lock`/`htlc_claim`/`htlc_reclaim`, `reveal_mnemonic`/`reveal_private_key`/`reveal_address_mnemonic`/`reveal_evm_private_key`, `export_vault`/`export_address`/`import_vault`, `delete_address`, `swap_get_quote`/`swap_execute`/`swap_refund`, `bsc_send_bnb`/`bsc_reveal_mnemonic`/`bsc_delete_key`, `lp_withdraw_self` |
 
 **Containment**: `spend ⊇ manage ⊇ read`. A token at a higher scope
 satisfies every lower scope, so an exchange's withdrawal worker only

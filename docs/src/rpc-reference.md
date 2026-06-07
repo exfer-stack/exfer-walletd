@@ -1,4 +1,4 @@
-# RPC reference (v1.9)
+# RPC reference (v1.13)
 
 JSON-RPC 2.0 over `POST /`. `GET /healthz` is unauthenticated and
 returns `ok` for liveness probes.
@@ -55,14 +55,107 @@ READ=$(cat ~/.exfer-walletd/token-read)
 
 ## Scope mapping
 
-| Scope | Methods |
-|---|---|
-| `read` | `ping`, `validate_address`, `get_balance`, `get_wallet_balance`, `get_block_height`, `get_block_by_id`, `get_block_by_height`, `get_block_id_at_height`, `get_transaction`, `get_address_utxos`, `get_script_utxos`, `get_status`, `list_addresses`, `verify_message` |
-| `manage` | `generate_address`, `abandon_transfer` |
-| `spend` | `transfer`, `htlc_lock`, `htlc_claim`, `htlc_reclaim`, `send_raw_transaction`, `sign_message`, `reveal_mnemonic`, `reveal_private_key` |
+`spend` ⊇ `manage` ⊇ `read` — a token at a higher scope satisfies every
+lower scope. The authoritative source is `Scope::for_method` in
+`src/auth.rs`; the per-method scope is shown in the catalog below.
 
-`spend` ⊇ `manage` ⊇ `read`. A token at a higher scope satisfies every
-lower scope.
+## Method catalog
+
+Every dispatched method, grouped by family. Methods marked **(node)** or
+**(indexer)** proxy the upstream node / the embedded indexer; the rest
+act on the local keyring or the swap engine. Detailed request/response
+sections follow for the core wallet, HTLC, simulation, observability,
+and payment-URI methods; the keyring, swap, LP, and BSC families are
+documented at the [end of this page](#keyring-management).
+
+### Chain reads (node) — `read`
+
+| Method | Purpose |
+|---|---|
+| `ping` | liveness + version |
+| `get_status` / `get_follower_status` | daemon + indexer-follower health |
+| `get_block_height` | tip height + `genesis_block_id` |
+| `get_block_by_id` / `get_block_by_height` / `get_block_id_at_height` | block lookups |
+| `get_transaction` | transaction by id |
+| `get_balance` / `get_wallet_balance` | one address / whole-keyring balance |
+| `get_address_utxos` / `get_script_utxos` | spendable outputs |
+| `get_address_mempool` | unconfirmed entries touching an address |
+| `get_output_spent_by` | the input that spent an outpoint (indexer) |
+| `validate_address` | address well-formedness check |
+| `wait_for_tx` / `wait_for_payment` | long-poll for confirmation / incoming funds |
+
+### Indexer reads (indexer) — `read`
+
+| Method | Purpose |
+|---|---|
+| `get_address_history` | confirmed tx history for an address |
+| `list_settlements` | settlement records the daemon tracks |
+| `htlc_status` / `htlc_list` / `htlc_lookup_by_hashlock` | HTLC lifecycle observability |
+| `contract_stats` | aggregate contract counters |
+| `get_attestation_edges` | attestation graph edges |
+| `detect_in_chain_swaps` | scan for on-chain swap legs |
+
+### Keyring — `manage` to create, `spend` to reveal/export/delete
+
+| Method | Scope | Purpose |
+|---|---|---|
+| `generate_standard_address` | manage | **default**: 1:1 address from a standard BIP-39 phrase (exfer.dev-compatible) |
+| `generate_independent_address` | manage | 1:1 address, raw secret as its own phrase |
+| `generate_address` | manage | HD-derive next index (seeded keyrings only) |
+| `import_private_key` | manage | import a raw 32-byte secret |
+| `import_mnemonic` | manage | import an independent 24-word phrase |
+| `import_standard_mnemonic` | manage | import a standard 24-word phrase |
+| `list_addresses` | read | list keyring addresses + labels |
+| `reveal_address_mnemonic` | spend | a single address's 24-word phrase |
+| `reveal_mnemonic` / `reveal_private_key` | spend | legacy seed mnemonic / raw key |
+| `export_address` / `export_vault` | spend | seal one key / the whole keyring to a vault blob |
+| `import_vault` | spend | restore a vault blob |
+| `delete_address` | spend | erase a key (refuses on non-zero balance unless `force`) |
+
+### Transactions & messages
+
+| Method | Scope | Purpose |
+|---|---|---|
+| `transfer` | spend | build, sign, broadcast a payment |
+| `send_raw_transaction` | spend | broadcast a pre-built tx |
+| `abandon_transfer` | manage | drop a stuck in-flight transfer |
+| `sign_message` / `verify_message` | spend / read | proof-of-ownership signatures |
+| `simulate_transfer` / `simulate_htlc_lock` | read | cost/feasibility dry-run |
+
+### HTLC
+
+| Method | Scope | Purpose |
+|---|---|---|
+| `htlc_lock` / `htlc_claim` / `htlc_reclaim` | spend | open / claim / reclaim an HTLC |
+| `htlc_forget` | manage | drop local HTLC tracking state |
+
+### Payment URI — `read`
+
+`payment_uri_encode` / `payment_uri_decode` — `exfer:` URI codec.
+
+### Cross-chain swap & LP (swap engine / pool)
+
+| Method | Scope | Purpose |
+|---|---|---|
+| `swap_get_quote` | spend | reserve a preimage + seal a swap quote |
+| `swap_execute` / `swap_refund` | spend | lock/claim / reclaim both legs |
+| `swap_status` / `swap_list` | read | swap journal |
+| `swap_pool_info` / `swap_price_klines` | read | pool reserves, fees / price chart |
+| `lp_pool_info` / `lp_position` / `lp_deposit_status` | read | LP pool + position views |
+| `lp_deposit_start` | read | begin an LP deposit (returns funding instructions) |
+| `lp_withdraw_self` | spend | cash out LP shares to the user |
+
+### BSC / EVM side (native BNB counter-asset)
+
+| Method | Scope | Purpose |
+|---|---|---|
+| `bsc_get_address` / `bsc_get_balances` | read | EVM address / BNB+token balances |
+| `bsc_tx_history` | read | native-BNB transfer history |
+| `bsc_create_address` / `bsc_import_mnemonic` / `bsc_import_key` | manage | provision the independent EVM key |
+| `bsc_reveal_mnemonic` | spend | reveal the EVM recovery phrase |
+| `reveal_evm_private_key` | spend | export the EVM key (MetaMask import) |
+| `bsc_delete_key` | spend | delete the EVM key (can strand BNB) |
+| `bsc_send_bnb` | spend | withdraw native BNB |
 
 ---
 
@@ -1044,3 +1137,101 @@ Empty batches return a single top-level `-32600` response. Batches
 consisting entirely of notifications return `204 No Content`. Mixed
 batches return HTTP 200 with per-item `result` / `error` objects in
 the array.
+
+---
+
+## Keyring management
+
+The keyring is a flat set of 1:1 keys; see [Keystore](./keystore.md)
+for the model. All addresses are 64-hex pubkey hashes (lowercase).
+
+### `generate_standard_address`
+
+`manage`. The **default** way to mint an address. Derives a fresh 1:1
+key from a random standard BIP-39 phrase (the `exfer.dev`-compatible
+derivation), so its recovery phrase restores the same address in any
+Exfer wallet.
+
+- **Params**: `{ "label": "<string, optional>" }` (or none).
+- **Result**: `{ "address": "<64 hex>", "pubkey": "<64 hex>", "imported": true }`.
+
+### `generate_independent_address`
+
+`manage`. Same shape, but the key's recovery phrase is its raw 32-byte
+secret encoded as BIP-39 — self-contained, walletd-restore only.
+
+### `generate_address`
+
+`manage`. Legacy HD derivation: bumps `next_index` and derives the next
+address from the keyring's seed. Only meaningful on a **seeded** keyring
+(see [Keystore → Seeded vs seedless](./keystore.md#seeded-vs-seedless)).
+Params `{ "label": "<optional>" }`.
+
+### `import_private_key`
+
+`manage`. Register a raw 32-byte ed25519 secret.
+Params `{ "private_key": "<64 hex>", "label": "<optional>" }`.
+
+### `import_mnemonic` / `import_standard_mnemonic`
+
+`manage`. Register a 24-word BIP-39 phrase as a key — `import_mnemonic`
+treats it as an independent phrase, `import_standard_mnemonic` derives it
+through the standard `exfer.dev` domain.
+
+- **Params**: `{ "mnemonic": "<24 words>", "label": "<optional>" }`.
+- **Result**: the imported `address`.
+
+### `reveal_address_mnemonic`
+
+`spend`. Return one address's own 24-word recovery phrase. Sensitive.
+
+- **Params**: `{ "address": "<64 hex>", "passphrase": "<keystore passphrase>" }`.
+- **Result**: `{ "address": "<64 hex>", "mnemonic": ["word", …] }`.
+
+### `export_address` / `export_vault`
+
+`spend`. Seal key material to a `WDV1` vault blob.
+`export_address` covers a single address; `export_vault` covers **every**
+key in the keyring (single-file backup that survives adding addresses).
+
+- **`export_address` params**: `{ "address": "<64 hex>", "passphrase": "<vault passphrase>" }`
+  → `{ "address": "<64 hex>", "vault_hex": "<hex blob>" }`.
+- **`export_vault` params**: `{ "passphrase": "<vault passphrase>" }`
+  → the sealed `vault_hex` blob.
+
+The vault passphrase is independent of the keystore passphrase: it
+protects the portable blob.
+
+### `import_vault`
+
+`spend`. Restore keys from an `export_vault` / `export_address` blob;
+each lands as an independent key, and addresses already present are
+skipped.
+
+- **Params**: `{ "vault_hex": "<hex blob>", "passphrase": "<vault passphrase>" }`.
+- **Result**: the list of restored addresses.
+
+### `delete_address`
+
+`spend`. Erase a key from the keyring. Destructive — refuses while the
+address holds a confirmed balance (or when the upstream balance can't be
+checked) unless `force` is set. Back the key up first
+([`export_address`](#export_address--export_vault) or
+[`reveal_address_mnemonic`](#reveal_address_mnemonic)).
+
+- **Params**: `{ "address": "<64 hex>", "passphrase": "<keystore passphrase>", "force": false }`.
+
+## Swap, LP, and BSC
+
+The cross-chain swap engine settles EXFER against **native BNB** over a
+pool, using HTLCs on the Exfer leg and an EVM key on the BSC leg. These
+methods are summarized in the [catalog](#cross-chain-swap--lp-swap-engine--pool)
+above; their request/response shapes track the pool protocol and the
+EVM side, and the fund-moving ones (`swap_get_quote`, `swap_execute`,
+`swap_refund`, `bsc_send_bnb`, `lp_withdraw_self`, and the EVM key
+reveals/deletes) require `spend`. LP read views (`lp_pool_info`,
+`lp_position`, `lp_deposit_status`) and swap views (`swap_status`,
+`swap_list`, `swap_pool_info`, `swap_price_klines`) are `read`. The
+LP deposit/withdraw calls key off the caller's EXFER and BSC addresses
+(`lp_deposit_start(exfer_address, bsc_address)`,
+`lp_withdraw_self(exfer_address, shares)`).

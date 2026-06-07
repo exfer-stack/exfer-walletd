@@ -14,14 +14,16 @@ gpg --symmetric --cipher-algo AES256 wallets-$(date +%F).tar.gz
 ```
 
 If you can't stop the daemon, snapshot the underlying volume (LVM,
-ZFS, your cloud snapshot). Walletd writes `seed.enc`, `state.json`,
-and `imported/*.key.enc` atomically (write-to-`.tmp` + rename), so
-per-file copies during a quiet moment are fine too.
+ZFS, your cloud snapshot). Walletd writes `state.json`,
+`imported/*.key.enc` (and, on a legacy seeded keyring, `seed.enc`)
+atomically (write-to-`.tmp` + rename), so per-file copies during a
+quiet moment are fine too.
 
-The 24-word mnemonic printed on first run is the canonical backup
-of the HD seed — keep it offline. With the mnemonic you can rederive
-every HD address; only the `imported/` directory holds non-HD
-secrets that are not recoverable from the mnemonic.
+The canonical backup is a **vault** blob from `export_vault` — one
+passphrase-sealed file covering every key in the keyring, including
+standard recovery phrases. Keep it offline, and re-export after minting
+new addresses. Per-address phrases (`reveal_address_mnemonic`) are the
+finer-grained alternative. See [Keystore](./keystore.md).
 
 ## Upgrade
 

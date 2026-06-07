@@ -1,23 +1,66 @@
-# Keystore (HD seed)
+# Keystore (keyring)
 
-v1.0 keeps **one** BIP-39 seed per daemon. Every address you ever
-generate is derived from that seed by index — back up the seed once,
-back up every present and future address.
+Walletd's keystore is a **flat keyring**: a collection of independent
+keys, each individually exportable, importable, and deletable. No single
+secret governs the others — every address has its OWN 24-word recovery
+phrase, and a single **vault** file backs up the whole keyring under one
+passphrase.
+
+This replaced the older "one HD seed derives every address" model. A
+legacy HD seed still works as a backward-compatible *origin* (see
+[Seeded vs seedless](#seeded-vs-seedless)), but it is no longer the
+spine of the wallet.
+
+## Key origins
+
+A key enters the keyring one of three ways:
+
+| Origin | Created by | Recovery |
+| ------ | ---------- | -------- |
+| **Standard** (default) | `generate_standard_address`, `import_standard_mnemonic` | its own 24-word BIP-39 phrase, cross-wallet compatible |
+| **Independent** | `generate_independent_address` | its own 24-word phrase (the raw ed25519 secret encoded as BIP-39) |
+| **Imported** | `import_private_key`, `import_mnemonic` | the supplied secret / phrase; back it up yourself |
+| **HD-derived** (legacy) | `generate_address` on a seeded keyring | the keyring's single seed mnemonic |
+
+`generate_standard_address` is the **default for new addresses**. It
+mints a fresh 1:1 address from a random standard BIP-39 phrase whose
+derivation matches `exfer.dev` and the apps — the same phrase re-imported
+into any Exfer wallet yields the same address. Each method returns
+`{address, pubkey, imported: true}`.
+
+## Standard vs independent
+
+Both are 1:1 keys with their own recovery phrase; they differ only in
+how the phrase maps to the secret:
+
+- **Standard** mixes the BIP-39 seed with the domain tag
+  `EXFER-MNEMONIC-ED25519-V1` (pinned, byte-identical across `exfer.dev`
+  web and the apps). Its phrase is sealed alongside the key so
+  `reveal_address_mnemonic` can return it, and the phrase restores the
+  same address in any Exfer wallet.
+- **Independent** encodes the raw 32-byte ed25519 secret directly as a
+  BIP-39 phrase. Self-contained, but not derived through the standard
+  domain — restore it into walletd, not into a different wallet's
+  "import mnemonic".
 
 ## On-disk layout (`<wallet_dir>/`)
 
 ```
-seed.enc                  ← BIP-39 entropy (32 B) sealed with argon2id + ChaCha20-Poly1305
-state.json                ← {"next_index": N, "derived": {addr→idx},
-                              "labels": {addr→label}, "imported": [addr,…]}
-imported/<addr>.key.enc   ← sealed 32-byte secret for non-HD imports
+seed.enc                       ← OPTIONAL legacy HD entropy (32 B), sealed.
+                                 Absent in a seedless keyring.
+state.json                     ← {"next_index": N, "derived": {addr→idx},
+                                  "labels": {addr→label}, "imported": [addr,…]}
+imported/<addr>.key.enc        ← sealed 32-byte secret per 1:1 key
+imported/<addr>.mnemonic.enc   ← sealed BIP-39 phrase for STANDARD keys only
+                                 (lets reveal_address_mnemonic return it)
 ```
 
 `<wallet_dir>` defaults to `<datadir>/wallets` (mode `0700`).
 
 ## At-rest encryption
 
-The seed (and any imported secrets) is wrapped in a small format:
+Every sealed file (keys, mnemonics, the optional seed, the vault) uses
+one format:
 
 ```
 magic   "WDV1" (4)
@@ -27,119 +70,58 @@ nonce   12 bytes  (random per-seal; fed to ChaCha20-Poly1305)
 ct      payload + 16-byte Poly1305 tag
 ```
 
-Argon2id parameters: **m=64 MiB / t=3 / p=1** (≈0.5–1s on a modern
-x86 core). Enough to defeat offline brute force against medium-strength
-passphrases; cheap enough that startup (one unseal per seed) and
-imported-key access stay snappy.
+Argon2id parameters: **m=64 MiB / t=3 / p=1** (≈0.5–1s on a modern x86
+core) — enough to defeat offline brute force against medium-strength
+passphrases, cheap enough that unseal stays snappy. Each sealed class is
+bound to its own AAD (`exfer-walletd/v1/{seed,imported,vault,mnemonic}`)
+so a blob can't be replayed across roles.
 
-## The passphrase
+## The keystore passphrase
 
-The encryption KEK comes from `WALLETD_KEYSTORE_PASSPHRASE`. walletd
+The at-rest KEK comes from `WALLETD_KEYSTORE_PASSPHRASE`; walletd
 **refuses to start without it**. Set it via:
 
 - env var directly (development):
   ```bash
   WALLETD_KEYSTORE_PASSPHRASE='correct horse battery staple' exfer-walletd
   ```
-- secret manager → env at process spawn (production):
-  - systemd: `Environment="WALLETD_KEYSTORE_PASSPHRASE=…"` in a
-    `0600` drop-in
-  - Docker / k8s: pull from Secrets Manager / Vault / AWS-SM /
-    GCP-SM into the container env at start
-- never check in: `.env` files in git are an immediate red flag
+- secret manager → env at process spawn (production): systemd
+  `Environment=` in a `0600` drop-in; Docker/k8s from a Secrets Manager.
+- never check `.env` files into git.
 
-If the passphrase is wrong on a subsequent start, walletd surfaces
-`KeystoreLocked` (`-32012`) and exits before binding any socket.
+A wrong passphrase on a later start surfaces `KeystoreLocked`
+(`-32012`) and walletd exits before binding any socket.
 
-## Derivation path
+## Backup and recovery
 
-```
-m / 44' / 9527' / 0' / 0' / index'
-```
+Two complementary backups:
 
-- SLIP-0010 Ed25519 (forces hardened derivation at every level).
-- Coin type `9527'` is a placeholder until Exfer registers an
-  official SLIP-44 slot. Pinned in code; switching it would invalidate
-  every derived address — only changes inside a major version bump.
-- BIP-39 passphrase is empty: the *keystore* passphrase encrypts
-  entropy at rest; the wallet itself has no second factor.
+1. **The vault** (recommended). `export_vault` seals the entire keyring
+   — every key, with standard mnemonics — into one passphrase-protected
+   blob; `import_vault` restores it into another walletd. This is the
+   single-file backup that survives adding new addresses without
+   re-backing-up. `export_address` exports just one key as a vault blob.
+2. **Per-address recovery phrase.** `reveal_address_mnemonic` returns one
+   address's 24 words. A standard phrase restores that address into any
+   Exfer wallet; an independent phrase restores into walletd.
 
-`derive_ed25519_private_key(seed, [44, 9527, 0, 0, index])` (from the
-`slip10_ed25519` crate) produces a 32-byte secret; we wrap that as an
-`ed25519_dalek::SigningKey` and compute the address as
-`TxOutput::pubkey_hash_from_key(pubkey)` — byte-identical to the
-on-chain address scheme.
+Deleting a key (`delete_address`) is destructive: it refuses while the
+address holds a balance unless you pass `force: true`, and once erased
+the key is gone unless it was backed up (vault or phrase). Sweep first.
 
-## First-run mnemonic
+## Seeded vs seedless
 
-The first time walletd starts with an empty `<wallet_dir>`, it
-generates a 24-word BIP-39 mnemonic, seals the entropy to disk, and
-prints the words to **stderr** inside a boxed section:
+- **Seedless** (default for fresh keyrings): no `seed.enc`. Every
+  address is its own 1:1 key; backup is the vault or per-address phrases.
+- **Seeded** (legacy / operator): a `seed.enc` is present and
+  `generate_address` derives addresses by index along
+  `m/44'/9527'/0'/0'/i'` (SLIP-0010 Ed25519, all-hardened). The single
+  seed mnemonic backs up every *derived* address. Coin type `9527'` is a
+  private-use SLIP-44 placeholder until Exfer registers an official slot;
+  changing it would invalidate every derived address.
 
-```
-┌─ first run: HD seed ──────────────────────────────────────────────────
-│ A new BIP-39 mnemonic has been generated and the seed has been
-│ encrypted at rest with your WALLETD_KEYSTORE_PASSPHRASE.
-│
-│ ⚠  WRITE THESE 24 WORDS DOWN. They are the ONLY way to recover
-│    every address this daemon will ever derive. They will NEVER be
-│    shown again.
-│
-│     1. abandon    2. ability   3. able      4. about     5. above     6. absent
-│     7. absorb     8. abstract  9. absurd   10. abuse    11. access   12. accident
-│    13. account   14. accuse   15. achieve  16. acid     17. acoustic 18. acquire
-│    19. across    20. act      21. action   22. actor    23. actress  24. actual
-└───────────────────────────────────────────────────────────────────────
-```
-
-The mnemonic is **never re-printed** on later starts. Capture it
-out-of-band on first run (paper, password manager, hardware backup).
-
-## Recovery
-
-Two paths:
-
-1. **Same `seed.enc` + same `WALLETD_KEYSTORE_PASSPHRASE`** — drop the
-   sealed seed back in `<wallet_dir>/` and start with the original
-   passphrase.
-2. **Restore from the 24-word mnemonic** (v1.4.0+) —
-   [`HdSeedStore::init_from_mnemonic(wallet_dir, passphrase, phrase)`](https://github.com/exfer-stack/exfer-walletd/blob/main/src/store/hd.rs)
-   validates the phrase, seals its entropy to a **clean**
-   `<wallet_dir>/seed.enc` under a (possibly new) passphrase, and writes
-   a default `state.json`. Open the store afterward and the addresses
-   re-derive deterministically (`generate_address` for index 0, 1, …
-   reproduces the same addresses). Refuses if a seed already exists, so
-   it can't clobber a live keystore. The desktop app exposes this as
-   "Restore from recovery phrase" on first run.
-
-The mnemonic restores **into another exfer-walletd** (same SLIP-0010
-`m/44'/9527'/0'/0'/i'` derivation). It does **not** restore your
-addresses in other wallets — including `exfer.dev`'s "Import Mnemonic",
-which derives a different key. To move a single address elsewhere,
-export that address's key instead.
-
-## Imported (non-derived) addresses
-
-`exfer-walletd migrate --from <legacy-walletdir>` imports legacy v0.x
-`.key` files (raw 32-byte ed25519 secrets, or upstream-encrypted
-`EXFK`) as **non-derived** addresses. Each imported secret is sealed
-with the same KEK as the seed and stored at
-`<wallet_dir>/imported/<addr>.key.enc`.
-
-Imported addresses appear in `list_addresses` with `imported: true`
-and `index: null`. They sign normally; the only loss is that they're
-not recoverable from the mnemonic — back up imported secrets separately
-or accept that they're abandoned-by-design after a re-keying.
-
-## Index pacing
-
-Each `generate_address` bumps `next_index` and persists it atomically
-(`state.json.tmp` → rename). With `u32` indices you have ~4 billion
-addresses before the keystore refuses to mint more — well beyond any
-practical exchange / payment processor.
-
-`state.json` is *not* required for derivation correctness — the
-address at any index is purely a function of the seed. If you ever
-lose `state.json` but kept the seed, re-creating an empty one is
-safe; `list_addresses` will just be empty until you `generate_address`
-or learn the indices through other means.
+Existing seeded wallets keep working unchanged — they derive as before,
+and new addresses default to standard 1:1 keys. `state.json` is not
+required for derivation correctness on a seeded keyring (the address at
+any index is a pure function of the seed), but it is the only record of
+imported/independent keys, so it is included in the vault.

@@ -8,7 +8,7 @@
 - [Quick start](./quick-start.md)
 - [Picking a node](./picking-a-node.md)
 - [Tokens and scopes](./tokens-and-scopes.md)
-- [Keystore (HD seed)](./keystore.md)
+- [Keystore (keyring)](./keystore.md)
 
 # Reference
 

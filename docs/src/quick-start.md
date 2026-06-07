@@ -25,15 +25,16 @@ exfer-walletd
 
 Defaults: `--bind 127.0.0.1:7448`, `--node-rpc http://127.0.0.1:9334`,
 `--datadir ~/.exfer-walletd`. `WALLETD_KEYSTORE_PASSPHRASE` is
-**required** — walletd encrypts the HD seed at rest with argon2id +
+**required** — walletd seals every key at rest with argon2id +
 ChaCha20-Poly1305 and refuses to start without an explicit passphrase.
 
 On first run, walletd:
 
 1. Creates `~/.exfer-walletd/` (mode `0700`).
-2. Generates a 24-word BIP-39 mnemonic + a fresh HD seed; seals the
-   seed and prints the mnemonic once on stderr inside an ASCII box.
-   **Write the words down — they are the only seed backup.**
+2. Initializes an empty keyring. Addresses are minted on demand
+   (`generate_standard_address`), each with its own recovery phrase —
+   there is no single seed to write down. Back up the keyring with
+   `export_vault` (see [Keystore](./keystore.md)).
 3. Generates three bearer tokens (one per scope) at
    `<datadir>/token-{read,manage,spend}` and prints each once in an
    ASCII box.
@@ -50,9 +51,9 @@ drwx------  walletd  4096   .
 -rw-------  walletd    65   token-manage
 -rw-------  walletd    65   token-spend
 drwx------  walletd  4096   wallets/
-    ├── seed.enc        ← sealed BIP-39 entropy
     ├── state.json      ← next_index, labels, imported list
-    └── imported/       ← legacy .key migrations (sealed)
+    ├── imported/       ← one sealed key per 1:1 address
+    └── seed.enc        ← OPTIONAL: only on a legacy seeded keyring
 
 $ cat ~/.exfer-walletd/token-spend
 a85da0752815bbf652a1b147649cde77c17f784f3e608d362c629c798a555e7b
@@ -61,11 +62,10 @@ a85da0752815bbf652a1b147649cde77c17f784f3e608d362c629c798a555e7b
 If you also passed `--tls` (see below), three more files appear:
 `cert.pem`, `cert.key`, `cert.fingerprint`.
 
-**Backup** = the 24-word mnemonic (offline) plus
-`tar czf ... ~/.exfer-walletd/wallets/imported`. The mnemonic
-recovers every HD-derived address; the `imported/` files cover
-addresses that came in via `migrate`. Uninstall = `rm -rf` the
-datadir.
+**Backup** = a vault blob from `export_vault` (one passphrase-sealed
+file covering every key), kept offline. Per-address phrases
+(`reveal_address_mnemonic`) are the finer-grained alternative. See
+[Keystore](./keystore.md). Uninstall = `rm -rf` the datadir.
 
 ## Call it
 

@@ -8,10 +8,12 @@
 - Public binds fail-close unless TLS is on (`--tls`) or you opt in
   with `--allow-public-bind`. See
   [Tokens and scopes → Bind safety](./tokens-and-scopes.md#bind-safety).
-- HD seed sealed at `<wallet_dir>/seed.enc` with argon2id +
-  ChaCha20-Poly1305 (KEK from `WALLETD_KEYSTORE_PASSPHRASE`).
-  Imported (non-derived) secrets sealed under the same KEK at
-  `<wallet_dir>/imported/<addr>.key.enc`. Filenames are validated
+- Every key is sealed at rest with argon2id + ChaCha20-Poly1305 (KEK
+  from `WALLETD_KEYSTORE_PASSPHRASE`): one 1:1 key per file at
+  `<wallet_dir>/imported/<addr>.key.enc`, standard mnemonics alongside
+  at `<addr>.mnemonic.enc`, and — only on a legacy seeded keyring — the
+  HD seed at `<wallet_dir>/seed.enc`. Each sealed class has its own AAD
+  so a blob can't be replayed across roles. Filenames are validated
   64-hex addresses — no path traversal.
 - Signing happens in-process. Only the signed transaction bytes go
   to the upstream node; private keys never leave the daemon.
@@ -29,12 +31,13 @@
 These are deliberate trade-offs, not bugs. Know what model you're
 running.
 
-- **One passphrase unlocks every key.** The HD seed and any imported
-  secrets share the same KEK (derived from
-  `WALLETD_KEYSTORE_PASSPHRASE` via argon2id). Anyone who has the
-  passphrase plus read access to `<wallet_dir>/` can spend every
-  wallet. At-rest encryption defeats offline attackers against the
-  disk; live attackers with both inputs get full authority.
+- **One passphrase unlocks every key.** All sealed keys share the same
+  KEK (derived from `WALLETD_KEYSTORE_PASSPHRASE` via argon2id). Anyone
+  who has the passphrase plus read access to `<wallet_dir>/` can spend
+  every wallet. At-rest encryption defeats offline attackers against the
+  disk; live attackers with both inputs get full authority. (The vault
+  export passphrase is separate and protects only the portable backup
+  blob.)
 - **One spend token = total spend authority.** No per-key
   authorization, no quorum, no MPC. If you need finer-grained
   authority, implement the

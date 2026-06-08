@@ -32,6 +32,7 @@ use crate::upstream::ExferNode;
 
 pub mod htlc;
 pub mod payment_uri;
+pub mod quote;
 pub mod signmsg;
 pub mod simulate;
 pub mod swap;
@@ -404,6 +405,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- proof-of-ownership signatures ----
         "sign_message" => signmsg::sign_message(state, req.params).await,
         "verify_message" => signmsg::verify_message(state, req.params).await,
+
+        // ---- EXFER-QUOTE signed price credential ----
+        "quote_issue" => quote::quote_issue(state, req.params).await,
+        "quote_verify" => quote::quote_verify(state, req.params).await,
 
         // ---- sensitive recovery export (passphrase-gated, spend-scope) ----
         "reveal_mnemonic" => reveal_mnemonic(state, req.params).await,

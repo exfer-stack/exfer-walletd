@@ -63,6 +63,9 @@ impl Scope {
             | "htlc_reclaim"
             | "send_raw_transaction"
             | "sign_message"
+            // EXFER-QUOTE issuance mints a value-bearing price credential
+            // (same posture as sign_message); verification is pure/read-only.
+            | "quote_issue"
             | "reveal_mnemonic"
             | "reveal_private_key"
             // BSC/EVM private key export (for MetaMask import).
@@ -103,6 +106,8 @@ impl Scope {
             | "bsc_import_key"
             | "abandon_transfer"
             | "htlc_forget" => Scope::Manage,
+            // EXFER-QUOTE verification is pure and key-free; Read scope.
+            "quote_verify" => Scope::Read,
             _ => Scope::Read,
         }
     }

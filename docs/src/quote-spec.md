@@ -6,7 +6,7 @@ A signed EXFER-QUOTE is a price credential: a canonical, signed statement of *wh
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, MAY, and OPTIONAL are to be interpreted as in RFC 2119 / RFC 8174 when in all capitals.
 
-This standard derives from and resolves [ahuman-exfer/exfer#28](https://github.com/ahuman-exfer/exfer/issues/28). The walletd methods (Section 11) are gated on [#33](https://github.com/ahuman-exfer/exfer/issues/32) (node-derived genesis).
+This standard derives from and resolves [ahuman-exfer/exfer#28](https://github.com/ahuman-exfer/exfer/issues/28). The walletd methods (Section 11) are gated on [#33](https://github.com/ahuman-exfer/exfer/pull/33) (node-derived genesis).
 
 A quote is a **price credential, not a money credential**: holding one moves no value. A leaked or replayed quote can at worst be presented for one settlement at that price before it expires; every rule below exists to bound that blast radius to one settlement, and every check is acceptor-side.
 
@@ -230,4 +230,4 @@ Two RPC-surface facts an acceptor must budget for: there is no outpoint-to-outpu
 
 ## 12. Changelog
 
-- **v1 (Draft), 2026-06-07.** Initial standard, derived from and resolving [issue #28](https://github.com/ahuman-exfer/exfer/issues/28); wire image frozen per the approval. Implementation gated on [#33](https://github.com/ahuman-exfer/exfer/issues/32). Wire version byte = 1.
+- **v1 (Draft), 2026-06-07.** Initial standard, derived from and resolving [issue #28](https://github.com/ahuman-exfer/exfer/issues/28); wire image frozen per the approval. Implementation gated on [#33](https://github.com/ahuman-exfer/exfer/pull/33). Wire version byte = 1.

@@ -431,6 +431,13 @@ impl ExferNode {
 pub struct BlockTip {
     pub height: u64,
     pub block_id: String,
+    /// Node-derived genesis block id (`node.genesis_id`), never
+    /// tip-derived. Added by node PR #33 so walletd can bind quotes and
+    /// transactions to the network they were issued on. EXFER-QUOTE
+    /// (`src/api/quote.rs`) reads this from the live `get_block_height`
+    /// call and MUST NOT substitute a compiled-in constant.
+    #[serde(default)]
+    pub genesis_block_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

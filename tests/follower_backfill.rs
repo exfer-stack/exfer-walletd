@@ -142,3 +142,39 @@ async fn caught_up_index_does_not_skip_a_real_gap() {
         min_seen.load(Ordering::SeqCst)
     );
 }
+
+#[tokio::test]
+async fn tip_only_mode_tracks_tip_without_indexing() {
+    // With an indexer configured the follower runs tip-only: it advances the
+    // meta to the tip (so wait_for_tx/get_follower_status work) but indexes NO
+    // HTLCs — it must never even fetch a block.
+    let mock = MockServer::start().await;
+    let min_seen = Arc::new(AtomicU64::new(u64::MAX));
+    mount_node(&mock, 100, min_seen.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap());
+    let node = Arc::new(
+        ExferNode::with_retry_policy(mock.uri(), Duration::from_secs(5), RetryPolicy::none())
+            .unwrap(),
+    );
+    let index = Arc::new(Index::open(dir.path()).unwrap());
+    let cfg = FollowerConfig {
+        tip_only: true,
+        ..Default::default()
+    };
+    let (follower, rx) = Follower::new(store, node, index.clone(), cfg);
+
+    follower.tick_tip_only().await.unwrap();
+
+    let meta = index.follower_meta().unwrap();
+    assert_eq!(meta.last_indexed_height, 100, "tip tracked");
+    assert!(meta.full_scan_complete, "reports caught-up, not 'behind'");
+    assert_eq!(*rx.borrow(), 100, "tip_rx nudged (wait_for_tx wakes)");
+    assert_eq!(
+        min_seen.load(Ordering::SeqCst),
+        u64::MAX,
+        "tip-only must NOT fetch any block"
+    );
+    assert_eq!(index.count().unwrap(), 0, "no HTLCs indexed locally");
+}

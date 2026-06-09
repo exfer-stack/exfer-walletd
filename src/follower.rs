@@ -101,6 +101,14 @@ pub struct FollowerConfig {
     /// affects the FIRST catch-up — once `full_scan_complete` is set, a
     /// later gap is real blocks the follower must index, never skipped.
     pub backfill_lookback: Option<u64>,
+    /// When true, the follower does NOT index HTLCs at all — it only tracks
+    /// the chain tip (advancing `tip_rx` and the follower meta so
+    /// `wait_for_tx`/`wait_for_payment` wake and `get_follower_status` reports
+    /// honestly). Set when an indexer is configured: HTLC observability is
+    /// delegated to the global indexer (see `api::htlc`), so re-walking the
+    /// chain to build a redundant local index is pure waste. The owned-only
+    /// local follower is only needed as the standalone (no-indexer) fallback.
+    pub tip_only: bool,
 }
 
 impl Default for FollowerConfig {
@@ -109,6 +117,7 @@ impl Default for FollowerConfig {
             poll_interval: Duration::from_secs(2),
             disabled: false,
             backfill_lookback: Some(DEFAULT_BACKFILL_LOOKBACK),
+            tip_only: false,
         }
     }
 }
@@ -240,20 +249,35 @@ impl Follower {
             tracing::warn!("follower: disabled by config; nothing will be indexed");
             return;
         }
-        tracing::info!(
-            "follower: started; poll interval = {:?}",
-            self.config.poll_interval
-        );
+        if self.config.tip_only {
+            tracing::info!(
+                "follower: tip-only mode (indexer configured) — HTLC observability is delegated \
+                 to the indexer; tracking chain tip only, no local HTLC index backfill. \
+                 poll interval = {:?}",
+                self.config.poll_interval
+            );
+        } else {
+            tracing::info!(
+                "follower: started; poll interval = {:?}",
+                self.config.poll_interval
+            );
+        }
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
                 _ = async {
-                    if let Err(e) = self.refresh_owned().await {
-                        tracing::warn!("follower: owned-key refresh failed: {e}");
-                    }
-                    if let Err(e) = self.tick().await {
-                        tracing::warn!("follower: tick failed: {e}");
+                    if self.config.tip_only {
+                        if let Err(e) = self.tick_tip_only().await {
+                            tracing::warn!("follower: tip-only tick failed: {e}");
+                        }
+                    } else {
+                        if let Err(e) = self.refresh_owned().await {
+                            tracing::warn!("follower: owned-key refresh failed: {e}");
+                        }
+                        if let Err(e) = self.tick().await {
+                            tracing::warn!("follower: tick failed: {e}");
+                        }
                     }
                     tokio::time::sleep(self.config.poll_interval).await;
                 } => {}
@@ -439,6 +463,35 @@ impl Follower {
         // Persist the final cursor — covers every block since the last
         // checkpoint (and the full_scan_complete flip).
         self.index.save_follower_meta(&meta)?;
+        Ok(())
+    }
+
+    /// Tip-only tick (used when an indexer is configured): do NOT index any
+    /// HTLCs. Just read the chain tip, advance the follower meta to it, and
+    /// nudge `tip_rx`. This keeps `wait_for_tx`/`wait_for_payment` waking on
+    /// new blocks and `get_follower_status` reporting "caught up", while HTLC
+    /// observability is served by the indexer (`api::htlc` delegation). No
+    /// genesis backfill, no per-block tx fetch — the redundant local index is
+    /// simply not built.
+    ///
+    /// Caveat: advancing the meta to the tip means that if the indexer is
+    /// later removed and walletd restarts in full mode, it resumes from the
+    /// tip rather than backfilling pre-removal history (forward HTLCs are still
+    /// indexed). Wipe the index or set `EXFER_FOLLOWER_BACKFILL_LOOKBACK` to
+    /// force a historical rebuild in that (rare) case.
+    pub async fn tick_tip_only(self: &Arc<Self>) -> Result<()> {
+        let tip = self.node.get_block_height().await?;
+        let mut meta = self.index.follower_meta()?;
+        if meta.started_at == 0 {
+            meta.started_at = unix_now_secs();
+        }
+        if meta.last_indexed_height != tip.height || !meta.full_scan_complete {
+            meta.last_indexed_height = tip.height;
+            meta.last_indexed_block_id = decode_hex32(&tip.block_id)?;
+            meta.full_scan_complete = true;
+            self.index.save_follower_meta(&meta)?;
+        }
+        let _ = self.tip_tx.send(tip.height);
         Ok(())
     }
 

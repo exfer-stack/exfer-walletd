@@ -196,8 +196,14 @@ pub async fn run_embedded(
     // restart, the old follower keeps polling and holding the wallet store,
     // so the new instance can't reopen the datadir. `tip_rx` is what
     // `wait_for_tx` will subscribe to.
+    // When an indexer is configured, HTLC observability is delegated to it
+    // (see `api::htlc`), so the follower runs in tip-only mode — it tracks the
+    // chain tip (for `wait_for_tx`/`wait_for_payment` and `get_follower_status`)
+    // but does NOT build a redundant local HTLC index from genesis. The full
+    // owned-only follower runs only as the standalone, no-indexer fallback.
     let follower_cfg = crate::follower::FollowerConfig {
         backfill_lookback: crate::follower::backfill_lookback_from_env(),
+        tip_only: cfg.indexer_rpc.is_some(),
         ..crate::follower::FollowerConfig::default()
     };
     let (follower, tip_rx) =

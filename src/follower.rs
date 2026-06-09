@@ -79,16 +79,12 @@ pub const DEFAULT_BACKFILL_LOOKBACK: u64 = 2_000;
 /// fetches (bounded to this many in flight) while still yielding blocks
 /// strictly in height order, so processing — and the same-block lock→claim
 /// ordering it relies on — is unchanged.
-const FETCH_CONCURRENCY: usize = 32;
-
-/// During a long catch-up walk, persist the follower checkpoint every this
-/// many blocks rather than after every single one. Each `save_follower_meta`
-/// is a redb write transaction; doing it per-block dominated backfill time.
-/// A crash loses at most this many blocks of progress, which the next walk
-/// re-indexes idempotently. The tail past the last checkpoint is always saved
-/// when the walk finishes. Also bounds how stale `get_follower_status` can
-/// read during an active backfill, so it's kept modest.
-const META_CHECKPOINT_INTERVAL: u64 = 64;
+/// Real upstream nodes (including the public RPCs) intermittently reset
+/// connections under bursty load, and each failed fetch aborts the whole
+/// tick. Keep concurrency moderate so the catch-up walk pulls blocks in
+/// parallel (vs the old one-at-a-time crawl) without hammering a flaky node
+/// into more resets than it saves.
+const FETCH_CONCURRENCY: usize = 12;
 
 /// How frequently the follower polls for a new tip. Default 2 s.
 #[derive(Debug, Clone)]
@@ -405,20 +401,20 @@ impl Follower {
         let mut blocks = stream::iter(start..=tip_height)
             .map(|h| self.fetch_full_block(h))
             .buffered(FETCH_CONCURRENCY);
-        let mut since_checkpoint = 0u64;
         while let Some(res) = blocks.next().await {
             let fb = res?;
             let h = fb.height;
             self.process_fetched(&fb).await?;
             meta.last_indexed_height = h;
             meta.last_indexed_block_id = fb.block_id;
+            // Persist every block. A flaky upstream that drops a connection
+            // aborts the rest of this tick (the `res?` above); per-block saves
+            // mean the next tick resumes from the last block we actually
+            // indexed instead of re-walking everything since a periodic
+            // checkpoint — which, on a node that resets often, can stall net
+            // progress entirely. redb writes are cheap; the fetch dominates.
+            self.index.save_follower_meta(&meta)?;
             let _ = self.tip_tx.send(h);
-
-            since_checkpoint += 1;
-            if since_checkpoint >= META_CHECKPOINT_INTERVAL {
-                self.index.save_follower_meta(&meta)?;
-                since_checkpoint = 0;
-            }
 
             if h.is_multiple_of(1000) {
                 tracing::info!(

@@ -227,6 +227,7 @@ async fn follower_indexes_lock_then_classifies_claim() {
         FollowerConfig {
             poll_interval: Duration::from_millis(1),
             disabled: false,
+            backfill_lookback: None,
         },
     );
 
@@ -271,6 +272,7 @@ async fn follower_indexes_lock_then_classifies_claim() {
         FollowerConfig {
             poll_interval: Duration::from_millis(1),
             disabled: false,
+            backfill_lookback: None,
         },
     );
     follower2.refresh_owned().await.unwrap();

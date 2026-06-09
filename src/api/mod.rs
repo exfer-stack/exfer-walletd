@@ -29,6 +29,7 @@ use crate::inflight::InFlightUtxos;
 use crate::store::WalletStore;
 use crate::tx::{FeeChoice, TransferReceipt};
 use crate::upstream::ExferNode;
+use exfer::covenants::htlc::{HtlcParams, HtlcRecord, HtlcRole, HtlcState};
 
 pub mod htlc;
 pub mod payment_uri;
@@ -941,7 +942,65 @@ async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
         &state.inflight,
     )
     .await?;
+
+    // Eagerly record our own outgoing HTLC so `htlc_status` / `htlc_list`
+    // surface it IMMEDIATELY, rather than only after the block follower
+    // re-discovers it from chain — which can lag badly. Best-effort: the lock
+    // has already broadcast, so an index hiccup must not fail the call.
+    if let Ok(lock_tx_id) = crate::tx::decode_hash(&receipt.tx_id) {
+        let record = eager_lock_record(
+            lock_tx_id,
+            receipt.htlc_output_index,
+            signer.pubkey(),
+            receiver,
+            hash_lock.0,
+            p.timeout,
+            receipt.amount,
+            receipt.built_at_height,
+        );
+        if let Ok(owned_addr) = crate::tx::decode_hash(&p.from) {
+            if let Err(e) = state.index.upsert_htlc(&record, owned_addr) {
+                tracing::warn!("htlc_lock: eager index write failed (non-fatal): {e}");
+            }
+        }
+    }
+
     serde_json::to_value(&receipt).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// Build the optimistic mempool `HtlcRecord` for a just-broadcast OUTGOING
+/// HTLC lock. `lock_block_height: None` marks it mempool-pending (the
+/// documented wallet-daemon optimistic case); `role: Sender` because we
+/// funded it; `state: Locked`. The follower reconciles the confirmed height
+/// and any claim/reclaim once the lock lands in a block.
+#[allow(clippy::too_many_arguments)]
+fn eager_lock_record(
+    lock_tx_id: [u8; 32],
+    output_index: u32,
+    sender_pubkey: [u8; 32],
+    receiver: [u8; 32],
+    hash_lock: [u8; 32],
+    timeout_height: u64,
+    amount: u64,
+    observed_height: u64,
+) -> HtlcRecord {
+    HtlcRecord {
+        lock_tx_id,
+        output_index,
+        params: HtlcParams {
+            sender: sender_pubkey,
+            receiver,
+            hash_lock,
+            timeout_height,
+        },
+        amount,
+        lock_block_height: None,
+        state: HtlcState::Locked,
+        claim: None,
+        reclaim: None,
+        role: HtlcRole::Sender,
+        last_indexed_height: observed_height,
+    }
 }
 
 async fn htlc_claim_method(state: &ApiState, params: Value) -> Result<Value> {
@@ -1705,6 +1764,33 @@ fn ensure_hex(s: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn eager_lock_record_is_sender_locked_mempool() {
+        let rec = eager_lock_record(
+            [0x11; 32], // lock_tx_id
+            0,          // output_index
+            [0xAA; 32], // sender pubkey (ours)
+            [0xBB; 32], // receiver
+            [0xCC; 32], // hash_lock
+            999,        // timeout_height
+            50_000,     // amount
+            761_000,    // observed tip
+        );
+        // The whole point of the eager write: visible before confirmation.
+        assert_eq!(rec.lock_block_height, None, "must be mempool-pending");
+        assert_eq!(rec.state, HtlcState::Locked);
+        assert_eq!(rec.role, HtlcRole::Sender, "we funded it → Sender");
+        assert_eq!(rec.claim, None);
+        assert_eq!(rec.reclaim, None);
+        // Params round-trip exactly so htlc_status reflects the real lock.
+        assert_eq!(rec.params.sender, [0xAA; 32]);
+        assert_eq!(rec.params.receiver, [0xBB; 32]);
+        assert_eq!(rec.params.hash_lock, [0xCC; 32]);
+        assert_eq!(rec.params.timeout_height, 999);
+        assert_eq!(rec.amount, 50_000);
+        assert_eq!(rec.last_indexed_height, 761_000);
+    }
 
     #[test]
     fn utxo_status_classification_priority() {

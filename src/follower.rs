@@ -50,13 +50,45 @@ use exfer::covenants::htlc::{
     try_parse_htlc, HtlcClaimRecord, HtlcParams, HtlcReclaimRecord, HtlcRecord, HtlcRole, HtlcState,
 };
 use exfer::types::transaction::Transaction;
+use futures::stream::{self, StreamExt};
 use tokio::sync::{watch, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 use crate::index::{FollowerMeta, Index};
 use crate::store::WalletStore;
-use crate::upstream::{BlockSummary, ExferNode};
+use crate::upstream::ExferNode;
+
+/// Default initial-backfill lookback window (in blocks). On a fresh or
+/// reset index the follower starts indexing from `tip - this` rather than
+/// genesis, so it never has to re-walk hundreds of thousands of ancient
+/// blocks tx-by-tx (the upstream node serves these one round-trip at a time
+/// and is the throughput ceiling, so a full backfill can take tens of
+/// minutes to hours). ~2k blocks is several hours at the current cadence —
+/// long enough to pick up any in-flight HTLC, while keeping the one-time
+/// catch-up to a few minutes. The wallet's OWN outgoing HTLCs are recorded
+/// eagerly at lock time (and survive a meta reset), so the window only needs
+/// to cover counterparty/receiver-side activity. Override with
+/// `EXFER_FOLLOWER_BACKFILL_LOOKBACK` (`full` = scan from genesis; or any
+/// block count).
+pub const DEFAULT_BACKFILL_LOOKBACK: u64 = 2_000;
+
+/// How many blocks the catch-up walk fetches concurrently. Block + per-tx
+/// lookups are network round-trips to the upstream node; fetching them one
+/// at a time made a 10k-block backfill take hours. `buffered` pipelines the
+/// fetches (bounded to this many in flight) while still yielding blocks
+/// strictly in height order, so processing — and the same-block lock→claim
+/// ordering it relies on — is unchanged.
+const FETCH_CONCURRENCY: usize = 32;
+
+/// During a long catch-up walk, persist the follower checkpoint every this
+/// many blocks rather than after every single one. Each `save_follower_meta`
+/// is a redb write transaction; doing it per-block dominated backfill time.
+/// A crash loses at most this many blocks of progress, which the next walk
+/// re-indexes idempotently. The tail past the last checkpoint is always saved
+/// when the walk finishes. Also bounds how stale `get_follower_status` can
+/// read during an active backfill, so it's kept modest.
+const META_CHECKPOINT_INTERVAL: u64 = 64;
 
 /// How frequently the follower polls for a new tip. Default 2 s.
 #[derive(Debug, Clone)]
@@ -66,6 +98,13 @@ pub struct FollowerConfig {
     /// ops debugging or when running walletd against an out-of-date
     /// node.
     pub disabled: bool,
+    /// Initial-backfill lookback window, in blocks. `Some(n)`: on a
+    /// never-caught-up index that is more than `n` blocks behind the tip,
+    /// fast-forward the cursor to `tip - n` (skipping older history).
+    /// `None`: always backfill from genesis (legacy behaviour). Only
+    /// affects the FIRST catch-up — once `full_scan_complete` is set, a
+    /// later gap is real blocks the follower must index, never skipped.
+    pub backfill_lookback: Option<u64>,
 }
 
 impl Default for FollowerConfig {
@@ -73,6 +112,29 @@ impl Default for FollowerConfig {
         Self {
             poll_interval: Duration::from_secs(2),
             disabled: false,
+            backfill_lookback: Some(DEFAULT_BACKFILL_LOOKBACK),
+        }
+    }
+}
+
+/// Resolve the initial-backfill lookback from the
+/// `EXFER_FOLLOWER_BACKFILL_LOOKBACK` environment variable:
+/// unset → the default window; `full` / `genesis` / `0` → `None` (scan
+/// from genesis); a positive integer → that many blocks. An unparseable
+/// value falls back to the default rather than failing startup.
+pub fn backfill_lookback_from_env() -> Option<u64> {
+    match std::env::var("EXFER_FOLLOWER_BACKFILL_LOOKBACK") {
+        Err(_) => Some(DEFAULT_BACKFILL_LOOKBACK),
+        Ok(raw) => {
+            let v = raw.trim();
+            if v.eq_ignore_ascii_case("full") || v.eq_ignore_ascii_case("genesis") || v == "0" {
+                None
+            } else {
+                match v.parse::<u64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => Some(DEFAULT_BACKFILL_LOOKBACK),
+                }
+            }
         }
     }
 }
@@ -101,6 +163,14 @@ struct OwnedSet {
     /// Tracks which address hex strings we've already loaded, so the
     /// next `list()` round doesn't pay the argon2 unseal cost again.
     known_addresses: std::collections::HashSet<String>,
+}
+
+/// A block plus its fully-decoded transactions, fetched ahead of processing
+/// by the pipelined catch-up walk.
+struct FetchedBlock {
+    height: u64,
+    block_id: [u8; 32],
+    txs: Vec<([u8; 32], Transaction)>,
 }
 
 pub struct Follower {
@@ -273,6 +343,41 @@ impl Follower {
             }
         }
 
+        // Initial-backfill fast-forward. The follower only indexes
+        // owned-key HTLCs, and the wallet eagerly records its own sends at
+        // lock time, so re-walking ancient history on a fresh/reset index is
+        // almost pure waste — yet, done block-by-block tx-by-tx, it can leave
+        // the follower hundreds of thousands of blocks behind the chain
+        // forever. When we have NEVER caught up (`!full_scan_complete`) and
+        // are further behind than the lookback window, jump the cursor to
+        // `tip - lookback`, anchored on that block's real id. A follower that
+        // HAS caught up never skips: a later gap is real blocks it must index.
+        if let Some(lookback) = self.config.backfill_lookback {
+            if !meta.full_scan_complete
+                && tip_height.saturating_sub(meta.last_indexed_height) > lookback
+            {
+                let start_at = tip_height - lookback; // first block we WILL index
+                if start_at >= 1 {
+                    let anchor_h = start_at - 1;
+                    let anchor = self.node.get_block_by_height(anchor_h).await?;
+                    let skipped = anchor_h.saturating_sub(meta.last_indexed_height);
+                    meta.last_indexed_height = anchor_h;
+                    meta.last_indexed_block_id = decode_hex32(&anchor.block_id)?;
+                    self.index.save_follower_meta(&meta)?;
+                    let _ = self.tip_tx.send(anchor_h);
+                    tracing::info!(
+                        "follower: backfill fast-forward to height {} (skipped ~{} ancient \
+                         blocks; lookback={}). Owned-key HTLCs locked before {} are not \
+                         indexed; set EXFER_FOLLOWER_BACKFILL_LOOKBACK=full for a genesis scan.",
+                        start_at,
+                        skipped,
+                        lookback,
+                        start_at
+                    );
+                }
+            }
+        }
+
         let start = if meta.last_indexed_block_id == [0u8; 32] && meta.last_indexed_height == 0 {
             // Genesis included.
             0
@@ -290,17 +395,30 @@ impl Follower {
             return Ok(());
         }
 
-        for h in start..=tip_height {
-            let block = self.node.get_block_by_height(h).await?;
-            self.process_block(h, &block).await?;
+        // Fetch blocks (with their txs) concurrently but process them in
+        // strict height order. `buffered` keeps up to FETCH_CONCURRENCY fetches
+        // in flight and yields results in input order, so block H is processed
+        // before H+1 (and a same-block lock is indexed before a claim that
+        // spends it) while the network latency of the next blocks is hidden.
+        // On any fetch/decode error the stream surfaces it here: blocks before
+        // it are already committed to meta, so the next tick resumes cleanly.
+        let mut blocks = stream::iter(start..=tip_height)
+            .map(|h| self.fetch_full_block(h))
+            .buffered(FETCH_CONCURRENCY);
+        let mut since_checkpoint = 0u64;
+        while let Some(res) = blocks.next().await {
+            let fb = res?;
+            let h = fb.height;
+            self.process_fetched(&fb).await?;
             meta.last_indexed_height = h;
-            meta.last_indexed_block_id = decode_hex32(&block.block_id)?;
-            // Lifecycle sweep: Locked → LockedExpired for any HTLC
-            // whose timeout has now passed.
-            self.sweep_expired(h)?;
-            // Save meta every block — redb writes are cheap (~µs).
-            self.index.save_follower_meta(&meta)?;
+            meta.last_indexed_block_id = fb.block_id;
             let _ = self.tip_tx.send(h);
+
+            since_checkpoint += 1;
+            if since_checkpoint >= META_CHECKPOINT_INTERVAL {
+                self.index.save_follower_meta(&meta)?;
+                since_checkpoint = 0;
+            }
 
             if h.is_multiple_of(1000) {
                 tracing::info!(
@@ -311,26 +429,62 @@ impl Follower {
                 );
             }
         }
+
+        // Lifecycle sweep ONCE per tick at the height we reached, rather than
+        // on every block: Locked → LockedExpired for any owned HTLC whose
+        // timeout has now passed. Claims/reclaims are still applied per-block
+        // by `process_inputs`; the sweep only catches locks that expired
+        // without being spent, so a single pass at the final height suffices.
+        self.sweep_expired(meta.last_indexed_height)?;
+
         if meta.last_indexed_height >= tip_height {
             meta.full_scan_complete = true;
-            self.index.save_follower_meta(&meta)?;
         }
+        // Persist the final cursor — covers every block since the last
+        // checkpoint (and the full_scan_complete flip).
+        self.index.save_follower_meta(&meta)?;
         Ok(())
     }
 
-    /// Walk every transaction in a block. Returns early on the first
-    /// upstream error — partial work is fine because upsert is
-    /// idempotent.
-    async fn process_block(&self, height: u64, block: &BlockSummary) -> Result<()> {
-        for tx_id_hex in &block.transactions {
-            let tx_status = self.node.get_transaction(tx_id_hex).await?;
-            let tx_bytes =
-                hex::decode(&tx_status.tx_hex).map_err(|e| Error::BadHex(e.to_string()))?;
-            let (tx, _consumed) = Transaction::deserialize(&tx_bytes)
-                .map_err(|e| Error::Internal(format!("follower: decode tx {tx_id_hex}: {e:?}")))?;
-            let tx_id_bytes = decode_hex32(tx_id_hex)?;
-            self.process_outputs(&tx, tx_id_bytes, height).await?;
-            self.process_inputs(&tx, tx_id_bytes, height).await?;
+    /// Fetch a block and all of its transactions, decoded and ready to
+    /// index. The per-tx `get_transaction` round-trips run concurrently
+    /// (blocks on this chain are small); the caller pipelines whole blocks
+    /// via `buffered`. Returns early on the first fetch/decode error.
+    async fn fetch_full_block(&self, height: u64) -> Result<FetchedBlock> {
+        let block = self.node.get_block_by_height(height).await?;
+        let block_id = decode_hex32(&block.block_id)?;
+        let tx_futs = block.transactions.iter().map(|tx_id_hex| {
+            let node = self.node.clone();
+            let tx_id_hex = tx_id_hex.clone();
+            async move {
+                let tx_status = node.get_transaction(&tx_id_hex).await?;
+                let tx_bytes =
+                    hex::decode(&tx_status.tx_hex).map_err(|e| Error::BadHex(e.to_string()))?;
+                let (tx, _consumed) = Transaction::deserialize(&tx_bytes).map_err(|e| {
+                    Error::Internal(format!("follower: decode tx {tx_id_hex}: {e:?}"))
+                })?;
+                let tx_id_bytes = decode_hex32(&tx_id_hex)?;
+                Ok::<_, Error>((tx_id_bytes, tx))
+            }
+        });
+        let mut txs = Vec::with_capacity(block.transactions.len());
+        for r in futures::future::join_all(tx_futs).await {
+            txs.push(r?);
+        }
+        Ok(FetchedBlock {
+            height,
+            block_id,
+            txs,
+        })
+    }
+
+    /// Index every transaction of a pre-fetched block, in order. Outputs
+    /// before inputs per tx, txs in block order — so a same-block lock is
+    /// recorded before a claim that spends it. Upsert is idempotent.
+    async fn process_fetched(&self, fb: &FetchedBlock) -> Result<()> {
+        for (tx_id, tx) in &fb.txs {
+            self.process_outputs(tx, *tx_id, fb.height).await?;
+            self.process_inputs(tx, *tx_id, fb.height).await?;
         }
         Ok(())
     }

@@ -196,12 +196,12 @@ pub async fn run_embedded(
     // restart, the old follower keeps polling and holding the wallet store,
     // so the new instance can't reopen the datadir. `tip_rx` is what
     // `wait_for_tx` will subscribe to.
-    let (follower, tip_rx) = crate::follower::Follower::new(
-        store.clone(),
-        node.clone(),
-        index.clone(),
-        crate::follower::FollowerConfig::default(),
-    );
+    let follower_cfg = crate::follower::FollowerConfig {
+        backfill_lookback: crate::follower::backfill_lookback_from_env(),
+        ..crate::follower::FollowerConfig::default()
+    };
+    let (follower, tip_rx) =
+        crate::follower::Follower::new(store.clone(), node.clone(), index.clone(), follower_cfg);
     let follower_task = follower.spawn_with_shutdown(shutdown.clone());
 
     // Phase 2 SSE: connect to the upstream node's /sse push endpoint and

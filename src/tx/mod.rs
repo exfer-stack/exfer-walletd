@@ -237,6 +237,7 @@ pub async fn transfer(
 pub async fn simulate_transfer(
     signer: &Signer,
     recipients: Vec<(Hash256, u64)>,
+    datum: Option<Vec<u8>>,
     fee_choice: FeeChoice,
     max_fee: u64,
     node: &ExferNode,
@@ -255,10 +256,12 @@ pub async fn simulate_transfer(
         })
         .collect();
 
-    // simulate ignores datum (its only effect is a few cost-units of size);
-    // a dry-run fee estimate stays accurate enough without it.
+    // Thread the datum through `build_only` so its bytes count toward the
+    // simulated tx size + fee — a honor settlement (which carries the
+    // quote_id as a 16-byte datum) then dry-runs to the SAME size/fee the
+    // real transfer produces.
     let (built, _guard) =
-        build_only(signer, outputs, None, fee_choice, max_fee, node, inflight).await?;
+        build_only(signer, outputs, datum, fee_choice, max_fee, node, inflight).await?;
     // Dropping `_guard` releases the inflight UTXO reservation — the
     // simulated build was a snapshot, not a commitment.
 

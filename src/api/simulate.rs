@@ -36,6 +36,12 @@ pub struct SimulateTransferParams {
     pub fee: Option<u64>,
     #[serde(default)]
     pub max_fee: Option<u64>,
+    /// Optional datum (hex), mirroring the real `transfer.datum`. Its byte
+    /// length is counted toward the simulated tx size + fee so a
+    /// datum-carrying settlement dry-runs to the SAME size/fee the real
+    /// transfer produces. Validated as hex, <= MAX_DATUM_SIZE = 4096 bytes.
+    #[serde(default)]
+    pub datum: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +99,23 @@ pub async fn simulate_transfer_method(state: &ApiState, params: Value) -> Result
         recipients.push((exfer::types::Hash256(arr), o.amount));
     }
 
+    // Optional datum: validate (hex, <= MAX_DATUM_SIZE) exactly like the
+    // real transfer does, so its bytes count toward the simulated size/fee.
+    let recipient_datum: Option<Vec<u8>> = match p.datum.as_deref() {
+        None => None,
+        Some(h) => {
+            let b = hex::decode(h).map_err(|e| Error::BadHex(e.to_string()))?;
+            if b.len() > exfer::types::MAX_DATUM_SIZE {
+                return Err(Error::BadParams(format!(
+                    "datum is {} bytes, exceeds MAX_DATUM_SIZE {}",
+                    b.len(),
+                    exfer::types::MAX_DATUM_SIZE
+                )));
+            }
+            Some(b)
+        }
+    };
+
     let store = state.store.clone();
     let from = p.from.clone();
     let signer = tokio::task::spawn_blocking(move || store.load_by_address(&from))
@@ -102,6 +125,7 @@ pub async fn simulate_transfer_method(state: &ApiState, params: Value) -> Result
     let receipt = crate::tx::simulate_transfer(
         &signer,
         recipients,
+        recipient_datum,
         fee_choice,
         max_fee,
         &state.node,

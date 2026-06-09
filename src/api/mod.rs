@@ -387,6 +387,10 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
             proxy_to_indexer(state, "htlc_lookup_by_hashlock", req.params).await
         }
         "get_output_spent_by" => proxy_to_indexer(state, "get_output_spent_by", req.params).await,
+        "get_output_datum" => proxy_to_indexer(state, "get_output_datum", req.params).await,
+        "find_settlements_by_quote_id" => {
+            proxy_to_indexer(state, "find_settlements_by_quote_id", req.params).await
+        }
 
         // ---- read passthroughs ----
         "get_block_height" => get_block_height(state).await,

@@ -277,6 +277,164 @@ async fn simulate_transfer_is_deterministic_across_calls() {
 }
 
 #[tokio::test]
+async fn simulate_transfer_with_datum_is_larger_than_without() {
+    // The optional `datum` must count toward the simulated tx size + fee,
+    // so a honor settlement (which carries the quote_id as a 16-byte
+    // datum) dry-runs to the SAME size/fee the real datum-carrying
+    // transfer produces. Cross-check from the wire contract: a real
+    // transfer with a 16-byte datum was 245 bytes vs 227 without.
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let from = dispatch(&state, rpc("generate_address", json!({})))
+        .await
+        .unwrap()["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let to = "11".repeat(32);
+    mount_utxos(&mock, &from, &"aa".repeat(32), 1_000_000).await;
+
+    let plain = dispatch(
+        &state,
+        rpc(
+            "simulate_transfer",
+            json!({
+                "from":    from,
+                "outputs": [{ "to": to, "amount": 200_000 }],
+                "fee_rate": 1,
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // A 16-byte datum, exactly as a honor settlement carries the quote_id.
+    let with_datum = dispatch(
+        &state,
+        rpc(
+            "simulate_transfer",
+            json!({
+                "from":    from,
+                "outputs": [{ "to": to, "amount": 200_000 }],
+                "fee_rate": 1,
+                "datum":   "00112233445566778899aabbccddeeff",
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let plain_size = plain["size"].as_u64().unwrap();
+    let with_size = with_datum["size"].as_u64().unwrap();
+    assert!(
+        with_size > plain_size,
+        "datum-carrying simulate must be larger: {with_size} vs {plain_size}"
+    );
+
+    // The contract's cross-check: a 16-byte datum added 245 - 227 = 18
+    // bytes (16 payload + a 2-byte length/tag overhead) to the tx.
+    assert_eq!(
+        with_size - plain_size,
+        18,
+        "16-byte datum should add 18 bytes (16 payload + 2 framing)"
+    );
+
+    // The fee tracks size at fee_rate 1, so a bigger tx costs more.
+    let plain_fee = plain["fee"].as_u64().unwrap();
+    let with_fee = with_datum["fee"].as_u64().unwrap();
+    assert!(
+        with_fee >= plain_fee,
+        "datum must not reduce the simulated fee: {with_fee} vs {plain_fee}"
+    );
+}
+
+#[tokio::test]
+async fn simulate_transfer_rejects_bad_datum_hex() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "simulate_transfer",
+            json!({
+                "from":    "ab".repeat(32),
+                "outputs": [{ "to": "ff".repeat(32), "amount": 1000 }],
+                "datum":   "nothex",
+            }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadHex(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn simulate_transfer_rejects_oversized_datum() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    // MAX_DATUM_SIZE = 4096 bytes → 8192 hex chars. One byte over.
+    let oversized = "ab".repeat(4097);
+    let err = dispatch(
+        &state,
+        rpc(
+            "simulate_transfer",
+            json!({
+                "from":    "ab".repeat(32),
+                "outputs": [{ "to": "ff".repeat(32), "amount": 1000 }],
+                "datum":   oversized,
+            }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadParams(_)), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Indexer-delegated EXFER-QUOTE read methods
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_output_datum_dispatches_to_indexer() {
+    // With no --indexer-rpc configured (indexer: None), the method must
+    // dispatch to proxy_to_indexer and surface IndexerNotConfigured —
+    // not UnknownMethod (which would mean it isn't wired up at all).
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "get_output_datum",
+            json!({ "tx_id": "ab".repeat(32), "output_index": 0 }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::IndexerNotConfigured), "got {err:?}");
+}
+
+#[tokio::test]
+async fn find_settlements_by_quote_id_dispatches_to_indexer() {
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let err = dispatch(
+        &state,
+        rpc(
+            "find_settlements_by_quote_id",
+            json!({ "quote_id": "00112233445566778899aabbccddeeff" }),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::IndexerNotConfigured), "got {err:?}");
+}
+
+#[tokio::test]
 async fn simulate_transfer_does_not_broadcast() {
     // If walletd ever called send_raw_transaction, this mock would
     // count the request — and the assert at the end would catch it.

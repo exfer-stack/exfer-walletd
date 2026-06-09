@@ -294,10 +294,25 @@ pub async fn wait_for_tx_method(state: &ApiState, params: Value) -> Result<Value
     }
 }
 
-/// Polls `get_transaction` on each tip-channel tick until the tx is in
-/// a block with `min_confs` confirmations behind it. Upstream
-/// "not-found" responses are silently treated as "not yet visible"
-/// (the tx may still be propagating) and the loop continues.
+/// How often `wait_for_tx` re-polls the node tip when the follower's tip
+/// channel hasn't fired. Keeps confirmation counting responsive even when
+/// walletd's own HTLC follower lags the chain.
+const WAIT_FOR_TX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Polls `get_transaction` until the tx is in a block with `min_confs`
+/// confirmations behind it. Upstream "not-found" responses are silently
+/// treated as "not yet visible" (the tx may still be propagating) and the
+/// loop continues.
+///
+/// Confirmation depth is measured against the node's **authoritative chain
+/// tip** (`get_block_height`), NOT walletd's internal follower (`tip_rx`).
+/// The follower is a heavyweight HTLC-observability indexer that walks every
+/// block transaction-by-transaction and routinely sits many blocks behind the
+/// chain; gating settlement finality on it made `wait_for_tx` report far fewer
+/// confirmations than reality (e.g. `confirmations: 1` for a tx already 20
+/// blocks deep) and time out on transactions that were long since final. The
+/// follower channel is still used as a cheap wake signal, but a short poll
+/// timer races it so a stalled/lagging follower can never block progress.
 async fn wait_for_tx_inner(state: &ApiState, tx_id: String, min_confs: u32) -> Result<Value> {
     let mut tip_rx = state.tip_rx.clone();
     loop {
@@ -309,8 +324,8 @@ async fn wait_for_tx_inner(state: &ApiState, tx_id: String, min_confs: u32) -> R
             Err(e) => return Err(e),
         };
         if let Some(bh) = block_height {
-            let follower_height = *tip_rx.borrow();
-            let confirmations = follower_height.saturating_sub(bh).saturating_add(1);
+            let tip = state.node.get_block_height().await?.height;
+            let confirmations = tip.saturating_sub(bh).saturating_add(1);
             if confirmations >= min_confs as u64 {
                 // Final fetch so we can return the canonical block_id.
                 let s = state.node.get_transaction(&tx_id).await?;
@@ -323,12 +338,20 @@ async fn wait_for_tx_inner(state: &ApiState, tx_id: String, min_confs: u32) -> R
                 return serde_json::to_value(&resp).map_err(|e| Error::Internal(e.to_string()));
             }
         }
-        // Wait for tip to advance (or shutdown).
-        if tip_rx.changed().await.is_err() {
-            // Sender dropped — daemon is shutting down.
-            return Err(Error::Internal(
-                "wait_for_tx: follower channel closed".into(),
-            ));
+        // Wake on the next follower tip nudge OR a short poll timer, whichever
+        // fires first. The timer guarantees we keep re-checking the node tip
+        // even when the follower channel is silent, so the wait tracks real
+        // chain progress rather than indexer progress.
+        tokio::select! {
+            r = tip_rx.changed() => {
+                if r.is_err() {
+                    // Sender dropped — daemon is shutting down.
+                    return Err(Error::Internal(
+                        "wait_for_tx: follower channel closed".into(),
+                    ));
+                }
+            }
+            _ = tokio::time::sleep(WAIT_FOR_TX_POLL_INTERVAL) => {}
         }
     }
 }

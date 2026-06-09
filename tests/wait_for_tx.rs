@@ -1,10 +1,14 @@
 //! Dispatch-layer tests for `wait_for_tx`.
 //!
-//! Drives the tip-watch channel manually (no real follower task) so
-//! tests stay deterministic and fast. The mock node serves a single
-//! transaction confirmed at a configurable height, and pushes through
-//! the tip channel simulate the follower advancing.
+//! Confirmation depth is measured against the node's authoritative chain
+//! tip (`get_block_height`), NOT walletd's internal follower channel
+//! (`tip_rx`). The follower is a heavyweight HTLC-observability indexer that
+//! routinely lags the chain; gating finality on it under-counted
+//! confirmations and timed out on already-final txs. These tests therefore
+//! drive a mock `get_block_height` (the tip oracle) and use the `tip_tx`
+//! channel only as a wake nudge so the waiter re-polls promptly.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,23 +20,66 @@ use exfer_walletd::upstream::{ExferNode, RetryPolicy};
 use serde_json::json;
 use tokio::sync::watch;
 use wiremock::matchers::{body_partial_json, method};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// Drive-able test fixture.
 struct Ctx {
     state: ApiState,
+    /// Wake nudge — pushing here makes the waiter re-poll the node tip
+    /// immediately instead of waiting for its fallback poll timer.
     tip_tx: watch::Sender<u64>,
+    /// The node's reported chain tip. Tests advance this to grant
+    /// confirmations (then nudge `tip_tx` to wake the waiter at once).
+    tip: Arc<AtomicU64>,
     #[allow(dead_code)]
     dir: tempfile::TempDir,
 }
 
-fn make_ctx(mock_uri: String, initial_tip: u64) -> Ctx {
+impl Ctx {
+    /// Advance the node tip and wake the waiter immediately.
+    fn advance_tip(&self, height: u64) {
+        self.tip.store(height, Ordering::SeqCst);
+        let _ = self.tip_tx.send(height);
+    }
+}
+
+/// Serves `get_block_height` from a shared atomic so tests can move the tip
+/// mid-wait without re-mounting.
+struct TipResponder(Arc<AtomicU64>);
+
+impl Respond for TipResponder {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let height = self.0.load(Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "height": height,
+                "block_id": "cd".repeat(32),
+                "genesis_block_id": "ef".repeat(32),
+            },
+            "id": 1
+        }))
+    }
+}
+
+async fn make_ctx(mock: &MockServer, initial_tip: u64) -> Ctx {
     let dir = tempfile::tempdir().unwrap();
     let store = HdSeedStore::open_or_init_fresh(dir.path(), b"test-passphrase").unwrap();
-    let node = ExferNode::with_retry_policy(mock_uri, Duration::from_secs(5), RetryPolicy::none())
-        .unwrap();
+    let node =
+        ExferNode::with_retry_policy(mock.uri(), Duration::from_secs(5), RetryPolicy::none())
+            .unwrap();
     let index = Arc::new(Index::open(dir.path()).unwrap());
     let (tip_tx, tip_rx) = watch::channel(initial_tip);
+    let tip = Arc::new(AtomicU64::new(initial_tip));
+
+    // Mount the tip oracle. The follower channel (`tip_rx`) is now only a
+    // wake signal; the confirmation count comes from here.
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "get_block_height" })))
+        .respond_with(TipResponder(tip.clone()))
+        .mount(mock)
+        .await;
+
     let state = ApiState {
         store: Arc::new(store),
         node: Arc::new(node),
@@ -44,7 +91,12 @@ fn make_ctx(mock_uri: String, initial_tip: u64) -> Ctx {
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
     };
-    Ctx { state, tip_tx, dir }
+    Ctx {
+        state,
+        tip_tx,
+        tip,
+        dir,
+    }
 }
 
 fn rpc(method: &str, params: serde_json::Value) -> RpcRequest {
@@ -114,7 +166,7 @@ async fn mount_not_found(mock: &MockServer, tx_id_hex: &str) {
 #[tokio::test]
 async fn wait_for_tx_rejects_short_id() {
     let mock = MockServer::start().await;
-    let ctx = make_ctx(mock.uri(), 0);
+    let ctx = make_ctx(&mock, 0).await;
     let err = dispatch(
         &ctx.state,
         rpc("wait_for_tx", json!({ "tx_id": "deadbeef" })),
@@ -129,8 +181,8 @@ async fn wait_for_tx_returns_immediately_when_already_confirmed() {
     let mock = MockServer::start().await;
     let tx_id = "aa".repeat(32);
     mount_confirmed(&mock, &tx_id, 100).await;
-    // Tip already advanced past the tx's block.
-    let ctx = make_ctx(mock.uri(), 100);
+    // Node tip already at the tx's block → 1 confirmation.
+    let ctx = make_ctx(&mock, 100).await;
 
     let resp = dispatch(
         &ctx.state,
@@ -148,13 +200,40 @@ async fn wait_for_tx_returns_immediately_when_already_confirmed() {
 }
 
 #[tokio::test]
+async fn wait_for_tx_counts_against_node_tip_not_follower() {
+    // Regression: the node tip is well past the tx (deep confirmations)
+    // while the follower channel (`tip_rx`) is left untouched at the tx's
+    // own block. The wait MUST still see full depth from the node tip —
+    // proving confirmations are no longer gated on the lagging follower.
+    let mock = MockServer::start().await;
+    let tx_id = "ba".repeat(32);
+    mount_confirmed(&mock, &tx_id, 100).await;
+    // Follower channel initialised at 100 (the tx's block), node tip at 120.
+    let ctx = make_ctx(&mock, 100).await;
+    ctx.tip.store(120, Ordering::SeqCst); // node is 20 blocks ahead
+
+    let resp = dispatch(
+        &ctx.state,
+        rpc(
+            "wait_for_tx",
+            json!({ "tx_id": tx_id, "min_confirmations": 3 }),
+        ),
+    )
+    .await
+    .unwrap();
+    // 120 - 100 + 1 = 21 confirmations, from the node tip.
+    assert_eq!(resp["confirmations"].as_u64().unwrap(), 21);
+}
+
+#[tokio::test]
 async fn wait_for_tx_returns_after_tip_advances() {
     let mock = MockServer::start().await;
     let tx_id = "bb".repeat(32);
     mount_confirmed(&mock, &tx_id, 100).await;
-    let ctx = make_ctx(mock.uri(), 99);
+    // Node tip one short of the tx block → 0 confirmations.
+    let ctx = make_ctx(&mock, 99).await;
 
-    // Spawn the wait, then advance the tip.
+    // Spawn the wait, then advance the node tip.
     let state = ctx.state.clone();
     let tx_id_owned = tx_id.clone();
     let waiter = tokio::spawn(async move {
@@ -170,7 +249,7 @@ async fn wait_for_tx_returns_after_tip_advances() {
 
     // Give the wait task a moment to fire its first lookup.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    ctx.tip_tx.send(100).unwrap();
+    ctx.advance_tip(100);
 
     let resp = waiter.await.unwrap().unwrap();
     assert_eq!(resp["block_height"].as_u64().unwrap(), 100);
@@ -182,8 +261,8 @@ async fn wait_for_tx_requires_min_confirmations_depth() {
     let mock = MockServer::start().await;
     let tx_id = "cc".repeat(32);
     mount_confirmed(&mock, &tx_id, 100).await;
-    // Tip at 100 means 1 confirmation. We want 3.
-    let ctx = make_ctx(mock.uri(), 100);
+    // Node tip at 100 means 1 confirmation. We want 3.
+    let ctx = make_ctx(&mock, 100).await;
 
     let state = ctx.state.clone();
     let tx_id_owned = tx_id.clone();
@@ -199,9 +278,9 @@ async fn wait_for_tx_requires_min_confirmations_depth() {
     });
 
     tokio::time::sleep(Duration::from_millis(30)).await;
-    ctx.tip_tx.send(101).unwrap(); // 2 confs — still not enough
+    ctx.advance_tip(101); // 2 confs — still not enough
     tokio::time::sleep(Duration::from_millis(30)).await;
-    ctx.tip_tx.send(102).unwrap(); // 3 confs — released
+    ctx.advance_tip(102); // 3 confs — released
 
     let resp = waiter.await.unwrap().unwrap();
     assert!(
@@ -216,7 +295,7 @@ async fn wait_for_tx_times_out_when_tx_never_confirms() {
     let mock = MockServer::start().await;
     let tx_id = "dd".repeat(32);
     mount_unconfirmed(&mock, &tx_id).await;
-    let ctx = make_ctx(mock.uri(), 100);
+    let ctx = make_ctx(&mock, 100).await;
 
     let err = dispatch(
         &ctx.state,
@@ -246,7 +325,7 @@ async fn wait_for_tx_treats_not_found_as_pending() {
     let mock = MockServer::start().await;
     let tx_id = "ee".repeat(32);
     mount_not_found(&mock, &tx_id).await;
-    let ctx = make_ctx(mock.uri(), 0);
+    let ctx = make_ctx(&mock, 0).await;
 
     // Should time out (we never push the tip) rather than erroring on
     // the upstream "not found".
@@ -269,7 +348,7 @@ async fn wait_for_tx_clamps_oversize_timeout() {
     let mock = MockServer::start().await;
     let tx_id = "ff".repeat(32);
     mount_confirmed(&mock, &tx_id, 10).await;
-    let ctx = make_ctx(mock.uri(), 10);
+    let ctx = make_ctx(&mock, 10).await;
 
     let resp = dispatch(
         &ctx.state,
@@ -291,7 +370,7 @@ async fn wait_for_tx_default_values_apply() {
     let mock = MockServer::start().await;
     let tx_id = "11".repeat(32);
     mount_confirmed(&mock, &tx_id, 50).await;
-    let ctx = make_ctx(mock.uri(), 50);
+    let ctx = make_ctx(&mock, 50).await;
 
     let resp = dispatch(&ctx.state, rpc("wait_for_tx", json!({ "tx_id": tx_id })))
         .await

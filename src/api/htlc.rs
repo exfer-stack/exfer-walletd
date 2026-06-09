@@ -1,9 +1,13 @@
 //! `htlc_status` / `htlc_list` / `htlc_forget` / `get_follower_status` —
 //! JSON-RPC handlers over the v1.9 HTLC observability index.
 //!
-//! All four methods consult [`crate::index::Index`] (populated by the
-//! block follower) and never touch upstream RPC. The first three
-//! follow the standard `noun_verb` Read / Manage scope split; the
+//! These methods consult [`crate::index::Index`] (populated by the block
+//! follower). When an indexer is configured (`--indexer-rpc`), `htlc_status`
+//! and `htlc_list` additionally delegate to it: `htlc_status` prefers the
+//! indexer's authoritative on-chain lifecycle (restoring our owner-relative
+//! role and falling back to the local mempool/eager record), and `htlc_list`
+//! delegates an explicit `address` filter to the indexer's global view. The
+//! first three follow the standard `noun_verb` Read / Manage scope split; the
 //! fourth is a Read-scope status snapshot.
 
 use exfer::covenants::htlc::{HtlcRole, HtlcState};
@@ -32,10 +36,40 @@ pub async fn htlc_status_method(state: &ApiState, params: Value) -> Result<Value
     let tx_id = decode_hex32(&p.lock_tx_id)?;
     let index = state.index.clone();
     let output_index = p.output_index;
-    let rec = tokio::task::spawn_blocking(move || index.get_htlc(&tx_id, output_index))
+    let local = tokio::task::spawn_blocking(move || index.get_htlc(&tx_id, output_index))
         .await
         .map_err(|e| Error::Internal(format!("htlc_status: blocking task panicked: {e}")))??;
-    match rec {
+
+    // When an indexer is configured it is the authoritative source for on-chain
+    // HTLC lifecycle (confirmed height, claim/reclaim) and — unlike walletd's
+    // owned-only follower — it can answer for HTLCs we never locked. Prefer it,
+    // but two corrections keep the result faithful to the local view:
+    //   (a) the global indexer always reports `role: observer`; if we hold a
+    //       local record we restore our owner-relative role (sender/receiver),
+    //   (b) if the indexer has no record yet (e.g. a lock we just broadcast
+    //       that's still in the mempool — the eager record from `htlc_lock`)
+    //       or is unreachable, we fall back to the local record.
+    if let Some(client) = state.indexer.as_ref() {
+        let q = serde_json::json!({
+            "lock_tx_id": p.lock_tx_id,
+            "output_index": p.output_index,
+        });
+        if let Ok(mut v) = client.htlc_status(q).await {
+            if let Some(l) = local.as_ref() {
+                if l.role != HtlcRole::Observer {
+                    if let (Some(obj), Ok(role_v)) =
+                        (v.as_object_mut(), serde_json::to_value(l.role))
+                    {
+                        obj.insert("role".into(), role_v);
+                    }
+                }
+            }
+            return Ok(v);
+        }
+        // indexer errored or has no such HTLC → fall through to the local view.
+    }
+
+    match local {
         Some(r) => serde_json::to_value(&r).map_err(|e| Error::Internal(e.to_string())),
         None => Err(Error::Wallet(format!(
             "no tracked HTLC at ({}, {})",
@@ -96,6 +130,7 @@ pub struct HtlcListResponse {
 }
 
 pub async fn htlc_list_method(state: &ApiState, params: Value) -> Result<Value> {
+    let raw_params = params.clone();
     let p: HtlcListParams = if params.is_null() {
         HtlcListParams {
             role: None,
@@ -129,6 +164,16 @@ pub async fn htlc_list_method(state: &ApiState, params: Value) -> Result<Value> 
 
     if let Some(ref addr) = p.address {
         ensure_64_hex(addr)?;
+        // An explicit `address` is a deliberate "HTLCs involving THIS address"
+        // query. walletd's local index is owned-only and (historically) ignored
+        // the address entirely, so when an indexer is configured we delegate to
+        // its native sender-or-receiver filter over the whole chain. Without an
+        // indexer we fall through to the local owned path (address still
+        // advisory, as before). Errors propagate rather than silently returning
+        // the local owned set, which would not match the requested address.
+        if let Some(client) = state.indexer.as_ref() {
+            return client.htlc_list(raw_params).await;
+        }
     }
 
     let filter = HtlcFilter {

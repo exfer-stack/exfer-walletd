@@ -35,6 +35,9 @@ fn make_state(
         indexer,
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
+        allowance: std::sync::Arc::new(
+            exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
+        ),
     };
     (state, wallet_dir)
 }

@@ -109,6 +109,9 @@ fn build_config(datadir: std::path::PathBuf) -> Config {
         swap_pool_ca: None,
         bsc_rpc_url: "https://bsc-dataseed1.binance.org".into(),
         bsc_chain_id: 56,
+        spend_cap_per_tx: None,
+        spend_cap_per_period: None,
+        spend_cap_period_secs: 86_400,
     }
 }
 

@@ -191,6 +191,24 @@ pub async fn run_embedded(
     let node = Arc::new(node);
     let index = Arc::new(crate::index::Index::open(&datadir)?);
 
+    // Spend allowance ledger — durable per-tx / per-period EXFER ceilings.
+    // Inert (always allows) unless `--spend-cap-*` is configured, so this
+    // is a no-op for existing deployments.
+    let allowance = Arc::new(crate::allowance::AllowanceLedger::open(
+        &datadir,
+        cfg.allowance_caps(),
+    )?);
+    if allowance.caps().is_active() {
+        let c = allowance.caps();
+        tracing::info!(
+            per_tx = ?c.per_tx,
+            per_period = ?c.per_period,
+            period_secs = c.period_secs,
+            "spend allowance caps active: transfer + htlc_lock metered; \
+             exfer_to_bnb swaps refused while caps are set (EXFER swap leg not yet metered)"
+        );
+    }
+
     // Spawn the block follower wired to the shutdown token. It must stop on
     // shutdown (not "run until process exit") — otherwise, for an embedded
     // restart, the old follower keeps polling and holding the wallet store,
@@ -286,6 +304,7 @@ pub async fn run_embedded(
         indexer,
         events: events.clone(),
         engine,
+        allowance,
     };
     let app_state = AppState {
         api,

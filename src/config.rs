@@ -225,6 +225,29 @@ pub struct Config {
     /// BSC chain id (56 mainnet, 97 Chapel testnet).
     #[arg(long, env = "WALLETD_BSC_CHAIN_ID", default_value_t = 56)]
     pub bsc_chain_id: u64,
+
+    /// Per-transaction spend ceiling, in exfers. A single native-EXFER
+    /// spend (`transfer` total, or an `htlc_lock` amount) above this is
+    /// refused before broadcast with `-32038 AllowanceExceeded`. Unset =
+    /// no per-transaction cap.
+    ///
+    /// Spend caps are operator configuration only — there is no RPC to
+    /// change them, so a leaked `spend`-scope token can never raise its
+    /// own limit. Defaults leave the daemon unlimited (no behaviour
+    /// change for existing deployments).
+    #[arg(long, env = "WALLETD_SPEND_CAP_PER_TX")]
+    pub spend_cap_per_tx: Option<u64>,
+
+    /// Rolling-window spend ceiling, in exfers: the most that native-EXFER
+    /// spends may total within one `--spend-cap-period-secs` window. Unset
+    /// = no per-period cap.
+    #[arg(long, env = "WALLETD_SPEND_CAP_PER_PERIOD")]
+    pub spend_cap_per_period: Option<u64>,
+
+    /// Window length in seconds for `--spend-cap-per-period`. Only
+    /// consulted when that cap is set. Defaults to one day.
+    #[arg(long, env = "WALLETD_SPEND_CAP_PERIOD_SECS", default_value_t = 86_400)]
+    pub spend_cap_period_secs: u64,
 }
 
 impl Config {
@@ -280,6 +303,17 @@ impl Config {
     pub fn tls_fingerprint_path(&self) -> PathBuf {
         self.resolved_datadir().join("cert.fingerprint")
     }
+
+    /// Assemble the spend [`AllowanceCaps`](crate::allowance::AllowanceCaps)
+    /// from the `--spend-cap-*` flags. All-unset yields an inert
+    /// (unlimited) ledger.
+    pub fn allowance_caps(&self) -> crate::allowance::AllowanceCaps {
+        crate::allowance::AllowanceCaps {
+            per_tx: self.spend_cap_per_tx,
+            per_period: self.spend_cap_per_period,
+            period_secs: self.spend_cap_period_secs,
+        }
+    }
 }
 
 /// Accept Unix-style booleans ("1", "yes", "on") in addition to the
@@ -322,6 +356,9 @@ mod tests {
             swap_pool_ca: None,
             bsc_rpc_url: "https://bsc-dataseed1.binance.org".into(),
             bsc_chain_id: 56,
+            spend_cap_per_tx: None,
+            spend_cap_per_period: None,
+            spend_cap_period_secs: 86_400,
         }
     }
 

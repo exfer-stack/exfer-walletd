@@ -67,6 +67,10 @@ pub struct ApiState {
     /// Cross-chain swap engine (EXFER↔USDT). `Some` only when `--swap-pool`
     /// is configured; the `swap_*` / `bsc_*` RPCs return `-32602` otherwise.
     pub engine: Option<Arc<crate::swap::SwapEngine>>,
+    /// Spend allowance ledger. Enforces the operator-configured per-tx and
+    /// per-period EXFER spend ceilings on `transfer` / `htlc_lock`. Inert
+    /// (always allows) when no `--spend-cap-*` flags are set.
+    pub allowance: Arc<crate::allowance::AllowanceLedger>,
 }
 
 // ============================================================================
@@ -414,6 +418,9 @@ pub async fn dispatch(state: &ApiState, req: RpcRequest) -> Result<Value> {
         // ---- EXFER-QUOTE signed price credential ----
         "quote_issue" => quote::quote_issue(state, req.params).await,
         "quote_verify" => quote::quote_verify(state, req.params).await,
+
+        // ---- spend allowance (read-only introspection of the caps) ----
+        "allowance_status" => allowance_status_method(state),
 
         // ---- sensitive recovery export (passphrase-gated, spend-scope) ----
         "reveal_mnemonic" => reveal_mnemonic(state, req.params).await,
@@ -788,6 +795,22 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
             )));
         }
     }
+
+    // Sum the EXFER leaving this wallet for the allowance ledger.
+    // Saturating: an absurd sum that overflows u64 can only exceed a finite
+    // cap, never wrap under it. The reserve/refund happens *inside* the
+    // idempotency unit below, so an idempotent retry neither double-charges
+    // nor re-checks an already-completed spend.
+    let allowance_amount: u64 = p
+        .outputs
+        .iter()
+        .fold(0u64, |a, o| a.saturating_add(o.amount));
+    let allowance_now = crate::allowance::now_unix();
+    // Fast-fail the stateless per-tx ceiling before any keystore I/O. The
+    // per-period window is reserved atomically inside the idempotency unit
+    // below (re-running this stateless check on a retry is harmless).
+    state.allowance.check_per_tx(allowance_amount)?;
+
     let fee_choice = match (p.fee, p.fee_rate) {
         (Some(f), None) => FeeChoice::Absolute(f),
         (None, Some(r)) => FeeChoice::Rate(r),
@@ -838,7 +861,11 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
             state
                 .idempotency
                 .get_or_run(token, fingerprint, move || async move {
-                    crate::tx::transfer(
+                    // Atomic check-and-reserve before broadcast; refund if
+                    // the broadcast itself fails so a failed spend doesn't
+                    // consume the window.
+                    state.allowance.reserve(allowance_amount, allowance_now)?;
+                    match crate::tx::transfer(
                         &signer,
                         recipients_for_run,
                         datum_for_run,
@@ -848,11 +875,19 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
                         &state.inflight,
                     )
                     .await
+                    {
+                        Ok(r) => Ok(r),
+                        Err(e) => {
+                            state.allowance.refund(allowance_amount, allowance_now);
+                            Err(e)
+                        }
+                    }
                 })
                 .await?
         }
         None => {
-            let r = crate::tx::transfer(
+            state.allowance.reserve(allowance_amount, allowance_now)?;
+            match crate::tx::transfer(
                 &signer,
                 recipients,
                 recipient_datum,
@@ -861,12 +896,33 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
                 &state.node,
                 &state.inflight,
             )
-            .await?;
-            std::sync::Arc::new(r)
+            .await
+            {
+                Ok(r) => std::sync::Arc::new(r),
+                Err(e) => {
+                    state.allowance.refund(allowance_amount, allowance_now);
+                    return Err(e);
+                }
+            }
         }
     };
 
     serde_json::to_value(&*receipt).map_err(|e| Error::Internal(e.to_string()))
+}
+
+/// `allowance_status` — report the operator-configured spend ceilings and
+/// the current rolling-window consumption. Read scope: pure, touches no
+/// funds and reveals only policy + a counter.
+fn allowance_status_method(state: &ApiState) -> Result<Value> {
+    let s = state.allowance.status(crate::allowance::now_unix())?;
+    Ok(serde_json::json!({
+        "per_tx": s.per_tx,
+        "per_period": s.per_period,
+        "period_secs": s.period_secs,
+        "spent_this_period": s.spent_this_period,
+        "remaining_this_period": s.remaining_this_period,
+        "window_resets_at": s.window_resets_at,
+    }))
 }
 
 /// Deterministic fingerprint over the *meaningful* request shape: which
@@ -929,8 +985,17 @@ async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
     let receiver = crate::tx::decode_hash(&p.receiver)?;
     let hash_lock = exfer::types::Hash256(crate::tx::decode_hash(&p.hash_lock)?);
 
+    // ---- spend allowance ----
+    // Fast-fail the stateless per-tx ceiling before keystore I/O; reserve
+    // the per-period window right before the lock so a signer-load failure
+    // can't leak a reservation. htlc_lock has no idempotency token, so
+    // reserve/refund sit directly around the lock call.
+    let allowance_now = crate::allowance::now_unix();
+    state.allowance.check_per_tx(p.amount)?;
+
     let signer = load_signer(state, &p.from).await?;
-    let receipt = crate::tx::htlc::htlc_lock(
+    state.allowance.reserve(p.amount, allowance_now)?;
+    let receipt = match crate::tx::htlc::htlc_lock(
         &signer,
         receiver,
         hash_lock,
@@ -941,7 +1006,14 @@ async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
         &state.node,
         &state.inflight,
     )
-    .await?;
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.allowance.refund(p.amount, allowance_now);
+            return Err(e);
+        }
+    };
 
     // Eagerly record our own outgoing HTLC so `htlc_status` / `htlc_list`
     // surface it IMMEDIATELY, rather than only after the block follower

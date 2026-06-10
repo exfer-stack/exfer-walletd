@@ -76,6 +76,24 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate SHA256SUMS
+        # Self-certifying checksums for the release binaries. Downloaders
+        # (e.g. exfer-mcp's managed-mode auto-fetch) verify each binary
+        # against this before executing it — the asset is a hot-wallet
+        # daemon, so integrity matters. Base names only, so the file reads:
+        #   <sha256>  exfer-walletd-linux-x86_64
+        working-directory: artifacts
+        run: |
+          for name in \
+            exfer-walletd-linux-x86_64 \
+            exfer-walletd-linux-arm64 \
+            exfer-walletd-macos-x86_64 \
+            exfer-walletd-macos-arm64 \
+            exfer-walletd-windows-x86_64.exe; do
+            ( cd "$name" && sha256sum "$name" )
+          done > ../SHA256SUMS
+          cat ../SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -86,3 +104,4 @@ jobs:
             artifacts/exfer-walletd-macos-x86_64/exfer-walletd-macos-x86_64
             artifacts/exfer-walletd-macos-arm64/exfer-walletd-macos-arm64
             artifacts/exfer-walletd-windows-x86_64.exe/exfer-walletd-windows-x86_64.exe
+            SHA256SUMS

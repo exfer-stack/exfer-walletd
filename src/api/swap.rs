@@ -42,6 +42,21 @@ pub async fn swap_get_quote(state: &ApiState, params: Value) -> Result<Value> {
     let p: QuoteParams = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("swap_get_quote params: {e}")))?;
     let dir = parse_direction(&p.direction)?;
+    // The EXFER→BNB leg locks native EXFER the daemon signs from a managed
+    // wallet, but the swap engine does not yet meter it through the spend
+    // allowance ledger. Rather than let it silently bypass an
+    // operator-configured cap (a drain path with the same Spend scope as
+    // `transfer`), fail closed while caps are active. Tracked as the v1
+    // follow-up to meter the swap EXFER leg. `bnb_to_exfer` (receives EXFER)
+    // and the BNB/LP methods (move non-EXFER assets) are unaffected.
+    if matches!(dir, Direction::ExferToBnb) && state.allowance.caps().is_active() {
+        return Err(Error::BadParams(
+            "exfer_to_bnb swaps are refused while spend caps (--spend-cap-*) are configured: \
+             the EXFER leg is not yet metered by the allowance ledger and would bypass the cap. \
+             Disable spend caps or avoid exfer_to_bnb until swap metering ships."
+                .into(),
+        ));
+    }
     let rec = engine(state)?.get_quote(dir, p.amount_in, p.from).await?;
     to_value(rec)
 }

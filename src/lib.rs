@@ -51,6 +51,7 @@
 //! - [`api`] — JSON-RPC dispatch (wrapper-only methods + passthroughs).
 //! - [`server`] — axum HTTP server, Bearer auth, health endpoint.
 
+pub mod allowance;
 pub mod api;
 pub mod auth;
 pub mod config;

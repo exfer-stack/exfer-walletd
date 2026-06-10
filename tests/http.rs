@@ -33,6 +33,9 @@ async fn boot(auth: Option<&str>) -> (String, KeepAlive) {
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
+        allowance: std::sync::Arc::new(
+            exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
+        ),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -170,6 +173,9 @@ async fn boot_scoped(
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
+        allowance: std::sync::Arc::new(
+            exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -330,6 +336,9 @@ async fn boot_with_bootstrap(cert_pem: &str, fingerprint: &str) -> (String, Keep
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
+        allowance: std::sync::Arc::new(
+            exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

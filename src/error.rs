@@ -141,6 +141,27 @@ pub enum Error {
     #[error("htlc timeout not reached: current height {current_height} <= timeout {timeout}")]
     TimeoutNotReached { current_height: u64, timeout: u64 },
 
+    /// A native-EXFER spend would breach an operator-configured allowance
+    /// ceiling. `scope` is `"per_tx"` (single-spend cap) or `"per_period"`
+    /// (rolling-window cap). Surfaces before broadcast, so the funds never
+    /// move. Caps are set via walletd config and cannot be raised over the
+    /// RPC, so this is a hard stop a leaked spend token cannot lift.
+    #[error("{}", allowance_exceeded_message(scope, *limit, *spent, *requested, *period_secs))]
+    // `scope` is already `&&'static str` in this context; the helper takes
+    // `&str`, which `&&str` coerces to at the call site.
+    AllowanceExceeded {
+        /// Which ceiling fired: `"per_tx"` or `"per_period"`.
+        scope: &'static str,
+        /// The configured ceiling in exfers.
+        limit: u64,
+        /// Already spent in the current window (0 for `per_tx`).
+        spent: u64,
+        /// What this spend asked for, in exfers.
+        requested: u64,
+        /// Window length in seconds (0 for `per_tx`).
+        period_secs: u64,
+    },
+
     /// `wait_for_tx` reached its `timeout_secs` before the transaction
     /// accumulated enough confirmations. The caller may retry, and the
     /// transaction may yet land — this only says "no result within the
@@ -201,6 +222,7 @@ impl Error {
             Error::IdempotencyConflict { .. } => -32035,
             Error::HtlcOutputAuth(_) => -32036,
             Error::TimeoutNotReached { .. } => -32037,
+            Error::AllowanceExceeded { .. } => -32038,
             Error::WaitTimeout { .. } => -32040,
             Error::IndexerNotConfigured => -32041,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
@@ -265,6 +287,20 @@ impl Error {
                 "min_confirmations": min_confirmations,
                 "elapsed_secs": elapsed_secs,
             })),
+            Error::AllowanceExceeded {
+                scope,
+                limit,
+                spent,
+                requested,
+                period_secs,
+            } => Some(json!({
+                "scope": scope,
+                "limit": limit,
+                "spent": spent,
+                "requested": requested,
+                "remaining": limit.saturating_sub(*spent),
+                "period_secs": period_secs,
+            })),
             _ => None,
         }
     }
@@ -290,4 +326,25 @@ fn insufficient_balance_message(
         ));
     }
     s
+}
+
+/// Build the human-readable `AllowanceExceeded` message for both ceilings.
+fn allowance_exceeded_message(
+    scope: &str,
+    limit: u64,
+    spent: u64,
+    requested: u64,
+    period_secs: u64,
+) -> String {
+    match scope {
+        "per_period" => format!(
+            "spend allowance exceeded: per-period cap {limit} exfers / {period_secs}s window, \
+             already spent {spent}, this request {requested} (remaining {})",
+            limit.saturating_sub(spent)
+        ),
+        _ => format!(
+            "spend allowance exceeded: per-transaction cap {limit} exfers, \
+             this request {requested}"
+        ),
+    }
 }

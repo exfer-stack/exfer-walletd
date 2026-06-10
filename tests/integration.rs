@@ -45,6 +45,9 @@ fn make_state_with_retry(
         indexer: None,
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
+        allowance: std::sync::Arc::new(
+            exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
+        ),
     };
     (state, wallet_dir)
 }

@@ -16,13 +16,13 @@ path = "src/main.rs"
 # identical to the upstream CLI. Pinned to a fork commit (not a branch)
 # for reproducible builds.
 #
-# The fork's main is upstream main + the canonical HTLC observability
-# types (HtlcRecord / HtlcState / HtlcRole / HtlcClaimRecord /
-# HtlcReclaimRecord) that this daemon's follower + index + JSON-RPC
-# surface consume. The types are awaiting re-land in ahuman-exfer/exfer
-# (PR #23). Once that PR merges, this can switch to a tag pin on the
-# upstream release that contains them.
-exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "99c45cfde397ca6602685ee9993a30317ae4e2f3" }
+# Pinned to upstream main as of PR #34 (mirrored in the fork). The
+# canonical HTLC observability types (HtlcRecord / HtlcState / HtlcRole /
+# HtlcClaimRecord / HtlcReclaimRecord) re-landed upstream with the #33/#34
+# series, and this rev additionally carries the node-derived signature
+# domain (`genesis::bind_signature_domain`, issue #32) that
+# `--expect-genesis` binds at startup.
+exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "acaf9b380db79d7277aaecf47124920cae9a15e7" }
 
 axum            = { version = "0.7", features = ["macros"] }
 

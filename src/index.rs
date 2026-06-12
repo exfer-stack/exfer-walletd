@@ -62,6 +62,10 @@ fn state_byte(s: HtlcState) -> u8 {
         HtlcState::Claimed => 0x02,
         HtlcState::Reclaimed => 0x03,
         HtlcState::Unknown => 0x04,
+        // Upstream marked the enum #[non_exhaustive]; a variant this build
+        // doesn't know cannot be classified, so index it as Unknown rather
+        // than inventing a new lexicographic byte.
+        _ => 0x04,
     }
 }
 
@@ -71,6 +75,9 @@ fn role_byte(r: HtlcRole) -> u8 {
         HtlcRole::Receiver => 0x01,
         HtlcRole::Both => 0x02,
         HtlcRole::Observer => 0x03,
+        // #[non_exhaustive] upstream: an unrecognised relationship is at
+        // most an observer from this build's point of view.
+        _ => 0x03,
     }
 }
 

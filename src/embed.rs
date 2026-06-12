@@ -189,6 +189,39 @@ pub async fn run_embedded(
     )?;
     let store = Arc::new(store);
     let node = Arc::new(node);
+
+    // issue #32 / node PR #33: when the operator names the chain this walletd
+    // serves (`--expect-genesis`), verify the node actually reports that
+    // genesis and bind the process signature domain to it, so transactions
+    // sign in the named network's domain (e.g. a devnet) instead of the
+    // compiled canonical one. Trust rule (upstream `bind_signature_domain`
+    // docs): bind the id the operator named and we verified — never an
+    // unchecked RPC answer.
+    if let Some(expected) = cfg.expect_genesis.as_deref() {
+        let expected = expected.trim().to_ascii_lowercase();
+        let bytes = hex::decode(&expected)
+            .map_err(|e| anyhow::anyhow!("--expect-genesis is not hex: {e}"))?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("--expect-genesis must be 32 bytes (64 hex chars)"))?;
+        let tip = node.get_block_height().await?;
+        if tip.genesis_block_id.to_ascii_lowercase() != expected {
+            anyhow::bail!(
+                "node reports genesis {} but --expect-genesis names {expected}; refusing to \
+                 start: signing in the wrong domain produces invalid (or cross-chain \
+                 replayable) transactions",
+                tip.genesis_block_id
+            );
+        }
+        exfer::genesis::bind_signature_domain(exfer::types::Hash256(bytes)).map_err(|bound| {
+            anyhow::anyhow!(
+                "signature domain already bound to {}; re-binding to a different id is refused",
+                hex::encode(bound.0)
+            )
+        })?;
+        tracing::info!(genesis = %expected, "signature domain bound to operator-named genesis");
+    }
+
     let index = Arc::new(crate::index::Index::open(&datadir)?);
 
     // Spend allowance ledger — durable per-tx / per-period EXFER ceilings.

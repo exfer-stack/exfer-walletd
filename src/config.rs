@@ -200,6 +200,17 @@ pub struct Config {
     #[arg(long, env = "WALLETD_INDEXER_TIMEOUT_SECS")]
     pub indexer_timeout_secs: Option<u64>,
 
+    /// Genesis block id (64 hex chars) the operator expects the upstream node
+    /// to report. When set, walletd verifies the node's `get_block_height`
+    /// `genesis_block_id` against it at startup and binds the process
+    /// signature domain to that id (upstream issue #32 / PR #33), so
+    /// transactions sign in the named network's domain (e.g. a devnet)
+    /// instead of the compiled canonical one. Mismatch → refuse to start.
+    ///
+    /// Unset → today's behaviour: sign in the canonical (mainnet) domain.
+    #[arg(long, env = "WALLETD_EXPECT_GENESIS", value_name = "GENESIS_ID")]
+    pub expect_genesis: Option<String>,
+
     /// exfer-pool base URL (the market-maker bot for EXFER↔BNB swaps). When
     /// set, the swap engine + monitor light up and the `swap_*` / `bsc_*` RPCs
     /// become answerable. Unset → swaps return -32602 ("swap not configured").
@@ -352,6 +363,7 @@ mod tests {
             indexer_rpc: None,
             indexer_token: None,
             indexer_timeout_secs: None,
+            expect_genesis: None,
             swap_pool_url: None,
             swap_pool_ca: None,
             bsc_rpc_url: "https://bsc-dataseed1.binance.org".into(),

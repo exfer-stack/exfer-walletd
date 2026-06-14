@@ -258,9 +258,12 @@ async fn transfer_rejects_short_address() {
     )
     .await
     .unwrap_err();
+    // Addresses now route through the codec (accept-both); a short hex string
+    // is still rejected, with the codec's specific length message. Same
+    // -32602 to clients.
     assert!(
-        matches!(err, Error::BadAddressLen(_)),
-        "expected BadAddressLen, got {err:?}",
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}",
     );
 }
 
@@ -501,9 +504,10 @@ async fn get_balance_rejects_non_hex_address() {
     )
     .await
     .unwrap_err();
+    // Codec rejects an unrecognized format (not hex, no whitelisted HRP).
     assert!(
-        matches!(err, Error::BadAddressLen(_)),
-        "expected BadAddressLen, got {err:?}",
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}",
     );
 }
 
@@ -548,9 +552,10 @@ async fn get_address_utxos_rejects_bad_address() {
     )
     .await
     .unwrap_err();
+    // Short hex string still rejected, now with the codec's length message.
     assert!(
-        matches!(err, Error::BadAddressLen(_)),
-        "expected BadAddressLen, got {err:?}",
+        matches!(err, Error::BadHex(_)),
+        "expected BadHex, got {err:?}",
     );
 }
 
@@ -1230,6 +1235,48 @@ async fn validate_address_returns_valid_false_for_garbage() {
     let result = dispatch(
         &state,
         rpc("validate_address", json!({ "address": "not-a-hash" })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["valid"], false);
+    assert!(result["normalized"].is_null());
+}
+
+#[tokio::test]
+async fn validate_address_accepts_bech32m_and_normalizes_to_hex() {
+    // Keystone proof: walletd delegates to the node's codec, so a bech32m
+    // address for THIS network is accepted and normalized back to the same
+    // 64-hex its bytes encode. (parse_any's own correctness is pinned by the
+    // node's 53-vector suite; this proves the walletd wiring.)
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let bytes = [0xABu8; 32];
+    // Default features → mainnet node → mainnet HRP ("xf").
+    let bech = exfer::types::address::encode(&bytes, exfer::types::address::Network::Mainnet);
+
+    let result = dispatch(&state, rpc("validate_address", json!({ "address": bech })))
+        .await
+        .unwrap();
+    assert_eq!(result["valid"], true);
+    assert_eq!(result["normalized"].as_str().unwrap(), "ab".repeat(32));
+}
+
+#[tokio::test]
+async fn validate_address_rejects_wrong_network_bech32m() {
+    // A well-formed testnet address must NOT validate on a mainnet node —
+    // the HRP carries the network and the codec enforces it. This is the
+    // cross-network fund-loss guard.
+    let mock = MockServer::start().await;
+    let (state, _dir) = make_state(mock.uri(), tempfile::tempdir().unwrap());
+
+    let bytes = [0xABu8; 32];
+    let testnet_addr =
+        exfer::types::address::encode(&bytes, exfer::types::address::Network::Testnet);
+
+    let result = dispatch(
+        &state,
+        rpc("validate_address", json!({ "address": testnet_addr })),
     )
     .await
     .unwrap();

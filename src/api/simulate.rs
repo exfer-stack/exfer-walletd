@@ -22,7 +22,10 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ensure_64_hex, ApiState, TransferOutput, DEFAULT_MAX_FEE, MAX_OUTPUTS};
+use super::{
+    ensure_64_hex, parse_address, parse_address_hex, ApiState, TransferOutput, DEFAULT_MAX_FEE,
+    MAX_OUTPUTS,
+};
 use crate::error::{Error, Result};
 use crate::tx::FeeChoice;
 
@@ -63,7 +66,9 @@ pub async fn simulate_transfer_method(state: &ApiState, params: Value) -> Result
     let p: SimulateTransferParams = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("simulate_transfer params: {e}")))?;
 
-    ensure_64_hex(&p.from)?;
+    // Accept-both, mirroring the real transfer: `from` normalized to canonical
+    // hex for the keystore lookup, recipients decoded to bytes below.
+    let (from_hex, _) = parse_address_hex(&p.from)?;
     if p.outputs.is_empty() {
         return Err(Error::BadParams(
             "simulate_transfer: outputs[] must not be empty".into(),
@@ -76,7 +81,7 @@ pub async fn simulate_transfer_method(state: &ApiState, params: Value) -> Result
         });
     }
     for o in &p.outputs {
-        ensure_64_hex(&o.to)?;
+        parse_address(&o.to)?;
     }
     if p.fee.is_some() && p.fee_rate.is_some() {
         return Err(Error::BadParams(
@@ -93,10 +98,7 @@ pub async fn simulate_transfer_method(state: &ApiState, params: Value) -> Result
 
     let mut recipients: Vec<(exfer::types::Hash256, u64)> = Vec::with_capacity(p.outputs.len());
     for o in &p.outputs {
-        let bytes = hex::decode(&o.to).map_err(|e| Error::BadHex(e.to_string()))?;
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        recipients.push((exfer::types::Hash256(arr), o.amount));
+        recipients.push((exfer::types::Hash256(parse_address(&o.to)?), o.amount));
     }
 
     // Optional datum: validate (hex, <= MAX_DATUM_SIZE) exactly like the
@@ -117,7 +119,7 @@ pub async fn simulate_transfer_method(state: &ApiState, params: Value) -> Result
     };
 
     let store = state.store.clone();
-    let from = p.from.clone();
+    let from = from_hex;
     let signer = tokio::task::spawn_blocking(move || store.load_by_address(&from))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;

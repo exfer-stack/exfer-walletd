@@ -22,7 +22,10 @@ path = "src/main.rs"
 # series, and this rev additionally carries the node-derived signature
 # domain (`genesis::bind_signature_domain`, issue #32) that
 # `--expect-genesis` binds at startup.
-exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "acaf9b380db79d7277aaecf47124920cae9a15e7" }
+# Bumped acaf9b3 → 6101e3f: adds only the `types::address` codec (PR #38,
+# bech32m accept-both). walletd delegates address parsing to it so we never
+# diverge from what the chain accepts. No other node change in this bump.
+exfer = { git = "https://github.com/exfer-stack/exfer.git", rev = "6101e3f38b5b007fa023ca34266eb1ef6d1a5024" }
 
 axum            = { version = "0.7", features = ["macros"] }
 

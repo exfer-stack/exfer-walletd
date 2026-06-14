@@ -767,7 +767,10 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
         .map_err(|e| Error::BadParams(format!("transfer params: {e}")))?;
 
     // ---- envelope-level validation (cheap, no upstream calls) --------
-    ensure_64_hex(&p.from)?;
+    // Accept-both: `from` and every recipient may be legacy 64-hex or bech32m
+    // for this network. Normalize `from` to canonical hex for the hex-keyed
+    // keystore lookup below; recipients are decoded to bytes further down.
+    let (from_hex, _) = parse_address_hex(&p.from)?;
     if p.outputs.is_empty() {
         return Err(Error::BadParams(
             "transfer: outputs[] must not be empty".into(),
@@ -780,7 +783,7 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
         });
     }
     for o in &p.outputs {
-        ensure_64_hex(&o.to)?;
+        parse_address(&o.to)?;
     }
     if p.fee.is_some() && p.fee_rate.is_some() {
         return Err(Error::BadParams(
@@ -820,18 +823,15 @@ async fn transfer_method(state: &ApiState, params: Value) -> Result<Value> {
     };
     let max_fee = p.max_fee.unwrap_or(DEFAULT_MAX_FEE);
 
-    // Convert recipient addresses into Hash256s.
+    // Convert recipient addresses into Hash256s (accept-both via the codec).
     let mut recipients: Vec<(exfer::types::Hash256, u64)> = Vec::with_capacity(p.outputs.len());
     for o in &p.outputs {
-        let bytes = hex::decode(&o.to).map_err(|e| Error::BadHex(e.to_string()))?;
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        recipients.push((exfer::types::Hash256(arr), o.amount));
+        recipients.push((exfer::types::Hash256(parse_address(&o.to)?), o.amount));
     }
 
     // ---- load the signer (blocking FS I/O on the keystore) -----------
     let store = state.store.clone();
-    let from = p.from.clone();
+    let from = from_hex;
     let signer = tokio::task::spawn_blocking(move || store.load_by_address(&from))
         .await
         .map_err(|e| Error::Internal(format!("blocking task panicked: {e}")))??;
@@ -1203,8 +1203,8 @@ async fn get_transaction(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_balance(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("get_balance params: {e}")))?;
-    ensure_64_hex(&p.address)?;
-    let bal = state.node.get_balance(&p.address).await?;
+    let (addr, _) = parse_address_hex(&p.address)?;
+    let bal = state.node.get_balance(&addr).await?;
     serde_json::to_value(&bal).map_err(|e| Error::Internal(e.to_string()))
 }
 
@@ -1217,11 +1217,11 @@ async fn get_address_utxos(state: &ApiState, params: Value) -> Result<Value> {
         .unwrap_or(false);
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("get_address_utxos params: {e}")))?;
-    ensure_64_hex(&p.address)?;
-    let u = state.node.get_address_utxos(&p.address).await?;
+    let (addr, _) = parse_address_hex(&p.address)?;
+    let u = state.node.get_address_utxos(&addr).await?;
     let mut out = serde_json::to_value(&u).map_err(|e| Error::Internal(e.to_string()))?;
     if with_status {
-        annotate_utxo_status(state, &p.address, u.tip_height, &mut out).await?;
+        annotate_utxo_status(state, &addr, u.tip_height, &mut out).await?;
     }
     Ok(out)
 }
@@ -1346,8 +1346,8 @@ async fn get_script_utxos(state: &ApiState, params: Value) -> Result<Value> {
 async fn get_address_mempool(state: &ApiState, params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("get_address_mempool params: {e}")))?;
-    ensure_64_hex(&p.address)?;
-    let m = state.node.get_address_mempool(&p.address).await?;
+    let (addr, _) = parse_address_hex(&p.address)?;
+    let m = state.node.get_address_mempool(&addr).await?;
     serde_json::to_value(&m).map_err(|e| Error::Internal(e.to_string()))
 }
 
@@ -1456,22 +1456,24 @@ async fn reveal_address_mnemonic(state: &ApiState, params: Value) -> Result<Valu
 // New wallet-side conveniences (v1.0)
 // ----------------------------------------------------------------------------
 
-/// `validate_address` — pure check that a string is a syntactically
-/// well-formed 64-char lowercase hex address. No upstream calls.
+/// `validate_address` — pure check that a string is a well-formed address in
+/// either accepted form (legacy 64-hex or bech32m for this network). Returns
+/// the canonical lowercase 64-hex `normalized` spelling when valid, so callers
+/// can key/compare on one form regardless of which the user typed. No upstream
+/// calls.
 async fn validate_address(params: Value) -> Result<Value> {
     let p: AddressParam = serde_json::from_value(params)
         .map_err(|e| Error::BadParams(format!("validate_address params: {e}")))?;
-    let trimmed = p.address.trim();
-    let valid = trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
-    let normalized = if valid {
-        Some(trimmed.to_ascii_lowercase())
-    } else {
-        None
-    };
-    Ok(serde_json::json!({
-        "valid": valid,
-        "normalized": normalized,
-    }))
+    match parse_address(p.address.trim()) {
+        Ok(bytes) => Ok(serde_json::json!({
+            "valid": true,
+            "normalized": hex::encode(bytes),
+        })),
+        Err(_) => Ok(serde_json::json!({
+            "valid": false,
+            "normalized": Value::Null,
+        })),
+    }
 }
 
 /// `get_wallet_balance` — aggregate balance across every managed
@@ -1805,6 +1807,37 @@ async fn abandon_transfer(state: &ApiState, params: Value) -> Result<Value> {
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
+
+/// Parse a user-supplied ADDRESS in either accepted form into its raw 32-byte
+/// hash: legacy 64-hex (mixed case preserved, bit-for-bit `hex::decode`
+/// semantics) or bech32m for THIS node's network.
+///
+/// Delegates to the node's single authoritative codec
+/// ([`exfer::types::address::parse_any`]) so walletd can never accept a string
+/// the chain would decode differently — there is exactly one decoder in the
+/// stack. Wrong-network, bad checksum, wrong-checksum-variant, bad length,
+/// mixed case, and non-canonical padding all surface as a `-32602` client
+/// error carrying the codec's specific message (e.g. "testnet address not
+/// valid on this mainnet node").
+///
+/// Scope: use ONLY for true addresses (transfer recipients, balance/utxo
+/// queries). Covenant pubkeys, hash-locks, tx-ids and block-ids stay hex-only
+/// via [`ensure_64_hex`] — encoding them as addresses would invite confusion.
+fn parse_address(s: &str) -> Result<[u8; 32]> {
+    exfer::types::address::parse_any(s, exfer::types::address::current_network())
+        .map_err(|e| Error::BadHex(e.to_string()))
+}
+
+/// Like [`parse_address`] but also returns the canonical lowercase 64-hex
+/// spelling. For the sites that forward an address *string* to the upstream
+/// node (which always speaks hex) or look it up in the hex-keyed keystore:
+/// bech32m is normalized to hex HERE so the node never needs the codec and
+/// walletd stays the sole accept-both boundary, independent of the remote
+/// node's build.
+fn parse_address_hex(s: &str) -> Result<(String, [u8; 32])> {
+    let bytes = parse_address(s)?;
+    Ok((hex::encode(bytes), bytes))
+}
 
 /// Validate a 32-byte hash hex string (address or block/tx hash).
 /// Length mismatch → `BadAddressLen` (`-32602`); right length but

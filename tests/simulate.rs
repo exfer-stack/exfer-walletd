@@ -121,7 +121,10 @@ async fn simulate_transfer_rejects_short_address() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, Error::BadAddressLen(_)), "got {err:?}");
+    // Addresses now route through the codec (accept-both); a short hex string
+    // is still rejected, with the codec's specific length message. Same
+    // -32602 to clients.
+    assert!(matches!(err, Error::BadHex(_)), "got {err:?}");
 }
 
 #[tokio::test]

@@ -693,10 +693,10 @@ struct ReclaimableLock {
 /// receiver / timeout-boundary logic — where the bugs hide — is unit-testable
 /// against the real indexer JSON shape. Returns `None` to skip the row.
 ///
-/// Reclaimable ⇔ all hold: it's a `locked` HTLC, WE are the sender (the address
-/// filter also returns locks we *received*, which are claimed not reclaimed),
-/// the tip is strictly past the timeout (the refund arm needs `height > timeout`),
-/// and every param decodes.
+/// Reclaimable ⇔ all hold: funds are still in the HTLC (neither arm fired), WE
+/// are the sender (the address filter also returns locks we *received*, which
+/// are claimed not reclaimed), the tip is strictly past the timeout (the refund
+/// arm needs `height > timeout`), and every param decodes.
 fn decode_reclaimable_lock(
     my_pubkey: &str,
     tip: u64,
@@ -707,7 +707,14 @@ fn decode_reclaimable_lock(
     if !sender.eq_ignore_ascii_case(my_pubkey) {
         return None;
     }
-    if h.get("state").and_then(|v| v.as_str()) != Some("locked") {
+    // Funds remain in the HTLC only while neither arm has fired. Do NOT key on
+    // the `state` string: a past-timeout lock is reported as `locked` OR
+    // `locked_expired` depending on whether it was mined before or after its
+    // own timeout height, and BOTH are reclaimable. A present `claim`/`reclaim`
+    // is the on-chain proof it's already settled — then there's nothing to do.
+    let claimed = h.get("claim").is_some_and(|v| !v.is_null());
+    let reclaimed = h.get("reclaim").is_some_and(|v| !v.is_null());
+    if claimed || reclaimed {
         return None;
     }
     let timeout = params.get("timeout_height").and_then(|v| v.as_u64())?;
@@ -1634,10 +1641,13 @@ impl SwapEngine {
             };
             let my_pubkey = hex::encode(signer.pubkey());
 
+            // Query by address only — NOT by `state: "locked"`: the indexer
+            // reports a past-timeout lock as `locked_expired`, so a state filter
+            // would hide exactly the locks we need to reclaim. We filter for
+            // "funds still locked" client-side in `decode_reclaimable_lock`.
             let resp = match indexer
                 .htlc_list(serde_json::json!({
                     "address": my_pubkey,
-                    "state": "locked",
                     "limit": 1000,
                 }))
                 .await
@@ -1863,15 +1873,30 @@ mod tests {
     }
 
     #[test]
-    fn sweep_skips_already_settled_states() {
+    fn sweep_skips_already_settled_locks() {
+        // Settled = the on-chain `claim` or `reclaim` arm has fired. Either
+        // present → never re-reclaim, regardless of the `state` string.
+        let mut claimed: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
+        claimed["state"] = "claimed".into();
+        claimed["claim"] =
+            serde_json::json!({"block_height": 815000, "preimage": "ab", "tx_id": "cd"});
+        assert!(decode_reclaimable_lock(SENDER, 815693, &claimed).is_none());
+
+        let mut reclaimed: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
+        reclaimed["state"] = "reclaimed".into();
+        reclaimed["reclaim"] = serde_json::json!({"block_height": 815000, "tx_id": "cd"});
+        assert!(decode_reclaimable_lock(SENDER, 815693, &reclaimed).is_none());
+    }
+
+    #[test]
+    fn sweep_reclaims_locked_expired_state() {
+        // Regression (caught by a live mainnet test): a lock mined AFTER its
+        // timeout is reported as `locked_expired`, not `locked`. Funds are still
+        // in the HTLC (claim/reclaim both null) → it MUST be reclaimable. Keying
+        // on `state == "locked"` skipped exactly these.
         let mut v: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
-        for st in ["claimed", "reclaimed", "none"] {
-            v["state"] = serde_json::Value::String(st.into());
-            assert!(
-                decode_reclaimable_lock(SENDER, 815693, &v).is_none(),
-                "state {st} must not be reclaimed"
-            );
-        }
+        v["state"] = "locked_expired".into();
+        assert!(decode_reclaimable_lock(SENDER, 815693, &v).is_some());
     }
 
     fn test_store(dir: &Path) -> Arc<dyn WalletStore> {

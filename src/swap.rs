@@ -653,6 +653,11 @@ pub struct SwapEngine {
     bsc_chain_id: u64,
     /// Serializes BSC sends from our single derived account (nonce safety).
     bsc_lock: tokio::sync::Mutex<()>,
+    /// Lock outpoints (`lock_tx_id ++ output_index`) the chain-driven sweep has
+    /// already broadcast a reclaim for this session. Stops [`sweep_stranded_locks`]
+    /// from re-broadcasting the same reclaim every tick (and on every app reopen)
+    /// during the block or two before the indexer flips the HTLC to `reclaimed`.
+    swept_locks: std::sync::Mutex<std::collections::HashSet<[u8; 36]>>,
     /// Per-swap_id async locks. execute()/refund() are check-then-act across long
     /// awaits (broadcast a lock, then flip status); without this a double-tapped
     /// or retried call would pass the status guard twice and lock the first leg
@@ -668,6 +673,61 @@ fn strip0x(s: &str) -> &str {
 
 fn hash256_from_hex(s: &str) -> Result<exfer::types::Hash256> {
     Ok(exfer::types::Hash256(crate::tx::decode_hash(strip0x(s))?))
+}
+
+/// A stranded HTLC lock the chain sweep can reclaim: decoded, ready to spend.
+struct ReclaimableLock {
+    lock_tx: exfer::types::Hash256,
+    output_index: u32,
+    receiver: [u8; 32],
+    hashlock: exfer::types::Hash256,
+    timeout: u64,
+    /// `0x`-prefixed hashlock, for matching back to a journal record.
+    hashlock_0x: String,
+    /// Raw lock-tx hex, for logging.
+    lock_tx_hex: String,
+}
+
+/// Decide whether one `htlc_list` row is a stranded lock WE can reclaim now, and
+/// if so decode its reclaim params. Pure (no I/O) so the field-name / sender-vs-
+/// receiver / timeout-boundary logic — where the bugs hide — is unit-testable
+/// against the real indexer JSON shape. Returns `None` to skip the row.
+///
+/// Reclaimable ⇔ all hold: it's a `locked` HTLC, WE are the sender (the address
+/// filter also returns locks we *received*, which are claimed not reclaimed),
+/// the tip is strictly past the timeout (the refund arm needs `height > timeout`),
+/// and every param decodes.
+fn decode_reclaimable_lock(
+    my_pubkey: &str,
+    tip: u64,
+    h: &serde_json::Value,
+) -> Option<ReclaimableLock> {
+    let params = h.get("params")?;
+    let sender = params.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+    if !sender.eq_ignore_ascii_case(my_pubkey) {
+        return None;
+    }
+    if h.get("state").and_then(|v| v.as_str()) != Some("locked") {
+        return None;
+    }
+    let timeout = params.get("timeout_height").and_then(|v| v.as_u64())?;
+    if tip <= timeout {
+        return None;
+    }
+    let lock_tx_hex = h.get("lock_tx_id").and_then(|v| v.as_str())?.to_string();
+    let output_index = u32::try_from(h.get("output_index").and_then(|v| v.as_u64())?).ok()?;
+    let receiver_hex = params.get("receiver").and_then(|v| v.as_str())?;
+    let hashlock_hex = params.get("hash_lock").and_then(|v| v.as_str())?;
+
+    Some(ReclaimableLock {
+        lock_tx: hash256_from_hex(&lock_tx_hex).ok()?,
+        output_index,
+        receiver: crate::tx::decode_hash(strip0x(receiver_hex)).ok()?,
+        hashlock: hash256_from_hex(hashlock_hex).ok()?,
+        timeout,
+        hashlock_0x: format!("0x{}", strip0x(hashlock_hex)),
+        lock_tx_hex,
+    })
 }
 
 impl SwapEngine {
@@ -695,6 +755,7 @@ impl SwapEngine {
             bsc_chain_id: cfg.bsc_chain_id,
             bsc_lock: tokio::sync::Mutex::new(()),
             swap_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            swept_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1519,6 +1580,141 @@ impl SwapEngine {
         }
         Ok(self.journal.get(swap_id).unwrap_or(rec))
     }
+
+    /// Chain-driven recovery of stranded EXFER HTLC locks — independent of the
+    /// swap journal. A swap whose claim step is interrupted (network drop, app
+    /// kill) strands the user's EXFER lock; the monitor's journal-driven refund
+    /// recovers it *only if the swap record still lives on the device*. But the
+    /// very failures that strand funds — reinstall, cleared data, a new phone,
+    /// restoring without the vault — are exactly the ones that lose that local
+    /// record, so the journal-driven path can't help there.
+    ///
+    /// This path depends on nothing local but the user's keys: for every EXFER
+    /// address in the keyring, ask the indexer for HTLCs touching that pubkey,
+    /// keep the ones WE locked (`sender == us`) that are still `locked` and past
+    /// their timeout height, and broadcast the reclaim. The reclaim pays back to
+    /// the sender — i.e. the user's own address. Best-effort: every lookup, parse
+    /// or broadcast error is logged and skipped so one bad entry never blocks the
+    /// rest, and an in-memory guard stops us re-broadcasting a reclaim that's
+    /// already in flight (before the indexer flips the HTLC to `reclaimed`).
+    ///
+    /// No funds are ever at risk: a reclaim spends the refund arm of the user's
+    /// own lock, which only the user's key can sign.
+    pub async fn sweep_stranded_locks(&self) {
+        let Some(indexer) = self.indexer.as_ref() else {
+            return;
+        };
+        let tip = match self.node.get_block_height().await {
+            Ok(t) => t.height,
+            Err(e) => {
+                tracing::debug!(error = %e, "sweep: get_block_height failed; skipping this pass");
+                return;
+            }
+        };
+        let store = self.store.clone();
+        let entries = match tokio::task::spawn_blocking(move || store.list()).await {
+            Ok(Ok(e)) => e,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "sweep: keyring list failed; skipping");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "sweep: keyring list task panicked; skipping");
+                return;
+            }
+        };
+
+        for entry in entries {
+            // Resolve the signer so we have the raw pubkey to query by and the
+            // key to sign the reclaim. Non-EXFER entries (e.g. the BSC key) either
+            // fail to load here or simply match no EXFER HTLCs — harmless.
+            let signer = match self.load_signer(&entry.address).await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let my_pubkey = hex::encode(signer.pubkey());
+
+            let resp = match indexer
+                .htlc_list(serde_json::json!({
+                    "address": my_pubkey,
+                    "state": "locked",
+                    "limit": 1000,
+                }))
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!(address = %entry.address, error = %e, "sweep: htlc_list failed");
+                    continue;
+                }
+            };
+            let Some(htlcs) = resp.get("htlcs").and_then(|v| v.as_array()) else {
+                continue;
+            };
+
+            for h in htlcs {
+                let Some(lock) = decode_reclaimable_lock(&my_pubkey, tip, h) else {
+                    continue;
+                };
+
+                // Dedup: skip if we already broadcast a reclaim for this outpoint
+                // this session (the indexer may still report `locked` until the
+                // reclaim mines).
+                let mut outpoint = [0u8; 36];
+                outpoint[..32].copy_from_slice(&lock.lock_tx.0);
+                outpoint[32..].copy_from_slice(&lock.output_index.to_be_bytes());
+                {
+                    let mut swept = self.swept_locks.lock().unwrap_or_else(|e| e.into_inner());
+                    if !swept.insert(outpoint) {
+                        continue;
+                    }
+                }
+
+                match crate::tx::htlc::htlc_reclaim(
+                    &signer,
+                    lock.lock_tx,
+                    lock.output_index,
+                    lock.receiver,
+                    lock.hashlock,
+                    lock.timeout,
+                    None,
+                    &self.node,
+                )
+                .await
+                {
+                    Ok(receipt) => {
+                        tracing::info!(
+                            address = %entry.address,
+                            lock_tx = %lock.lock_tx_hex,
+                            reclaim_tx = %receipt.tx_id,
+                            "sweep: reclaimed stranded EXFER HTLC lock back to the user"
+                        );
+                        // If this swap is still in the journal, reflect the
+                        // recovery so the UI shows it as Refunded rather than
+                        // stuck. Match by hashlock; ignore if absent (the whole
+                        // point of the sweep is recovery without a record).
+                        if let Some(rec) = self.journal.list().into_iter().find(|r| {
+                            r.hashlock.eq_ignore_ascii_case(&lock.hashlock_0x) && !r.is_terminal()
+                        }) {
+                            let _ = self.journal.update(&rec.swap_id, now_secs(), |r| {
+                                r.status = SwapStatus::Refunded;
+                                r.refund_tx = Some(receipt.tx_id.clone());
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        // Drop the dedup guard so a transient failure retries next
+                        // pass; a permanent one (already spent) just re-logs once.
+                        self.swept_locks
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&outpoint);
+                        tracing::debug!(lock_tx = %lock.lock_tx_hex, error = %e, "sweep: reclaim broadcast failed");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Background monitor: each tick, advance every pending swap toward settlement,
@@ -1535,6 +1731,10 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
     const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
     tracing::info!("swap monitor started");
     engine.reconcile_completed().await;
+    // Chain-driven recovery at startup: reclaim any stranded EXFER HTLC lock the
+    // user holds the key for, even if its swap record was lost (reinstall, new
+    // device). This is what makes "just reopen the app" recover funds.
+    engine.sweep_stranded_locks().await;
     let mut last_reconcile = std::time::Instant::now();
     loop {
         tokio::select! {
@@ -1543,6 +1743,7 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
         }
         if last_reconcile.elapsed() >= RECONCILE_EVERY {
             engine.reconcile_completed().await;
+            engine.sweep_stranded_locks().await;
             last_reconcile = std::time::Instant::now();
         }
         for rec in engine.journal().pending() {
@@ -1596,6 +1797,82 @@ mod tests {
     use super::*;
     use crate::store::keyring::KeyringStore;
     use std::sync::Arc;
+
+    // The exact `htlc_list` row the live indexer returns for the stranded sell
+    // (tx d737274…, the customer's 20k-EXFER lock) — used as a fixture so the
+    // sweep's parse/filter logic is pinned to the real wire shape.
+    const LIVE_LOCKED_ROW: &str = r#"{
+        "amount": 2000000000000,
+        "claim": null,
+        "last_indexed_height": 812636,
+        "lock_block_height": 812636,
+        "lock_tx_id": "d737274792fae5c531c96656d167a98223ac8ea3bed078e0e8a9ce96e99ce6c8",
+        "output_index": 0,
+        "params": {
+            "hash_lock": "ad2ee1c42cf1da686eaaf843ad29b902abbdb8f4fc7c5258a6ebc43f9e86b46f",
+            "receiver": "3587f4c43dac81d593863c53ff8f0bebe702aba781781785b7f1c6712586599c",
+            "sender": "04f7e2704bf82eba1c3180aa995bdc627374f0be236cedd0003847e388705778",
+            "timeout_height": 814071
+        },
+        "reclaim": null,
+        "role": "observer",
+        "state": "locked"
+    }"#;
+    const SENDER: &str = "04f7e2704bf82eba1c3180aa995bdc627374f0be236cedd0003847e388705778";
+
+    #[test]
+    fn sweep_decodes_real_stranded_lock_when_past_timeout() {
+        let h: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
+        // tip 815693 > timeout 814071 → reclaimable, params decode to the live values.
+        let lock = decode_reclaimable_lock(SENDER, 815693, &h).expect("should be reclaimable");
+        assert_eq!(lock.output_index, 0);
+        assert_eq!(lock.timeout, 814071);
+        assert_eq!(
+            lock.lock_tx_hex,
+            "d737274792fae5c531c96656d167a98223ac8ea3bed078e0e8a9ce96e99ce6c8"
+        );
+        assert_eq!(
+            hex::encode(lock.receiver),
+            "3587f4c43dac81d593863c53ff8f0bebe702aba781781785b7f1c6712586599c"
+        );
+        assert_eq!(
+            lock.hashlock_0x,
+            "0xad2ee1c42cf1da686eaaf843ad29b902abbdb8f4fc7c5258a6ebc43f9e86b46f"
+        );
+        // Case-insensitive sender match too.
+        assert!(decode_reclaimable_lock(&SENDER.to_uppercase(), 815693, &h).is_some());
+    }
+
+    #[test]
+    fn sweep_skips_lock_not_yet_past_timeout() {
+        let h: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
+        // tip == timeout and tip < timeout are both NOT reclaimable (refund arm
+        // needs height strictly greater than timeout).
+        assert!(decode_reclaimable_lock(SENDER, 814071, &h).is_none());
+        assert!(decode_reclaimable_lock(SENDER, 814070, &h).is_none());
+    }
+
+    #[test]
+    fn sweep_skips_locks_we_did_not_send() {
+        let h: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
+        // We are the RECEIVER of this lock, not the sender → never our reclaim.
+        let receiver = "3587f4c43dac81d593863c53ff8f0bebe702aba781781785b7f1c6712586599c";
+        assert!(decode_reclaimable_lock(receiver, 815693, &h).is_none());
+        // An unrelated pubkey → skip.
+        assert!(decode_reclaimable_lock(&"11".repeat(32), 815693, &h).is_none());
+    }
+
+    #[test]
+    fn sweep_skips_already_settled_states() {
+        let mut v: serde_json::Value = serde_json::from_str(LIVE_LOCKED_ROW).unwrap();
+        for st in ["claimed", "reclaimed", "none"] {
+            v["state"] = serde_json::Value::String(st.into());
+            assert!(
+                decode_reclaimable_lock(SENDER, 815693, &v).is_none(),
+                "state {st} must not be reclaimed"
+            );
+        }
+    }
 
     fn test_store(dir: &Path) -> Arc<dyn WalletStore> {
         // Seeded keyring so seal_aux/unseal_aux have a passphrase.

@@ -21,7 +21,7 @@ use alloy::primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use alloy::sol;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolEvent};
 use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
@@ -33,6 +33,11 @@ sol! {
     function claim(bytes32 preimage) external;
     function refund(bytes32 hashlock) external;
     function getSwap(bytes32 hashlock) external view returns (address sender, address recipient, uint256 amount, uint64 timeoutSec, uint8 state);
+
+    // Emitted on every lock. `sender` is indexed (topic[2]) so the stranded-BNB
+    // sweep can enumerate a user's locks by their own BSC address via eth_getLogs,
+    // without any local swap record. `hashlock` is indexed (topic[1]).
+    event Locked(bytes32 indexed hashlock, address indexed sender, address indexed recipient, uint256 amount, uint64 timeoutSec);
 }
 
 /// On-chain HTLC state mirror (ExferHtlc.sol `enum State`).
@@ -94,6 +99,18 @@ fn parse_b256(s: &str) -> Result<B256> {
     Ok(B256::from_slice(&bytes))
 }
 
+/// The hashlock (`topic[1]`) of an `eth_getLogs` entry for the `Locked` event,
+/// as a `0x`-prefixed string. Pure so the topic indexing / shape handling — the
+/// part that silently mis-decodes — is unit-testable against real RPC JSON.
+/// Returns `None` on any shape mismatch (skips the row).
+fn hashlock_from_log(log: &Value) -> Option<String> {
+    let topics = log.get("topics")?.as_array()?;
+    // topic[0] = event signature, [1] = hashlock, [2] = sender, [3] = recipient.
+    let h = topics.get(1)?.as_str()?;
+    // Normalize through the strict 32-byte parser so a malformed topic is dropped.
+    Some(format!("0x{}", hex::encode(parse_b256(h).ok()?)))
+}
+
 // ───────────────────────── client ─────────────────────────
 
 #[derive(Clone)]
@@ -113,6 +130,14 @@ const GAS_LIMIT_CAP: u64 = 800_000;
 /// than a fixed reserve. Fallback price when the node can't be reached.
 const SWEEP_GAS_BUDGET: u64 = 60_000;
 const FALLBACK_GAS_PRICE_WEI: u128 = 5_000_000_000;
+
+/// Block window for the stranded-BNB sweep's `eth_getLogs` scan. publicnode (the
+/// configured BSC RPC) caps a getLogs range at 50000 blocks (`-32701 exceed
+/// maximum block range`), which this matches to minimize calls. Halved and
+/// retried on any range/result-limit error, down to [`BSC_GETLOGS_WINDOW_MIN`],
+/// so a stricter RPC still completes the scan.
+const BSC_GETLOGS_WINDOW: u64 = 50_000;
+const BSC_GETLOGS_WINDOW_MIN: u64 = 2_000;
 
 impl EvmClient {
     pub fn new(rpc_url: impl Into<String>, chain_id: u64) -> Self {
@@ -215,6 +240,100 @@ impl EvmClient {
     /// the on-chain recipient against our own derived address).
     pub fn address_of(secret: &[u8; 32]) -> Result<Address> {
         Ok(signer_from_secret(secret)?.address())
+    }
+
+    /// Latest block height.
+    pub async fn block_number(&self) -> Result<u64> {
+        let r = self.rpc("eth_blockNumber", json!([])).await?;
+        Self::hex_to_u64(Self::result_hex(&r)?)
+    }
+
+    /// `block.timestamp` of the latest block — the clock the HTLC's refund gate
+    /// (`block.timestamp >= timeoutSec`) is measured against.
+    pub async fn latest_block_timestamp(&self) -> Result<u64> {
+        let r = self
+            .rpc("eth_getBlockByNumber", json!(["latest", false]))
+            .await?;
+        let ts = r
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::UpstreamUnexpected("latest block: no timestamp".into()))?;
+        Self::hex_to_u64(ts)
+    }
+
+    /// Every hashlock `sender` has ever locked in `contract`, read from the
+    /// indexed `Locked` event over `[from_block, to_block]`. Journal-independent:
+    /// the only input is the user's own BSC address, so it recovers stranded BNB
+    /// even when the local swap record is gone (reinstall / new device).
+    ///
+    /// Scans in bounded windows so a public RPC with a getLogs range/result cap
+    /// still serves a full-history scan; a window that trips the cap is halved and
+    /// retried. Best-effort: a span that keeps failing at the minimum window is
+    /// logged and skipped so one bad range never blocks the rest. Returns the
+    /// `0x`-prefixed hashlocks (deduped) for the caller to check + refund.
+    pub async fn locked_hashlocks_by_sender(
+        &self,
+        contract: &str,
+        sender: Address,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<String>> {
+        let contract = parse_address(contract)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut start = from_block;
+        let mut window = BSC_GETLOGS_WINDOW;
+        while start <= to_block {
+            let end = (start + window - 1).min(to_block);
+            match self.get_logs_locked(contract, sender, start, end).await {
+                Ok(hashlocks) => {
+                    for h in hashlocks {
+                        if seen.insert(h.clone()) {
+                            out.push(h);
+                        }
+                    }
+                    start = end + 1;
+                    // Recover toward the full window after a forced split.
+                    if window < BSC_GETLOGS_WINDOW {
+                        window = (window * 2).min(BSC_GETLOGS_WINDOW);
+                    }
+                }
+                Err(e) if window > BSC_GETLOGS_WINDOW_MIN => {
+                    window = (window / 2).max(BSC_GETLOGS_WINDOW_MIN);
+                    tracing::debug!(start, end, error = %e, new_window = window, "getLogs window too wide; halving");
+                }
+                Err(e) => {
+                    tracing::debug!(start, end, error = %e, "getLogs span failed at min window; skipping");
+                    start = end + 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One `eth_getLogs` page for the `Locked` event, filtered to `sender`.
+    async fn get_logs_locked(
+        &self,
+        contract: Address,
+        sender: Address,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<String>> {
+        let params = json!([{
+            "address": contract.to_checksum(None),
+            "fromBlock": format!("0x{from:x}"),
+            "toBlock": format!("0x{to:x}"),
+            "topics": [
+                format!("0x{}", hex::encode(Locked::SIGNATURE_HASH)),
+                Value::Null,                                   // hashlock: any
+                format!("0x{}", hex::encode(sender.into_word())), // sender: us
+            ],
+        }]);
+        let r = self.rpc("eth_getLogs", params).await?;
+        let arr = r
+            .as_array()
+            .ok_or_else(|| Error::UpstreamUnexpected("eth_getLogs: expected array".into()))?;
+        Ok(arr.iter().filter_map(hashlock_from_log).collect())
     }
 
     async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>> {
@@ -482,5 +601,41 @@ mod tests {
         let sel = &alloy::primitives::keccak256("claim(bytes32)")[..4];
         assert_eq!(&data[..4], sel);
         assert_eq!(data.len(), 4 + 32);
+    }
+
+    #[test]
+    fn locked_event_signature_matches_solidity() {
+        // The getLogs topic[0] filter depends on this exact signature; a drift
+        // from the deployed contract would silently return zero logs.
+        let want = alloy::primitives::keccak256("Locked(bytes32,address,address,uint256,uint64)");
+        assert_eq!(Locked::SIGNATURE_HASH, want);
+    }
+
+    #[test]
+    fn hashlock_from_log_reads_topic_one() {
+        // A real eth_getLogs entry shape: topic[1] is the indexed hashlock.
+        let hl = format!("0x{}", "ab".repeat(32));
+        let sender = format!("0x{}", "00".repeat(12) + &"11".repeat(20));
+        let log = json!({
+            "topics": [
+                format!("0x{}", hex::encode(Locked::SIGNATURE_HASH)),
+                hl,
+                sender,
+                format!("0x{}", "00".repeat(12) + &"22".repeat(20)),
+            ],
+            "data": "0x",
+        });
+        assert_eq!(hashlock_from_log(&log).as_deref(), Some(hl.as_str()));
+    }
+
+    #[test]
+    fn hashlock_from_log_rejects_malformed() {
+        // Missing topics, too-few topics, and a non-32-byte topic[1] all drop.
+        assert_eq!(hashlock_from_log(&json!({})), None);
+        assert_eq!(hashlock_from_log(&json!({ "topics": [] })), None);
+        assert_eq!(
+            hashlock_from_log(&json!({ "topics": ["0xsig", "0xdeadbeef"] })),
+            None
+        );
     }
 }

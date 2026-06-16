@@ -658,6 +658,16 @@ pub struct SwapEngine {
     /// from re-broadcasting the same reclaim every tick (and on every app reopen)
     /// during the block or two before the indexer flips the HTLC to `reclaimed`.
     swept_locks: std::sync::Mutex<std::collections::HashSet<[u8; 36]>>,
+    /// Hashlocks (`0x`, lowercased) the BNB sweep has already broadcast a refund
+    /// for this session — the BSC analog of `swept_locks`. Stops re-sending a
+    /// refund every tick before the chain flips the HTLC to `Refunded`.
+    swept_bnb: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// In-memory high-water block for the stranded-BNB `eth_getLogs` scan. `0` =
+    /// not yet scanned: the first sweep of a session scans from the contract's
+    /// deploy block (recovering anything stranded while the app was closed), then
+    /// later ticks scan only new blocks. Reset to `0` on restart (fresh engine) so
+    /// every app launch re-does the full recovery scan — exactly when we want it.
+    bsc_sweep_cursor: std::sync::Mutex<u64>,
     /// Per-swap_id async locks. execute()/refund() are check-then-act across long
     /// awaits (broadcast a lock, then flip status); without this a double-tapped
     /// or retried call would pass the status guard twice and lock the first leg
@@ -670,6 +680,30 @@ pub struct SwapEngine {
 fn strip0x(s: &str) -> &str {
     s.trim_start_matches("0x")
 }
+
+/// The fixed ExferHtlc deployment `(contract, scan_floor_block)` for a BSC chain
+/// id, or `None` for an unknown/dev chain (the stranded-BNB sweep then no-ops).
+/// The floor bounds the `eth_getLogs` history scan: no lock can predate the
+/// contract's first `Locked` event, so scanning below it only wastes calls.
+///
+/// The pool uses ONE long-lived HTLC per chain (it custodies in-flight funds, so
+/// the address is effectively permanent — `GET /api/pool` → `bsc.htlc_contract`).
+/// Mainnet (56) `0x4Fdf…` is the live deployment; the floor is set just below its
+/// first observed lock (block 104_450_944). A pool HTLC redeploy is a coordinated
+/// release that must update this table. Testnet (97) mirrors
+/// `deployment-htlc-97.json`.
+fn bsc_htlc_for_chain(chain_id: u64) -> Option<(&'static str, u64)> {
+    match chain_id {
+        56 => Some(("0x4FdfB5f599cB84b87693aCCA1B9D57f5236e2E3d", 104_440_000)),
+        97 => Some(("0xBAd7f057c8196fF1b724fa1D8cb9D2397780E54d", 0)),
+        _ => None,
+    }
+}
+
+/// Blocks to rewind the in-memory sweep cursor each pass, so a shallow BSC reorg
+/// just below the last scanned tip can't hide a lock. Re-scanning a few blocks is
+/// free — the per-hashlock on-chain check + dedup set make it idempotent.
+const BSC_SWEEP_REORG_MARGIN: u64 = 50;
 
 fn hash256_from_hex(s: &str) -> Result<exfer::types::Hash256> {
     Ok(exfer::types::Hash256(crate::tx::decode_hash(strip0x(s))?))
@@ -763,6 +797,8 @@ impl SwapEngine {
             bsc_lock: tokio::sync::Mutex::new(()),
             swap_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             swept_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
+            swept_bnb: std::sync::Mutex::new(std::collections::HashSet::new()),
+            bsc_sweep_cursor: std::sync::Mutex::new(0),
         }
     }
 
@@ -1725,6 +1761,151 @@ impl SwapEngine {
             }
         }
     }
+
+    /// Chain-driven recovery of stranded BNB HTLC locks (buy direction) — the BSC
+    /// twin of [`sweep_stranded_locks`]. A buy locks the user's BNB on BSC first;
+    /// if the claim step is interrupted (network drop, app kill) AND the local
+    /// swap record is later lost (reinstall, new device, cleared data), the
+    /// journal-driven refund can't help — the very failures that strand the BNB
+    /// are the ones that lose the record.
+    ///
+    /// This path needs nothing local but the user's BSC key: enumerate every lock
+    /// that key SENT to the chain's fixed ExferHtlc (via the indexed `Locked`
+    /// event), and for each one still `Locked` past its `timeoutSec`, broadcast
+    /// `refund(hashlock)` — which the contract only honours for the original
+    /// sender, so no funds are ever at risk. Best-effort; an in-memory dedup guard
+    /// (`swept_bnb`) stops re-broadcasting before the chain flips to `Refunded`.
+    pub async fn sweep_stranded_bnb_locks(&self) {
+        // Fixed deployment for this chain; unknown/dev chains have no enumerable
+        // contract → nothing to sweep.
+        let Some((contract, deploy_block)) = bsc_htlc_for_chain(self.bsc_chain_id) else {
+            return;
+        };
+        // Our BSC key + address. Seed-only wallets created before the BSC key
+        // existed have none → nothing to sweep.
+        let secret = match self.store.evm_secret() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let our = match crate::evm::EvmClient::address_of(&secret) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(error = %e, "bnb sweep: bad BSC address; skipping");
+                return;
+            }
+        };
+
+        let tip = match self.evm.block_number().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "bnb sweep: block_number failed; skipping pass");
+                return;
+            }
+        };
+        // Scan from the deploy block on the first pass of a session (full
+        // recovery), then only new blocks, rewound a little for reorg safety.
+        let from = {
+            let cursor = *self
+                .bsc_sweep_cursor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cursor == 0 {
+                deploy_block
+            } else {
+                cursor
+                    .saturating_sub(BSC_SWEEP_REORG_MARGIN)
+                    .max(deploy_block)
+            }
+        };
+        if from > tip {
+            return;
+        }
+
+        let hashlocks = match self
+            .evm
+            .locked_hashlocks_by_sender(contract, our, from, tip)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(error = %e, "bnb sweep: getLogs enumeration failed; skipping pass");
+                return;
+            }
+        };
+        // Chain clock the refund gate is measured against (NOT wall time).
+        let now_ts = match self.evm.latest_block_timestamp().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "bnb sweep: block timestamp failed; skipping pass");
+                return;
+            }
+        };
+
+        for hashlock in hashlocks {
+            let sw = match self.evm.get_htlc_swap(contract, &hashlock).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(%hashlock, error = %e, "bnb sweep: getSwap failed; skipping");
+                    continue;
+                }
+            };
+            // Funds still in the HTLC and past the refund deadline?
+            if sw.state != crate::evm::HtlcState::Locked || now_ts < sw.timeout_sec {
+                continue;
+            }
+
+            let key = hashlock.to_lowercase();
+            {
+                let mut swept = self.swept_bnb.lock().unwrap_or_else(|e| e.into_inner());
+                if !swept.insert(key.clone()) {
+                    continue; // refund already in flight this session
+                }
+            }
+
+            let tx = {
+                let _guard = self.bsc_lock.lock().await;
+                self.evm.htlc_refund(&secret, contract, &hashlock).await
+            };
+            match tx {
+                Ok(txhash) => {
+                    tracing::info!(
+                        %hashlock,
+                        refund_tx = %txhash,
+                        "bnb sweep: refunded stranded BNB HTLC lock back to the user"
+                    );
+                    // Mirror the recovery into the journal if a live record exists
+                    // (so the UI shows Refunded, not stuck). Match by hashlock; the
+                    // sweep's whole point is to work WITHOUT a record, so absence is
+                    // fine.
+                    if let Some(rec) =
+                        self.journal.list().into_iter().find(|r| {
+                            r.hashlock.eq_ignore_ascii_case(&hashlock) && !r.is_terminal()
+                        })
+                    {
+                        let _ = self.journal.update(&rec.swap_id, now_secs(), |r| {
+                            r.status = SwapStatus::Refunded;
+                            r.refund_tx = Some(txhash.clone());
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Drop the dedup guard so a transient failure retries next pass.
+                    self.swept_bnb
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                    tracing::debug!(%hashlock, error = %e, "bnb sweep: refund broadcast failed");
+                }
+            }
+        }
+
+        // Advance the cursor past this fully-scanned tip so subsequent ticks in
+        // this session only scan new blocks.
+        *self
+            .bsc_sweep_cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = tip + 1;
+    }
 }
 
 /// Background monitor: each tick, advance every pending swap toward settlement,
@@ -1745,6 +1926,9 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
     // user holds the key for, even if its swap record was lost (reinstall, new
     // device). This is what makes "just reopen the app" recover funds.
     engine.sweep_stranded_locks().await;
+    // The BSC twin: recover stranded BNB locks from a buy whose claim was
+    // interrupted, even with no local record (reinstall / new device).
+    engine.sweep_stranded_bnb_locks().await;
     let mut last_reconcile = std::time::Instant::now();
     loop {
         tokio::select! {
@@ -1754,6 +1938,7 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
         if last_reconcile.elapsed() >= RECONCILE_EVERY {
             engine.reconcile_completed().await;
             engine.sweep_stranded_locks().await;
+            engine.sweep_stranded_bnb_locks().await;
             last_reconcile = std::time::Instant::now();
         }
         for rec in engine.journal().pending() {
@@ -2094,5 +2279,22 @@ mod tests {
             serde_json::from_str::<Direction>("\"exfer_to_bnb\"").unwrap(),
             Direction::ExferToBnb
         );
+    }
+
+    #[test]
+    fn bsc_htlc_for_chain_knows_mainnet_and_testnet() {
+        // Mainnet (56) must resolve to the live deployment the sweep refunds
+        // against; a wrong address/deploy-block would miss every stranded lock.
+        assert_eq!(
+            bsc_htlc_for_chain(56),
+            Some(("0x4FdfB5f599cB84b87693aCCA1B9D57f5236e2E3d", 104_440_000))
+        );
+        assert_eq!(
+            bsc_htlc_for_chain(97),
+            Some(("0xBAd7f057c8196fF1b724fa1D8cb9D2397780E54d", 0))
+        );
+        // Unknown/dev chains opt out of the sweep entirely (no enumerable HTLC).
+        assert_eq!(bsc_htlc_for_chain(1), None);
+        assert_eq!(bsc_htlc_for_chain(31337), None);
     }
 }

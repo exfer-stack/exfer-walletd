@@ -1315,6 +1315,9 @@ async fn get_status_reports_version_wallet_count_and_inflight() {
         result["version"].as_str().unwrap(),
         env!("CARGO_PKG_VERSION")
     );
+    // Network the daemon is genesis-bound to — clients read this to pick the
+    // bech32m display HRP. Default build is mainnet.
+    assert_eq!(result["network"], "mainnet");
     assert_eq!(result["upstream_ok"], true);
     assert_eq!(result["wallet_count"], 2);
     assert_eq!(result["tip"]["height"], 100);

@@ -1747,6 +1747,10 @@ async fn get_status(state: &ApiState) -> Result<Value> {
 
     Ok(serde_json::json!({
         "version":             env!("CARGO_PKG_VERSION"),
+        // The network this walletd is genesis-bound to ("mainnet"/"testnet"/
+        // "devnet"). Same source as parse_any's HRP gate, so a client can pick
+        // the right bech32m HRP for display without a second round-trip.
+        "network":             exfer::types::address::current_network().name(),
         "tip": {
             "block_id": tip_block_id,
             "height":   tip_height,

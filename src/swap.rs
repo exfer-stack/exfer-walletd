@@ -92,8 +92,15 @@ const BNBLOG_AAD: &[u8] = b"exfer-walletd/v1/bnb-txlog";
 const BNBLOG_FILE: &str = "bnb-txs.enc";
 
 /// Margin before the pool's BSC lock expiry within which we still consider it
-/// safe to reveal the preimage (the claim needs time to mine).
-const CLAIM_MARGIN_SECS: u64 = 600;
+/// safe to reveal the preimage (the claim needs time to mine). Sized well above
+/// this deployment's observed worst case: the 2026-06-06 incident saw a 65s
+/// block-propagation stall, and BSC RPC reads (`latest`) can themselves lag the
+/// chain by tens of seconds — so the wall-clock check here can believe more time
+/// remains than really does. 600s left only ~6-10 blocks of cushion for a
+/// value-bearing reveal; 1800s (30 min) keeps a deep margin while still being
+/// far under the pool leg's lifetime (poolHtlcHours, 12h) and the minimum lock we
+/// accept (MIN_BSC_LOCK_SECS, 2h), so it never rejects an otherwise-good claim.
+const CLAIM_MARGIN_SECS: u64 = 1800;
 /// Minimum user-leg lock duration we'll accept from the pool, so the user keeps
 /// a generous reclaim window even if the pool stalls/vanishes.
 const MIN_EXFER_LOCK_BLOCKS: u64 = 360; // ~1h at 10s blocks

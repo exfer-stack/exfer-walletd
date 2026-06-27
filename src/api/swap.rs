@@ -89,6 +89,29 @@ pub async fn swap_status(state: &ApiState, params: Value) -> Result<Value> {
     to_value(rec)
 }
 
+/// Force-advance ONE swap against the pool/chain right now, then return the fresh
+/// record. The UI calls this on (re)open of an in-flight swap so it reflects
+/// AUTHORITATIVE state immediately instead of waiting for the foreground monitor:
+/// it completes a settled-but-stuck claim, and — critically — lets a matched swap
+/// flip `user_locked → pool_locked` so the UI never declares a matched swap
+/// "unmatched" off a stale local status. Best-effort: a transient pool/indexer
+/// error is swallowed (the caller just re-reads the unchanged record and retries).
+pub async fn swap_refresh(state: &ApiState, params: Value) -> Result<Value> {
+    let p: SwapIdParams = serde_json::from_value(params)
+        .map_err(|e| Error::BadParams(format!("swap_refresh params: {e}")))?;
+    let eng = engine(state)?;
+    let rec = eng
+        .journal()
+        .get(&p.swap_id)
+        .ok_or_else(|| Error::BadParams(format!("unknown swap_id {}", p.swap_id)))?;
+    let _ = eng.advance(&rec).await;
+    let fresh = eng
+        .journal()
+        .get(&p.swap_id)
+        .ok_or_else(|| Error::BadParams(format!("unknown swap_id {}", p.swap_id)))?;
+    to_value(fresh)
+}
+
 pub async fn swap_list(state: &ApiState) -> Result<Value> {
     to_value(engine(state)?.journal().list())
 }

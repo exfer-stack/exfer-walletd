@@ -115,6 +115,13 @@ const CLAIM_REBROADCAST_SECS: u64 = 60;
 /// SELL's BSC lock confirms in seconds, so this is generous headroom.
 const V2_POOL_LOCK_WAIT_SECS: u64 = 90;
 
+/// v2 BUY: how long to wait for the pool's EXFER lock to CONFIRM + index before
+/// locking our BNB. The pool reports `pool_locked` on broadcast, but we verify
+/// against the indexer (mined locks only) and EXFER can mine in bursts — so the
+/// safety verify retries up to this long. (A production build would move this
+/// wait into the monitor so `swap_execute` returns immediately.)
+const V2_BUY_VERIFY_WAIT_SECS: u64 = 300;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -139,6 +146,15 @@ pub enum SwapFlow {
     #[default]
     V1,
     V2,
+}
+
+/// A verified pool EXFER lock (v2 buy) — enough to pre-sign a claim against it.
+struct PoolExferLock {
+    lock_tx_id: String,
+    output_index: u32,
+    /// The pool's pubkey (sender of the lock), 0x-stripped hex.
+    sender_pubkey: String,
+    timeout_height: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,6 +701,26 @@ impl PoolClient {
             let txt = resp.text().await.unwrap_or_default();
             return Err(Error::UpstreamUnexpected(format!(
                 "pool commit rejected: {txt}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// v2 BUY: POST the user's PRE-SIGNED EXFER claim. The pool stores it and,
+    /// after revealing the secret, splices it into the witness at `preimage_offset`
+    /// and broadcasts — paying the user their EXFER without the user coming back.
+    async fn presigned_claim(&self, id: &str, tx_hex: &str, preimage_offset: usize) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/api/swap/{id}/presigned-claim", self.base_url))
+            .json(&serde_json::json!({ "tx_hex": tx_hex, "preimage_offset": preimage_offset }))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool presigned-claim: {e}")))?;
+        if !resp.status().is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(Error::UpstreamUnexpected(format!(
+                "pool presigned-claim rejected: {txt}"
             )));
         }
         Ok(())
@@ -1310,67 +1346,148 @@ impl SwapEngine {
         //    never trust the pool's self-reported status for a funds decision.
         match rec.direction {
             Direction::ExferToBnb => {
-                // Pool locked BNB → reuse the sell-direction on-chain BSC gate.
+                // SELL: the pool locked BNB → verify it on BSC, then lock our EXFER.
                 if !self.verify_pool_bsc_lock(rec).await? {
                     return Err(Error::UpstreamUnexpected(
                         "pool's BNB lock failed on-chain verification; NOT locking our EXFER"
                             .into(),
                     ));
                 }
+                let from = rec
+                    .our_exfer_address
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing EXFER from-address".into()))?;
+                let signer = self.load_signer(&from).await?;
+                let receiver = crate::tx::decode_hash(strip0x(
+                    rec.pool_exfer_pubkey
+                        .as_deref()
+                        .ok_or_else(|| Error::Internal("missing pool EXFER pubkey".into()))?,
+                ))?;
+                let hash_lock = hash256_from_hex(&rec.hashlock)?;
+                let timeout = rec
+                    .exfer_timeout_height
+                    .ok_or_else(|| Error::Internal("missing EXFER timeout height".into()))?;
+                let tip = self.node.get_block_height().await?.height;
+                if timeout < tip + MIN_EXFER_LOCK_BLOCKS {
+                    return Err(Error::BadParams(
+                        "pool returned an unsafe (too-short) EXFER lock timeout".into(),
+                    ));
+                }
+                let amount: u64 = rec
+                    .amount_in_units
+                    .parse()
+                    .map_err(|e| Error::Internal(format!("bad EXFER amount: {e}")))?;
+                let receipt = crate::tx::htlc::htlc_lock(
+                    &signer,
+                    receiver,
+                    hash_lock,
+                    timeout,
+                    amount,
+                    crate::tx::FeeChoice::Rate(1),
+                    crate::api::DEFAULT_MAX_FEE,
+                    &self.node,
+                    &self.inflight,
+                )
+                .await?;
+                self.journal.update(swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::UserLocked;
+                    r.user_lock_tx = Some(receipt.tx_id);
+                })?;
             }
             Direction::BnbToExfer => {
-                // v2 buy needs verify_pool_exfer_lock + a pre-signed EXFER claim
-                // handed to the pool. Not yet wired in this walletd build.
-                return Err(Error::BadParams(
-                    "v2 buy (bnb_to_exfer) is not yet supported by this walletd build; \
-                     the pre-signed-claim path is pending — use v1 for buys"
-                        .into(),
-                ));
+                // BUY: the pool locked EXFER (paying US). Verify it on-chain, then
+                // PRE-SIGN a claim against it while we're online, then lock our BNB,
+                // then hand the pre-signed claim to the pool — it fills in its secret
+                // and relays the EXFER, so we never come back to claim.
+                //
+                // Wait for the pool's EXFER lock to confirm + index before trusting
+                // it (the pool reports pool_locked on broadcast; the indexer needs
+                // it mined, and EXFER mines in bursts). Retry the safety verify.
+                let verify_deadline = now_secs() + V2_BUY_VERIFY_WAIT_SECS;
+                let pool_lock = loop {
+                    match self.verify_pool_exfer_lock(rec).await {
+                        Ok(pl) => break pl,
+                        Err(e) => {
+                            if now_secs() >= verify_deadline {
+                                return Err(e);
+                            }
+                            tracing::debug!(swap = %rec.swap_id, err = %e, "v2 buy: pool EXFER lock not verified yet; retry");
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                    }
+                };
+
+                let from = rec
+                    .our_exfer_address
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing EXFER receive-address".into()))?;
+                let signer = self.load_signer(&from).await?;
+                // Pre-sign locally (no funds move) BEFORE locking BNB, so a
+                // pre-sign failure aborts with nothing at risk.
+                let presigned = crate::tx::htlc::build_presigned_claim(
+                    &signer,
+                    hash256_from_hex(&pool_lock.lock_tx_id)?,
+                    pool_lock.output_index,
+                    crate::tx::decode_hash(&pool_lock.sender_pubkey)?,
+                    hash256_from_hex(&rec.hashlock)?,
+                    pool_lock.timeout_height,
+                    None,
+                    &self.node,
+                )
+                .await?;
+
+                // Lock our BNB (the input leg) with the pool-supplied short timeout.
+                let secret = self.store.evm_secret()?;
+                let htlc = rec
+                    .htlc_contract
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing HTLC contract".into()))?;
+                let recipient = rec
+                    .pool_bsc_address
+                    .clone()
+                    .ok_or_else(|| Error::Internal("missing pool BSC address".into()))?;
+                let timeout = rec
+                    .bsc_timeout_sec
+                    .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
+                if timeout < now_secs() + MIN_BSC_LOCK_SECS {
+                    return Err(Error::BadParams(
+                        "pool returned an unsafe (too-short) BNB lock timeout".into(),
+                    ));
+                }
+                let amount = alloy::primitives::U256::from_str_radix(&rec.amount_in_units, 10)
+                    .map_err(|e| Error::Internal(format!("bad BNB amount: {e}")))?;
+                let our_addr = secret_address(&secret)?;
+                let bnb = self.evm.bnb_balance(our_addr).await?;
+                if bnb <= amount {
+                    return Err(Error::BadParams(
+                        "not enough BNB: need the swap amount plus a little for gas".into(),
+                    ));
+                }
+                let lock_tx = {
+                    let _guard = self.bsc_lock.lock().await;
+                    self.evm
+                        .htlc_lock(&secret, &htlc, &rec.hashlock, &recipient, amount, timeout)
+                        .await?
+                };
+
+                // Hand the pre-signed claim to the pool so it can relay our EXFER.
+                // Best-effort: if this POST fails, the pool still reveals the secret
+                // when it claims our BNB, and our watchtower (or a re-POST) finishes
+                // the claim — funds are never at risk.
+                if let Err(e) = self
+                    .pool
+                    .presigned_claim(&rec.swap_id, &presigned.tx_hex, presigned.preimage_offset)
+                    .await
+                {
+                    tracing::warn!(swap = %rec.swap_id, error = %e, "v2 buy: handing pre-signed claim to pool failed; watchtower will finish");
+                }
+
+                self.journal.update(swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::UserLocked;
+                    r.user_lock_tx = Some(lock_tx);
+                })?;
             }
         }
-
-        // 4. Lock our single input leg (SELL: EXFER) with the pool-supplied short
-        //    timeout. After this the user can close the app.
-        let from = rec
-            .our_exfer_address
-            .clone()
-            .ok_or_else(|| Error::Internal("missing EXFER from-address".into()))?;
-        let signer = self.load_signer(&from).await?;
-        let receiver = crate::tx::decode_hash(strip0x(
-            rec.pool_exfer_pubkey
-                .as_deref()
-                .ok_or_else(|| Error::Internal("missing pool EXFER pubkey".into()))?,
-        ))?;
-        let hash_lock = hash256_from_hex(&rec.hashlock)?;
-        let timeout = rec
-            .exfer_timeout_height
-            .ok_or_else(|| Error::Internal("missing EXFER timeout height".into()))?;
-        let tip = self.node.get_block_height().await?.height;
-        if timeout < tip + MIN_EXFER_LOCK_BLOCKS {
-            return Err(Error::BadParams(
-                "pool returned an unsafe (too-short) EXFER lock timeout".into(),
-            ));
-        }
-        let amount: u64 = rec
-            .amount_in_units
-            .parse()
-            .map_err(|e| Error::Internal(format!("bad EXFER amount: {e}")))?;
-        let receipt = crate::tx::htlc::htlc_lock(
-            &signer,
-            receiver,
-            hash_lock,
-            timeout,
-            amount,
-            crate::tx::FeeChoice::Rate(1),
-            crate::api::DEFAULT_MAX_FEE,
-            &self.node,
-            &self.inflight,
-        )
-        .await?;
-        self.journal.update(swap_id, now_secs(), |r| {
-            r.status = SwapStatus::UserLocked;
-            r.user_lock_tx = Some(receipt.tx_id);
-        })?;
         Ok(self.journal.get(swap_id).unwrap_or_else(|| rec.clone()))
     }
 
@@ -1397,6 +1514,94 @@ impl SwapEngine {
         let safe = pool_lock_safe_to_claim(&oc, our, want_out, now_secs());
         tracing::debug!(swap = %rec.swap_id, state = ?oc.state, safe, "verify_pool_bsc_lock");
         Ok(safe)
+    }
+
+    /// Funds-safety gate (v2 buy): verify the pool's EXFER lock exists on the
+    /// EXFER chain, pays US, covers the quote, and leaves a safe reclaim margin —
+    /// BEFORE we lock our BNB. Returns the lock's outpoint + params so the caller
+    /// can pre-sign a claim against it. Mirrors the buy-claim reveal-gate, run
+    /// pre-lock instead of pre-reveal.
+    async fn verify_pool_exfer_lock(&self, rec: &SwapRecord) -> Result<PoolExferLock> {
+        let indexer = self
+            .indexer
+            .as_ref()
+            .ok_or_else(|| Error::Internal("indexer required for v2 buy".into()))?;
+        let from = rec.our_exfer_address.clone().unwrap_or_default();
+        let signer = self.load_signer(&from).await?;
+        let our_pubkey = hex::encode(signer.pubkey());
+        let our_addr = strip0x(&from).to_lowercase();
+        let resp = indexer
+            .htlc_lookup_by_hashlock(serde_json::json!({ "hash_lock": strip0x(&rec.hashlock) }))
+            .await?;
+        let htlcs = resp
+            .get("htlcs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // The pool's lock pays US — match the indexed receiver against our pubkey
+        // OR our address (indexers differ on which they store).
+        let pl = htlcs
+            .iter()
+            .find(|h| {
+                h.get("params")
+                    .and_then(|p| p.get("receiver"))
+                    .and_then(|v| v.as_str())
+                    .map(|r| {
+                        let r = r.to_lowercase();
+                        r == our_pubkey.to_lowercase() || r == our_addr
+                    })
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                Error::UpstreamUnexpected("pool EXFER lock not yet found by hashlock; retry".into())
+            })?;
+        let state = pl.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        if state != "locked" {
+            return Err(Error::UpstreamUnexpected(format!(
+                "pool EXFER lock not in 'locked' state (got {state:?}); NOT locking our BNB"
+            )));
+        }
+        let params = pl.get("params").cloned().unwrap_or_default();
+        let lock_tx_id = pl
+            .get("lock_tx_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::UpstreamUnexpected("indexed htlc missing lock_tx_id".into()))?
+            .to_string();
+        let sender = params
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::UpstreamUnexpected("indexed htlc missing sender".into()))?;
+        let timeout_height = params
+            .get("timeout_height")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // Reveal-gate (#8), run pre-lock: the lock must cover the quote and leave a
+        // safe reclaim margin, else we ABORT without locking any BNB.
+        let amount = pl
+            .get("amount")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| Error::UpstreamUnexpected("indexed htlc missing amount".into()))?;
+        let want_out: u64 = rec
+            .amount_out_units
+            .parse()
+            .map_err(|e| Error::Internal(format!("bad amount_out_units: {e}")))?;
+        if amount < want_out {
+            return Err(Error::UpstreamUnexpected(format!(
+                "pool EXFER lock underfunded: locked {amount} < quoted {want_out}; NOT locking BNB"
+            )));
+        }
+        let tip = self.node.get_block_height().await?.height;
+        if timeout_height < tip + MIN_EXFER_LOCK_BLOCKS {
+            return Err(Error::UpstreamUnexpected(format!(
+                "pool EXFER lock timeout too short: {timeout_height} < tip {tip} + {MIN_EXFER_LOCK_BLOCKS}"
+            )));
+        }
+        Ok(PoolExferLock {
+            lock_tx_id,
+            output_index: 0,
+            sender_pubkey: strip0x(sender).to_string(),
+            timeout_height,
+        })
     }
 
     /// One monitor tick for a single swap: advance toward settlement, or refund

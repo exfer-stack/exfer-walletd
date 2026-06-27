@@ -249,6 +249,157 @@ pub async fn htlc_reclaim(
     .await
 }
 
+/// Result of [`build_presigned_claim`]: a fully receiver-signed, NOT-broadcast
+/// HTLC claim whose preimage is a 32-byte placeholder.
+pub struct PresignedClaim {
+    /// Hex of the serialized tx, with 32 placeholder bytes where the preimage
+    /// belongs. Whoever holds the real secret overwrites those bytes and broadcasts.
+    pub tx_hex: String,
+    /// Byte offset in the serialized tx where the 32-byte preimage starts.
+    pub preimage_offset: usize,
+    /// EXFER the claimer receives (HTLC value minus fee).
+    pub value: u64,
+}
+
+/// Build — but do NOT broadcast — a receiver-signed claim of an HTLC output,
+/// leaving the preimage as a 32-byte zero placeholder.
+///
+/// The signature covers only the tx body (header + inputs + outputs; witnesses
+/// are excluded from `sig_message`) and the `tx_id` likewise excludes the
+/// witness, so a third party who knows the real preimage can overwrite the 32
+/// placeholder bytes at `preimage_offset` and broadcast — the signature and the
+/// tx_id stay valid.
+///
+/// This is the v2 BUY primitive: the user (receiver of the pool's EXFER lock)
+/// pre-signs while online and hands this to the pool; the pool — which generated
+/// the secret — splices it in and relays the EXFER, so the user never has to
+/// come back online to claim.
+///
+/// Deliberately mirrors [`spend_htlc`]'s fetch/fee/build/sign steps (kept
+/// SEPARATE so the live claim/reclaim path is untouched); only the broadcast is
+/// replaced by returning the serialized bytes + the offset.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_presigned_claim(
+    signer: &Signer,
+    lock_tx_id: Hash256,
+    output_index: u32,
+    sender_pubkey: [u8; 32],
+    hash_lock: Hash256,
+    timeout: u64,
+    fee: Option<u64>,
+    node: &ExferNode,
+) -> Result<PresignedClaim> {
+    // The claimer (signer) is the receiver in the covenant; sender = the pool.
+    let program = build_htlc_program(&sender_pubkey, &signer.pubkey(), &hash_lock, timeout);
+    let expected_script = serialize_program(&program);
+
+    // 1. fetch + authenticate the pool's locked output.
+    let lock_tx_id_hex = hex::encode(lock_tx_id.as_bytes());
+    let tx_status = node.get_transaction(&lock_tx_id_hex).await?;
+    let raw = hex::decode(&tx_status.tx_hex).map_err(|e| Error::BadHex(e.to_string()))?;
+    let (htlc_value, _script) =
+        authenticate_tx_hex(&raw, lock_tx_id, output_index, Some(&expected_script))
+            .map_err(|e| Error::HtlcOutputAuth(format!("{e:?}")))?;
+
+    // Witness = Left(Unit) ‖ Bytes(placeholder32) ‖ Bytes(sig). The placeholder
+    // MUST be exactly 32 bytes so the tx size, fee, and byte layout match the
+    // final (real-preimage) tx — only the 32 bytes' VALUE changes at splice time.
+    const PLACEHOLDER: [u8; 32] = [0u8; 32];
+    let build_witness = |sig: &[u8]| {
+        let mut w = Value::Left(Box::new(Value::Unit)).serialize();
+        w.extend_from_slice(&Value::Bytes(PLACEHOLDER.to_vec()).serialize());
+        w.extend_from_slice(&Value::Bytes(sig.to_vec()).serialize());
+        w
+    };
+
+    // 2. size the witness (zero-sig probe).
+    let witness_len = build_witness(&[0u8; 64]).len();
+    let to_script = signer.address().as_bytes().to_vec();
+    let mk_tx = |value: u64| Transaction {
+        inputs: vec![TxInput {
+            prev_tx_id: lock_tx_id,
+            output_index,
+        }],
+        outputs: vec![TxOutput {
+            value,
+            script: to_script.clone(),
+            datum: None,
+            datum_hash: None,
+        }],
+        witnesses: vec![TxWitness {
+            witness: vec![0u8; witness_len],
+            redeemer: None,
+        }],
+    };
+
+    // 3. settle the fee against the consensus minimum (script-input cost).
+    let sc = compute_cost(
+        &program,
+        &ListSizes {
+            input_count: 1,
+            output_count: 1,
+        },
+    )
+    .map_err(|e| Error::TxBuild(format!("script cost: {e:?}")))?;
+    let script_eval_cost = sc.cells as u128 + sc.steps as u128;
+    let script_validation_cost = ((expected_script.len() as u64).div_ceil(64) * 10) as u128;
+    let template = mk_tx(htlc_value);
+    let base_min = min_fee_with_script_cost(&template, script_eval_cost, script_validation_cost)
+        .ok_or_else(|| Error::TxBuild("min_fee computation overflowed".into()))?;
+    let min = base_min + base_min / 4 + 1;
+    let fee = match fee {
+        Some(f) if f < min => {
+            return Err(Error::TxBuild(format!(
+                "fee {f} below required minimum {min}"
+            )));
+        }
+        Some(f) => f,
+        None => min,
+    };
+    let value = htlc_value
+        .checked_sub(fee)
+        .ok_or_else(|| Error::TxBuild(format!("fee {fee} exceeds htlc value {htlc_value}")))?;
+    if value < DUST_THRESHOLD {
+        return Err(Error::DustOutput {
+            amount: value,
+            dust_threshold: DUST_THRESHOLD,
+        });
+    }
+
+    // 4. build + sign (sig over the body; witness excluded).
+    let mut tx = mk_tx(value);
+    let sig_msg = tx
+        .sig_message()
+        .map_err(|e| Error::TxSerialize(format!("sig_message: {e:?}")))?;
+    let sig = signer.signing_key().sign(&sig_msg);
+    tx.witnesses[0].witness = build_witness(&sig.to_bytes());
+
+    // 5. serialize + locate the placeholder. The witness blob is the tail of the
+    //    tx; the preimage is its 2nd item, at offset 7 within the blob
+    //    (Left(Unit)=2B, Bytes-tag=1B, len-u32-LE=4B). Find the blob's absolute
+    //    start (it contains the unique sig, so it appears exactly once), then +7.
+    let serialized = tx
+        .serialize()
+        .map_err(|e| Error::TxSerialize(format!("{e:?}")))?;
+    let witness_blob = &tx.witnesses[0].witness;
+    let blob_start = serialized
+        .windows(witness_blob.len())
+        .position(|w| w == witness_blob.as_slice())
+        .ok_or_else(|| Error::TxSerialize("witness blob not found in serialized tx".into()))?;
+    let preimage_offset = blob_start + 7;
+    if serialized.get(preimage_offset..preimage_offset + 32) != Some(&PLACEHOLDER[..]) {
+        return Err(Error::TxSerialize(
+            "preimage placeholder not at the computed offset".into(),
+        ));
+    }
+
+    Ok(PresignedClaim {
+        tx_hex: hex::encode(&serialized),
+        preimage_offset,
+        value,
+    })
+}
+
 /// Shared single-input spend of an HTLC output. Fetches + authenticates
 /// the locked output against `expected_script`, sizes the fee from the
 /// consensus minimum, signs, builds the witness via `build_witness(sig)`,

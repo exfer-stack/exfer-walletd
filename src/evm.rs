@@ -138,6 +138,13 @@ const FALLBACK_GAS_PRICE_WEI: u128 = 5_000_000_000;
 /// so a stricter RPC still completes the scan.
 const BSC_GETLOGS_WINDOW: u64 = 50_000;
 const BSC_GETLOGS_WINDOW_MIN: u64 = 2_000;
+/// Consecutive min-window getLogs failures after which the stranded-lock scan
+/// gives up THIS cycle instead of crawling millions of windows. A RPC that
+/// gates archive `eth_getLogs` entirely (e.g. publicnode testnet: "Archive
+/// requests require a personal token") would otherwise fail every window and
+/// wedge the monitor for hours. The sweep is best-effort recovery — skipping a
+/// cycle is fine; it retries on the next reconcile with the in-memory cursor.
+const BSC_GETLOGS_MAX_CONSEC_FAIL: u32 = 5;
 
 impl EvmClient {
     pub fn new(rpc_url: impl Into<String>, chain_id: u64) -> Self {
@@ -283,10 +290,12 @@ impl EvmClient {
         let mut out = Vec::new();
         let mut start = from_block;
         let mut window = BSC_GETLOGS_WINDOW;
+        let mut consecutive_fail = 0u32;
         while start <= to_block {
             let end = (start + window - 1).min(to_block);
             match self.get_logs_locked(contract, sender, start, end).await {
                 Ok(hashlocks) => {
+                    consecutive_fail = 0;
                     for h in hashlocks {
                         if seen.insert(h.clone()) {
                             out.push(h);
@@ -303,6 +312,19 @@ impl EvmClient {
                     tracing::debug!(start, end, error = %e, new_window = window, "getLogs window too wide; halving");
                 }
                 Err(e) => {
+                    consecutive_fail += 1;
+                    // Persistent failure at the minimum window means the RPC gates
+                    // archive getLogs entirely. Bail out of this cycle's scan rather
+                    // than crawling every remaining min-window (millions of them) and
+                    // wedging the monitor — the sweep is best-effort and retries next
+                    // reconcile.
+                    if consecutive_fail >= BSC_GETLOGS_MAX_CONSEC_FAIL {
+                        tracing::warn!(
+                            start, to_block, consecutive_fail, error = %e,
+                            "getLogs persistently failing at min window; aborting stranded-lock scan this cycle"
+                        );
+                        return Ok(out);
+                    }
                     tracing::debug!(start, end, error = %e, "getLogs span failed at min window; skipping");
                     start = end + 1;
                 }

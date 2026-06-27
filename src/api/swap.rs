@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::ApiState;
 use crate::error::{Error, Result};
-use crate::swap::{Direction, SwapEngine};
+use crate::swap::{Direction, SwapEngine, SwapFlow};
 
 fn engine(state: &ApiState) -> Result<&std::sync::Arc<SwapEngine>> {
     state
@@ -36,6 +36,10 @@ struct QuoteParams {
     amount_in: String,
     /// EXFER address that funds (sell) or receives (buy) the EXFER leg.
     from: String,
+    /// Protocol flow: "v1" (default, user-locks-first) or "v2" (pool-locks-first).
+    /// Absent = v1, so existing callers (mobile, agent) are unaffected.
+    #[serde(default)]
+    flow: Option<String>,
 }
 
 pub async fn swap_get_quote(state: &ApiState, params: Value) -> Result<Value> {
@@ -57,7 +61,16 @@ pub async fn swap_get_quote(state: &ApiState, params: Value) -> Result<Value> {
                 .into(),
         ));
     }
-    let rec = engine(state)?.get_quote(dir, p.amount_in, p.from).await?;
+    let flow = match p.flow.as_deref() {
+        None | Some("v1") => SwapFlow::V1,
+        Some("v2") => SwapFlow::V2,
+        Some(other) => {
+            return Err(Error::BadParams(format!(
+                "unknown swap flow {other:?} (expected \"v1\" or \"v2\")"
+            )))
+        }
+    };
+    let rec = engine(state)?.get_quote(dir, p.amount_in, p.from, flow).await?;
     to_value(rec)
 }
 

@@ -110,6 +110,11 @@ const MIN_BSC_LOCK_SECS: u64 = 2 * 3600;
 /// spamming the network every monitor tick).
 const CLAIM_REBROADCAST_SECS: u64 = 60;
 
+/// How long the v2 `execute` waits for the pool to front its OUT-asset lock
+/// (after `commit`) before giving up. The pool locks right after commit and
+/// SELL's BSC lock confirms in seconds, so this is generous headroom.
+const V2_POOL_LOCK_WAIT_SECS: u64 = 90;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -117,6 +122,23 @@ pub enum Direction {
     ExferToBnb,
     /// Buy EXFER with BNB. User locks BNB (on BSC) first.
     BnbToExfer,
+}
+
+/// Which swap protocol a record follows.
+///
+/// `V1` (default): the USER generates the preimage and locks first, then must
+/// stay online to reveal it on the claim — the dominant real-world failure when
+/// a mobile app is killed mid-flow. `V2` (reversed): the POOL generates the
+/// preimage and locks FIRST; the user locks their input asset ONCE and can
+/// leave; the pool claims the user's lock (revealing the secret) and relays the
+/// payout. Defaulted to `V1` so journals written before this field existed
+/// deserialize unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapFlow {
+    #[default]
+    V1,
+    V2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +174,10 @@ pub struct SwapRecord {
     pub swap_id: String,
     pub direction: Direction,
     pub status: SwapStatus,
+    /// Which protocol this swap follows (v1 user-first / v2 pool-first).
+    /// `#[serde(default)]` so v1 journals written before this field load as `V1`.
+    #[serde(default)]
+    pub flow: SwapFlow,
 
     /// 0x-prefixed hashlock (SHA-256 of the preimage).
     pub hashlock: String,
@@ -489,6 +515,13 @@ struct QuoteResp {
     // `instructions`, but we still need the BSC contract ref to verify/relay).
     #[serde(default)]
     htlc_contract: Option<String>,
+    /// v2: the POOL generates the hashlock and returns it here (v1 echoes the
+    /// client's). Optional for forward-compat; required-present for v2.
+    #[serde(default)]
+    hashlock: Option<String>,
+    /// Protocol flow the pool actually ran ("v1" | "v2").
+    #[serde(default)]
+    flow: Option<String>,
     instructions: Instructions,
 }
 
@@ -520,13 +553,20 @@ impl PoolClient {
         &self,
         direction: Direction,
         amount_in_human: &str,
-        hashlock: &str,
+        hashlock: Option<&str>,
         user_bsc_address: Option<&str>,
         user_exfer_address: Option<&str>,
+        flow: SwapFlow,
     ) -> Result<QuoteResp> {
         let dir = match direction {
             Direction::ExferToBnb => "exfer_to_bnb",
             Direction::BnbToExfer => "bnb_to_exfer",
+        };
+        // v2: send NO hashlock (the pool mints it); always declare the flow so
+        // the pool routes correctly. Absent flow on the wire would mean v1.
+        let flow_str = match flow {
+            SwapFlow::V1 => "v1",
+            SwapFlow::V2 => "v2",
         };
         let body = serde_json::json!({
             "direction": dir,
@@ -534,6 +574,7 @@ impl PoolClient {
             "hashlock": hashlock,
             "user_bsc_address": user_bsc_address,
             "user_exfer_address": user_exfer_address,
+            "flow": flow_str,
         });
         let resp = self
             .http
@@ -628,6 +669,25 @@ impl PoolClient {
         resp.json()
             .await
             .map_err(|e| Error::UpstreamUnexpected(format!("relay-claim decode: {e}")))
+    }
+
+    /// v2: POST /api/swap/:id/commit — the user has confirmed, so the pool
+    /// fronts its OUT-asset lock (the asset the user wants). v2-only.
+    async fn commit(&self, id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/api/swap/{id}/commit", self.base_url))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool commit: {e}")))?;
+        if !resp.status().is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(Error::UpstreamUnexpected(format!(
+                "pool commit rejected: {txt}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -982,6 +1042,7 @@ impl SwapEngine {
         direction: Direction,
         amount_in_human: String,
         from_exfer: String,
+        flow: SwapFlow,
     ) -> Result<SwapRecord> {
         use rand::RngCore;
         use sha2::{Digest, Sha256};
@@ -991,10 +1052,21 @@ impl SwapEngine {
         let signer = self.load_signer(&from_exfer).await?;
         let our_pubkey = hex::encode(signer.pubkey());
 
-        let mut pre = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut pre);
-        let hashlock = format!("0x{}", hex::encode(Sha256::digest(pre)));
-        let preimage = format!("0x{}", hex::encode(pre));
+        // v1: the USER generates the secret and sends only the hashlock (the pool
+        // echoes it). v2 (reversed): the POOL generates the secret and locks
+        // first, so we send NO hashlock and NEVER hold the preimage — we adopt
+        // the hashlock the pool returns.
+        let (preimage, client_hashlock) = match flow {
+            SwapFlow::V1 => {
+                let mut pre = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut pre);
+                (
+                    format!("0x{}", hex::encode(pre)),
+                    Some(format!("0x{}", hex::encode(Sha256::digest(pre)))),
+                )
+            }
+            SwapFlow::V2 => (String::new(), None),
+        };
 
         let (user_bsc, user_exfer) = match direction {
             Direction::ExferToBnb => (Some(our_bsc.as_str()), None),
@@ -1002,14 +1074,31 @@ impl SwapEngine {
         };
         let q = self
             .pool
-            .quote(direction, &amount_in_human, &hashlock, user_bsc, user_exfer)
+            .quote(
+                direction,
+                &amount_in_human,
+                client_hashlock.as_deref(),
+                user_bsc,
+                user_exfer,
+                flow,
+            )
             .await?;
+
+        // v2: adopt the pool-generated hashlock; v1: use the one we generated.
+        let hashlock = match flow {
+            SwapFlow::V1 => client_hashlock.expect("v1 always generates a hashlock"),
+            SwapFlow::V2 => q
+                .hashlock
+                .clone()
+                .ok_or_else(|| Error::UpstreamUnexpected("v2 pool quote missing hashlock".into()))?,
+        };
 
         let now = now_secs();
         let rec = SwapRecord {
             swap_id: q.swap_id,
             direction,
             status: SwapStatus::Quoted,
+            flow,
             hashlock,
             preimage,
             amount_in: q.amount_in,
@@ -1069,6 +1158,14 @@ impl SwapEngine {
             return Err(Error::BadParams(
                 "quote expired; request a fresh quote".into(),
             ));
+        }
+
+        // v2 (reversed) takes a different path: the pool already locked (or is
+        // about to); we commit, verify its lock, then lock our single leg once.
+        // v1 falls through to the original user-locks-first code below, BYTE-FOR-
+        // BYTE unchanged.
+        if rec.flow == SwapFlow::V2 {
+            return self.execute_v2(swap_id, &rec).await;
         }
 
         match rec.direction {
@@ -1168,6 +1265,115 @@ impl SwapEngine {
         Ok(self.journal.get(swap_id).unwrap_or(rec))
     }
 
+    /// v2 (reversed-flow) execute. The POOL holds the secret and locks FIRST.
+    /// We: (1) `commit` so the pool fronts its OUT-asset lock; (2) wait until the
+    /// pool reports it locked; (3) VERIFY that lock on-chain before risking our
+    /// funds; (4) lock our single input leg. After step 4 the user can leave —
+    /// the pool claims our lock (revealing the secret) and relays the payout.
+    ///
+    /// Synchronous for a deterministic first cut (SELL's BSC pool-lock confirms
+    /// in seconds). A later refactor can move the poll+verify+lock into the
+    /// monitor so `swap_execute` returns immediately.
+    async fn execute_v2(&self, swap_id: &str, rec: &SwapRecord) -> Result<SwapRecord> {
+        // 1. Commit — the pool fronts the OUT-asset lock (the asset the user wants).
+        self.pool.commit(swap_id).await?;
+
+        // 2. Wait until the pool reports it has locked (pool_locked or beyond).
+        let deadline = now_secs() + V2_POOL_LOCK_WAIT_SECS;
+        loop {
+            let ps = self.pool.get_swap(swap_id).await?;
+            let status = ps.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            match status {
+                "pool_locked" | "user_locked" | "preimage_seen" | "completed" => break,
+                "failed" | "expired" | "refunded" => {
+                    self.journal.update(swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::Failed;
+                        r.error = Some(format!("pool aborted before locking (status={status})"));
+                    })?;
+                    return Err(Error::UpstreamUnexpected(format!(
+                        "pool aborted the swap before locking (status={status})"
+                    )));
+                }
+                _ => {}
+            }
+            if now_secs() >= deadline {
+                return Err(Error::UpstreamUnexpected(
+                    "pool did not front its lock within the wait window; \
+                     the quote may still settle — poll swap_status"
+                        .into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        // 3. Verify the pool's lock on-chain BEFORE committing our own funds —
+        //    never trust the pool's self-reported status for a funds decision.
+        match rec.direction {
+            Direction::ExferToBnb => {
+                // Pool locked BNB → reuse the sell-direction on-chain BSC gate.
+                if !self.verify_pool_bsc_lock(rec).await? {
+                    return Err(Error::UpstreamUnexpected(
+                        "pool's BNB lock failed on-chain verification; NOT locking our EXFER"
+                            .into(),
+                    ));
+                }
+            }
+            Direction::BnbToExfer => {
+                // v2 buy needs verify_pool_exfer_lock + a pre-signed EXFER claim
+                // handed to the pool. Not yet wired in this walletd build.
+                return Err(Error::BadParams(
+                    "v2 buy (bnb_to_exfer) is not yet supported by this walletd build; \
+                     the pre-signed-claim path is pending — use v1 for buys"
+                        .into(),
+                ));
+            }
+        }
+
+        // 4. Lock our single input leg (SELL: EXFER) with the pool-supplied short
+        //    timeout. After this the user can close the app.
+        let from = rec
+            .our_exfer_address
+            .clone()
+            .ok_or_else(|| Error::Internal("missing EXFER from-address".into()))?;
+        let signer = self.load_signer(&from).await?;
+        let receiver = crate::tx::decode_hash(strip0x(
+            rec.pool_exfer_pubkey
+                .as_deref()
+                .ok_or_else(|| Error::Internal("missing pool EXFER pubkey".into()))?,
+        ))?;
+        let hash_lock = hash256_from_hex(&rec.hashlock)?;
+        let timeout = rec
+            .exfer_timeout_height
+            .ok_or_else(|| Error::Internal("missing EXFER timeout height".into()))?;
+        let tip = self.node.get_block_height().await?.height;
+        if timeout < tip + MIN_EXFER_LOCK_BLOCKS {
+            return Err(Error::BadParams(
+                "pool returned an unsafe (too-short) EXFER lock timeout".into(),
+            ));
+        }
+        let amount: u64 = rec
+            .amount_in_units
+            .parse()
+            .map_err(|e| Error::Internal(format!("bad EXFER amount: {e}")))?;
+        let receipt = crate::tx::htlc::htlc_lock(
+            &signer,
+            receiver,
+            hash_lock,
+            timeout,
+            amount,
+            crate::tx::FeeChoice::Rate(1),
+            crate::api::DEFAULT_MAX_FEE,
+            &self.node,
+            &self.inflight,
+        )
+        .await?;
+        self.journal.update(swap_id, now_secs(), |r| {
+            r.status = SwapStatus::UserLocked;
+            r.user_lock_tx = Some(receipt.tx_id);
+        })?;
+        Ok(self.journal.get(swap_id).unwrap_or_else(|| rec.clone()))
+    }
+
     /// Funds-safety gate (sell direction): verify the pool's BNB lock exists
     /// on BSC and is safe to claim against BEFORE we reveal the preimage. Must
     /// be Locked, paid to OUR address, cover the quoted output, and have enough
@@ -1195,7 +1401,67 @@ impl SwapEngine {
 
     /// One monitor tick for a single swap: advance toward settlement, or refund
     /// after timeout. Errors are logged by the caller and retried next tick.
+    /// v2 monitor step: the POOL settles (it holds the secret and does both
+    /// claims), so the client only RECONCILES its local status from the pool.
+    /// Funds safety is independent of this display status — the user's own lock
+    /// is always protected by the journal-independent sweep + its refund arm.
+    async fn advance_v2(&self, rec: &SwapRecord) -> Result<()> {
+        let pj = match self.pool.get_swap(&rec.swap_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(swap = %rec.swap_id, %e, "v2 reconcile: pool unreachable; retry");
+                return Ok(());
+            }
+        };
+        let pstatus = pj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        match pstatus {
+            "completed" => {
+                let claim = pj
+                    .get("userClaimTxhash")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Completed;
+                    if r.claim_tx.is_none() {
+                        r.claim_tx = claim;
+                    }
+                })?;
+            }
+            "refunded" => {
+                // The pool reclaimed its own leg. The user's lock (if it ever
+                // confirmed) is recovered independently by the timeout sweep; this
+                // only reflects the outcome in the local status.
+                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Refunded;
+                })?;
+            }
+            "failed" => {
+                let note = pj
+                    .get("notes")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pool marked the swap failed")
+                    .to_string();
+                self.journal.update(&rec.swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Failed;
+                    if r.error.is_none() {
+                        r.error = Some(note);
+                    }
+                })?;
+            }
+            // quoted / pool_locked / user_locked / preimage_seen → still settling.
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub async fn advance(&self, rec: &SwapRecord) -> Result<()> {
+        // v2 (reversed): the POOL drives settlement (it holds the secret and does
+        // both claims). The client's job after locking is to RECONCILE its local
+        // status from the pool — branch out before the v1 user-locks-first state
+        // machine, which would otherwise never match a v2 record's progression.
+        if rec.flow == SwapFlow::V2 {
+            return self.advance_v2(rec).await;
+        }
         match (rec.status, rec.direction) {
             // Sell: the pool must mirror with a USDT lock on BSC. We DO NOT trust
             // the pool's self-reported status to decide it's safe to reveal the
@@ -1957,6 +2223,33 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
             if rec.status == SwapStatus::Quoted {
                 if now_secs() >= rec.expires_at {
                     let _ = engine.journal().remove(&rec.swap_id);
+                }
+                continue;
+            }
+            // v2 (reversed): the POOL settles. RECONCILE from the pool FIRST, then
+            // only refund if it's genuinely timed out and still non-terminal.
+            // Reconciling before the refund check is what avoids the v1 ordering
+            // bug — a settled-but-locally-stale swap past its timeout being
+            // diverted into a forever-reverting refund.
+            if rec.flow == SwapFlow::V2 {
+                if let Err(e) = engine.advance(&rec).await {
+                    tracing::warn!(swap = %rec.swap_id, error = %e, "v2 swap reconcile retry");
+                }
+                let fresh = engine
+                    .journal()
+                    .get(&rec.swap_id)
+                    .unwrap_or_else(|| rec.clone());
+                if matches!(
+                    fresh.status,
+                    SwapStatus::UserLocked
+                        | SwapStatus::PoolLocked
+                        | SwapStatus::Claiming
+                        | SwapStatus::Refunding
+                ) && engine.refundable(&fresh).await
+                {
+                    if let Err(e) = engine.refund(&fresh.swap_id).await {
+                        tracing::debug!(swap = %fresh.swap_id, error = %e, "v2 swap refund retry");
+                    }
                 }
                 continue;
             }

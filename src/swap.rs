@@ -1965,6 +1965,22 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
                     | SwapStatus::Refunding
             ) && engine.refundable(&rec).await
             {
+                // SETTLE-OVER-REFUND: a swap whose claim already landed on-chain must
+                // COMPLETE, never refund — even past the refund deadline. Otherwise an
+                // already-paid swap (BUY: we revealed the preimage and received the
+                // EXFER; the pool then took our BNB) is frozen mid-settlement forever,
+                // because the refund it would attempt reverts (the HTLC is already
+                // claimed) and that error is swallowed below. Authoritative on-chain
+                // check first; only fall through to refund when the claim is genuinely
+                // NOT there. This also auto-recovers swaps a prior build left stuck.
+                if matches!(rec.status, SwapStatus::PoolLocked | SwapStatus::Claiming)
+                    && engine.claim_is_confirmed(&rec).await == Some(true)
+                {
+                    if let Err(e) = engine.advance(&rec).await {
+                        tracing::warn!(swap = %rec.swap_id, error = %e, "settle-over-refund retry");
+                    }
+                    continue;
+                }
                 if let Err(e) = engine.refund(&rec.swap_id).await {
                     tracing::debug!(swap = %rec.swap_id, error = %e, "swap refund retry");
                 }

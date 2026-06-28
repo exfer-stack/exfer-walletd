@@ -1123,10 +1123,27 @@ impl SwapEngine {
         // v2: adopt the pool-generated hashlock; v1: use the one we generated.
         let hashlock = match flow {
             SwapFlow::V1 => client_hashlock.expect("v1 always generates a hashlock"),
-            SwapFlow::V2 => q
-                .hashlock
-                .clone()
-                .ok_or_else(|| Error::UpstreamUnexpected("v2 pool quote missing hashlock".into()))?,
+            // Adopt the pool-generated v2 hashlock. If it's absent, the pool is NOT
+            // v2-capable — an OLD pool ignored our flow:"v2" and returned a v1 quote
+            // — so DOWNGRADE to v1 instead of failing: the swap still works against a
+            // not-yet-upgraded pool, and the returned record carries flow=V1 so the
+            // client renders v1 guidance (it trusts the echoed flow, never the
+            // request). This makes the v1→v2 rollout order-independent. (A NEW pool
+            // with v2 explicitly disabled returns a 400 instead, which still surfaces
+            // as an error — set SWAP_V2_ENABLED=1 when you deploy the v2 pool build.)
+            SwapFlow::V2 => match q.hashlock.clone() {
+                Some(h) => h,
+                None => {
+                    tracing::info!("pool is not v2-capable (no hashlock); downgrading quote to v1");
+                    return Box::pin(self.get_quote(
+                        direction,
+                        amount_in_human.clone(),
+                        from_exfer.clone(),
+                        SwapFlow::V1,
+                    ))
+                    .await;
+                }
+            },
         };
 
         let now = now_secs();

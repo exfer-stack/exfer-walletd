@@ -85,6 +85,8 @@ impl Scope {
             | "swap_get_quote"
             | "swap_execute"
             | "swap_refund"
+            // swap_refresh force-advances a swap (may broadcast a claim) → Spend.
+            | "swap_refresh"
             | "bsc_send_bnb"
             // BSC/EVM recovery-phrase reveal exposes key material (same bar as
             // reveal_evm_private_key); key deletion can strand BNB funds.

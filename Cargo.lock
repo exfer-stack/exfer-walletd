@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "exfer-walletd"
-version = "1.15.1"
+version = "1.15.2"
 dependencies = [
  "alloy",
  "anyhow",

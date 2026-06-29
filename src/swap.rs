@@ -110,17 +110,13 @@ const MIN_BSC_LOCK_SECS: u64 = 2 * 3600;
 /// spamming the network every monitor tick).
 const CLAIM_REBROADCAST_SECS: u64 = 60;
 
-/// How long the v2 `execute` waits for the pool to front its OUT-asset lock
-/// (after `commit`) before giving up. The pool locks right after commit and
-/// SELL's BSC lock confirms in seconds, so this is generous headroom.
-const V2_POOL_LOCK_WAIT_SECS: u64 = 90;
-
-/// v2 BUY: how long to wait for the pool's EXFER lock to CONFIRM + index before
-/// locking our BNB. The pool reports `pool_locked` on broadcast, but we verify
-/// against the indexer (mined locks only) and EXFER can mine in bursts — so the
-/// safety verify retries up to this long. (A production build would move this
-/// wait into the monitor so `swap_execute` returns immediately.)
-const V2_BUY_VERIFY_WAIT_SECS: u64 = 300;
+/// How long the SELL `execute` waits inline for the pool to front its BNB lock
+/// (after `commit`) before giving up. SELL's OUT-asset is BNB, whose BSC lock
+/// confirms in seconds, so this is generous headroom; the poll breaks early the
+/// instant `pool_locked` shows. (BUY does NOT use this — its EXFER lock can take
+/// minutes to mine on bursty mainnet, so it's driven asynchronously by the
+/// monitor in `drive_v2_buy_lock` and `execute` returns `Committing` at once.)
+const V2_POOL_LOCK_WAIT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +158,12 @@ struct PoolExferLock {
 pub enum SwapStatus {
     /// Quote obtained, preimage generated, nothing locked yet.
     Quoted,
+    /// v2 BUY only: we `commit`ted and the pool is fronting its EXFER lock; we
+    /// have NOT locked our BNB yet. The monitor drives this forward (verify the
+    /// pool's lock on-chain → pre-sign → lock our BNB) so `swap_execute` returns
+    /// immediately instead of blocking for minutes while the pool's EXFER lock
+    /// mines on bursty mainnet. Nothing of ours is at risk in this state.
+    Committing,
     /// User's first leg locked on-chain.
     UserLocked,
     /// Pool mirrored the lock on the other chain.
@@ -1331,6 +1333,20 @@ impl SwapEngine {
         // 1. Commit — the pool fronts the OUT-asset lock (the asset the user wants).
         self.pool.commit(swap_id).await?;
 
+        // BUY: the pool's OUT-asset is EXFER; its lock can take MINUTES to
+        // mine+index on bursty mainnet (worse under operator-send serialization),
+        // so do NOT block `execute` on it. Record `Committing` and let the monitor
+        // (`drive_v2_buy_lock`) verify the pool's lock and lock our BNB. The user
+        // can leave right after commit — nothing of ours is locked in this state.
+        if rec.direction == Direction::BnbToExfer {
+            self.journal.update(swap_id, now_secs(), |r| {
+                r.status = SwapStatus::Committing;
+            })?;
+            return Ok(self.journal.get(swap_id).unwrap_or_else(|| rec.clone()));
+        }
+
+        // SELL keeps the inline path: the pool's OUT-asset is BNB and its BSC lock
+        // confirms in seconds, so verifying it and locking our EXFER is fast.
         // 2. Wait until the pool reports it has locked (pool_locked or beyond).
         let deadline = now_secs() + V2_POOL_LOCK_WAIT_SECS;
         loop {
@@ -1412,100 +1428,169 @@ impl SwapEngine {
                 })?;
             }
             Direction::BnbToExfer => {
-                // BUY: the pool locked EXFER (paying US). Verify it on-chain, then
-                // PRE-SIGN a claim against it while we're online, then lock our BNB,
-                // then hand the pre-signed claim to the pool — it fills in its secret
-                // and relays the EXFER, so we never come back to claim.
-                //
-                // Wait for the pool's EXFER lock to confirm + index before trusting
-                // it (the pool reports pool_locked on broadcast; the indexer needs
-                // it mined, and EXFER mines in bursts). Retry the safety verify.
-                let verify_deadline = now_secs() + V2_BUY_VERIFY_WAIT_SECS;
-                let pool_lock = loop {
-                    match self.verify_pool_exfer_lock(rec).await {
-                        Ok(pl) => break pl,
-                        Err(e) => {
-                            if now_secs() >= verify_deadline {
-                                return Err(e);
-                            }
-                            tracing::debug!(swap = %rec.swap_id, err = %e, "v2 buy: pool EXFER lock not verified yet; retry");
-                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        }
-                    }
-                };
-
-                let from = rec
-                    .our_exfer_address
-                    .clone()
-                    .ok_or_else(|| Error::Internal("missing EXFER receive-address".into()))?;
-                let signer = self.load_signer(&from).await?;
-                // Pre-sign locally (no funds move) BEFORE locking BNB, so a
-                // pre-sign failure aborts with nothing at risk.
-                let presigned = crate::tx::htlc::build_presigned_claim(
-                    &signer,
-                    hash256_from_hex(&pool_lock.lock_tx_id)?,
-                    pool_lock.output_index,
-                    crate::tx::decode_hash(&pool_lock.sender_pubkey)?,
-                    hash256_from_hex(&rec.hashlock)?,
-                    pool_lock.timeout_height,
-                    None,
-                    &self.node,
-                )
-                .await?;
-
-                // Lock our BNB (the input leg) with the pool-supplied short timeout.
-                let secret = self.store.evm_secret()?;
-                let htlc = rec
-                    .htlc_contract
-                    .clone()
-                    .ok_or_else(|| Error::Internal("missing HTLC contract".into()))?;
-                let recipient = rec
-                    .pool_bsc_address
-                    .clone()
-                    .ok_or_else(|| Error::Internal("missing pool BSC address".into()))?;
-                let timeout = rec
-                    .bsc_timeout_sec
-                    .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
-                if timeout < now_secs() + MIN_BSC_LOCK_SECS {
-                    return Err(Error::BadParams(
-                        "pool returned an unsafe (too-short) BNB lock timeout".into(),
-                    ));
-                }
-                let amount = alloy::primitives::U256::from_str_radix(&rec.amount_in_units, 10)
-                    .map_err(|e| Error::Internal(format!("bad BNB amount: {e}")))?;
-                let our_addr = secret_address(&secret)?;
-                let bnb = self.evm.bnb_balance(our_addr).await?;
-                if bnb <= amount {
-                    return Err(Error::BadParams(
-                        "not enough BNB: need the swap amount plus a little for gas".into(),
-                    ));
-                }
-                let lock_tx = {
-                    let _guard = self.bsc_lock.lock().await;
-                    self.evm
-                        .htlc_lock(&secret, &htlc, &rec.hashlock, &recipient, amount, timeout)
-                        .await?
-                };
-
-                // Hand the pre-signed claim to the pool so it can relay our EXFER.
-                // Best-effort: if this POST fails, the pool still reveals the secret
-                // when it claims our BNB, and our watchtower (or a re-POST) finishes
-                // the claim — funds are never at risk.
-                if let Err(e) = self
-                    .pool
-                    .presigned_claim(&rec.swap_id, &presigned.tx_hex, presigned.preimage_offset)
-                    .await
-                {
-                    tracing::warn!(swap = %rec.swap_id, error = %e, "v2 buy: handing pre-signed claim to pool failed; watchtower will finish");
-                }
-
-                self.journal.update(swap_id, now_secs(), |r| {
-                    r.status = SwapStatus::UserLocked;
-                    r.user_lock_tx = Some(lock_tx);
-                })?;
+                // Unreachable in practice: a v2 BUY returns `Committing` above and
+                // is driven to a lock by the monitor (`drive_v2_buy_lock`). Kept as
+                // a defensive error (never a panic) in case the early return is ever
+                // removed.
+                return Err(Error::Internal(
+                    "v2 buy reached the synchronous lock path; expected Committing".into(),
+                ));
             }
         }
         Ok(self.journal.get(swap_id).unwrap_or_else(|| rec.clone()))
+    }
+
+    /// Monitor-driven completion of a v2 BUY's lock leg. `execute` returns
+    /// `Committing` right after `commit`; this drives the rest each monitor tick:
+    /// once the pool's EXFER lock is verifiable on-chain, pre-sign a claim against
+    /// it, lock our BNB, hand the pre-signed claim to the pool, and advance to
+    /// `UserLocked`. This is what lets the user leave right after Confirm instead
+    /// of the app blocking for minutes while the pool's EXFER lock mines.
+    ///
+    /// Safety + idempotency:
+    /// - holds the per-swap lock and re-reads `Committing` (no race with execute /
+    ///   another tick);
+    /// - gives up (Failed) if there's no longer a safe margin to the pool's BSC
+    ///   timeout — we must never lock BNB we can't reclaim;
+    /// - if a BNB lock for this hashlock already exists on-chain, we locked on a
+    ///   prior tick (and crashed before recording it) → just advance, never lock
+    ///   twice;
+    /// - a not-yet-verifiable pool lock is a RETRY (return Ok), never an error.
+    async fn drive_v2_buy_lock(&self, rec: &SwapRecord) -> Result<()> {
+        let swap_lock = self.swap_lock(&rec.swap_id);
+        let _guard = swap_lock.lock().await;
+        let rec = match self.journal.get(&rec.swap_id) {
+            Some(r) if r.status == SwapStatus::Committing => r,
+            _ => return Ok(()), // already advanced by execute / a prior tick
+        };
+
+        // Safety bound: without a safe margin to the pool-supplied BSC timeout we
+        // must NOT lock our BNB (we couldn't reclaim if the swap then stalls).
+        // Give up — the pool reclaims its own EXFER lock at its timeout.
+        let bsc_timeout = rec
+            .bsc_timeout_sec
+            .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
+        if bsc_timeout < now_secs() + MIN_BSC_LOCK_SECS {
+            self.journal.update(&rec.swap_id, now_secs(), |r| {
+                r.status = SwapStatus::Failed;
+                if r.error.is_none() {
+                    r.error =
+                        Some("buy aborted: pool did not lock in time to safely lock our BNB".into());
+                }
+            })?;
+            return Ok(());
+        }
+
+        // Mirror a pool-side abort and stop.
+        if let Ok(pj) = self.pool.get_swap(&rec.swap_id).await {
+            match pj.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                "failed" | "expired" => {
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::Failed;
+                        if r.error.is_none() {
+                            r.error = Some("pool aborted the buy before we locked".into());
+                        }
+                    })?;
+                    return Ok(());
+                }
+                "refunded" => {
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::Refunded;
+                    })?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // Crash-idempotency: if a BNB lock for this hashlock already exists, we
+        // locked on a prior tick — advance, don't lock again.
+        if let Some(htlc) = rec.htlc_contract.as_deref() {
+            if let Ok(oc) = self.evm.get_htlc_swap(htlc, &rec.hashlock).await {
+                if !matches!(oc.state, crate::evm::HtlcState::None) {
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::UserLocked;
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Verify the pool's EXFER lock (mined+indexed, pays us, covers the quote,
+        // safe reclaim margin). Not ready yet → retry next tick (bursty mainnet).
+        let pool_lock = match self.verify_pool_exfer_lock(&rec).await {
+            Ok(pl) => pl,
+            Err(e) => {
+                tracing::debug!(swap = %rec.swap_id, err = %e, "v2 buy: pool EXFER lock not verifiable yet; retry next tick");
+                return Ok(());
+            }
+        };
+
+        // Pre-sign locally (no funds move) BEFORE locking BNB.
+        let from = rec
+            .our_exfer_address
+            .clone()
+            .ok_or_else(|| Error::Internal("missing EXFER receive-address".into()))?;
+        let signer = self.load_signer(&from).await?;
+        let presigned = crate::tx::htlc::build_presigned_claim(
+            &signer,
+            hash256_from_hex(&pool_lock.lock_tx_id)?,
+            pool_lock.output_index,
+            crate::tx::decode_hash(&pool_lock.sender_pubkey)?,
+            hash256_from_hex(&rec.hashlock)?,
+            pool_lock.timeout_height,
+            None,
+            &self.node,
+        )
+        .await?;
+
+        // Lock our BNB (the input leg) with the pool-supplied short timeout.
+        let secret = self.store.evm_secret()?;
+        let htlc = rec
+            .htlc_contract
+            .clone()
+            .ok_or_else(|| Error::Internal("missing HTLC contract".into()))?;
+        let recipient = rec
+            .pool_bsc_address
+            .clone()
+            .ok_or_else(|| Error::Internal("missing pool BSC address".into()))?;
+        let amount = alloy::primitives::U256::from_str_radix(&rec.amount_in_units, 10)
+            .map_err(|e| Error::Internal(format!("bad BNB amount: {e}")))?;
+        let our_addr = secret_address(&secret)?;
+        let bnb = self.evm.bnb_balance(our_addr).await?;
+        if bnb <= amount {
+            self.journal.update(&rec.swap_id, now_secs(), |r| {
+                r.status = SwapStatus::Failed;
+                if r.error.is_none() {
+                    r.error =
+                        Some("not enough BNB: need the swap amount plus a little for gas".into());
+                }
+            })?;
+            return Ok(());
+        }
+        let lock_tx = {
+            let _g = self.bsc_lock.lock().await;
+            self.evm
+                .htlc_lock(&secret, &htlc, &rec.hashlock, &recipient, amount, bsc_timeout)
+                .await?
+        };
+
+        // Hand the pre-signed claim to the pool so it can relay our EXFER.
+        // Best-effort (the pool reveals the secret when it claims our BNB; the
+        // watchtower / a re-POST finishes the claim — funds are never at risk).
+        if let Err(e) = self
+            .pool
+            .presigned_claim(&rec.swap_id, &presigned.tx_hex, presigned.preimage_offset)
+            .await
+        {
+            tracing::warn!(swap = %rec.swap_id, error = %e, "v2 buy: handing pre-signed claim to pool failed; watchtower will finish");
+        }
+
+        self.journal.update(&rec.swap_id, now_secs(), |r| {
+            r.status = SwapStatus::UserLocked;
+            r.user_lock_tx = Some(lock_tx);
+        })?;
+        Ok(())
     }
 
     /// Funds-safety gate (sell direction): verify the pool's BNB lock exists
@@ -1628,6 +1713,12 @@ impl SwapEngine {
     /// Funds safety is independent of this display status — the user's own lock
     /// is always protected by the journal-independent sweep + its refund arm.
     async fn advance_v2(&self, rec: &SwapRecord) -> Result<()> {
+        // v2 BUY still in `Committing`: `execute` only committed; the monitor
+        // drives the verify → pre-sign → lock-our-BNB sequence here. Once it
+        // advances to UserLocked, later ticks fall through to the reconcile below.
+        if rec.status == SwapStatus::Committing {
+            return self.drive_v2_buy_lock(rec).await;
+        }
         let pj = match self.pool.get_swap(&rec.swap_id).await {
             Ok(v) => v,
             Err(e) => {

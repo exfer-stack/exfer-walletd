@@ -413,14 +413,74 @@ impl ExferNode {
     }
 
     pub async fn send_raw_transaction(&self, tx_hex: &str) -> Result<SendRawResponse> {
+        // Map a recognised double-spend / input-conflict reject to the
+        // typed `-32021 DoubleSpendRejected` so EVERY operator-key
+        // spender (htlc_lock via broadcast_built, transfer, spend_htlc)
+        // gets the same deterministic signal. Unrecognised rejects still
+        // surface as `-32020`.
         let v = self
             .call(
                 "send_raw_transaction",
                 serde_json::json!({ "tx_hex": tx_hex }),
             )
-            .await?;
+            .await
+            .map_err(classify_send_error)?;
         serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
     }
+
+    /// Like [`Self::get_transaction`] but tolerant of "transaction not
+    /// found": a node that doesn't know the tx (evicted from mempool,
+    /// never seen, or lagging) answers with an application error whose
+    /// message says so, or `-32601`. The lock-confirmation watchdog uses
+    /// this to distinguish "confirmed / still in mempool" (keep) from
+    /// "gone" (rebroadcast), without treating a not-found as fatal.
+    pub async fn get_transaction_opt(&self, tx_id_hex: &str) -> Result<Option<TxStatus>> {
+        match self.get_transaction(tx_id_hex).await {
+            Ok(s) => Ok(Some(s)),
+            Err(Error::UpstreamRpc { code: -32601, .. }) => Ok(None),
+            Err(Error::UpstreamRpc { message, .. }) | Err(Error::UpstreamUnexpected(message))
+                if {
+                    let m = message.to_lowercase();
+                    m.contains("not found") || m.contains("unknown transaction")
+                } =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Phrases (case-insensitive substring) that mark a node's broadcast
+/// reject as an input-conflict / double-spend. Kept conservative — a
+/// phrasing not listed here still surfaces as a generic `-32020` so a
+/// transient transport-ish error is never mislabeled as a permanent
+/// conflict.
+const DOUBLE_SPEND_PHRASES: &[&str] = &[
+    "double spend",
+    "double-spend",
+    "already spent",
+    "already in chain",
+    "input already",
+    "missing input",
+    "conflict",
+    "txn-mempool-conflict",
+];
+
+/// Reclassify a broadcast error: an [`Error::UpstreamRpc`] whose message
+/// matches a known double-spend phrase becomes the typed
+/// [`Error::DoubleSpendRejected`] (`-32021`); everything else passes
+/// through unchanged.
+pub(crate) fn classify_send_error(e: Error) -> Error {
+    if let Error::UpstreamRpc { message, .. } = &e {
+        let m = message.to_lowercase();
+        if DOUBLE_SPEND_PHRASES.iter().any(|p| m.contains(p)) {
+            return Error::DoubleSpendRejected {
+                message: message.clone(),
+            };
+        }
+    }
+    e
 }
 
 // ============================================================================
@@ -623,6 +683,42 @@ impl AddressMempoolEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_send_error_maps_known_double_spend_phrases() {
+        for phrase in [
+            "double spend detected",
+            "txn-mempool-conflict",
+            "input already spent",
+            "missing input for tx",
+            "already in chain",
+            "output conflict",
+        ] {
+            let e = classify_send_error(Error::UpstreamRpc {
+                code: -32020,
+                message: format!("node says: {phrase}"),
+            });
+            assert!(
+                matches!(e, Error::DoubleSpendRejected { .. }),
+                "phrase {phrase:?} should classify as double-spend"
+            );
+            assert_eq!(e.rpc_code(), -32021);
+        }
+    }
+
+    #[test]
+    fn classify_send_error_passes_through_generic_and_non_rpc() {
+        // Unrecognised reject stays -32020.
+        let e = classify_send_error(Error::UpstreamRpc {
+            code: -32020,
+            message: "temporary upstream hiccup".into(),
+        });
+        assert!(matches!(e, Error::UpstreamRpc { .. }));
+        assert_eq!(e.rpc_code(), -32020);
+        // Non-RPC errors pass through untouched.
+        let e2 = classify_send_error(Error::UpstreamUnreachable("conn refused".into()));
+        assert!(matches!(e2, Error::UpstreamUnreachable(_)));
+    }
 
     // The node's `get_address_mempool` JSON, captured verbatim, must
     // round-trip into AddressMempoolResponse and the pending sums must

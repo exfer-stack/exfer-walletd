@@ -93,6 +93,7 @@ async fn make_ctx(mock: &MockServer, initial_tip: u64) -> Ctx {
         allowance: std::sync::Arc::new(
             exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
         ),
+        lock_watch: None,
     };
     Ctx {
         state,

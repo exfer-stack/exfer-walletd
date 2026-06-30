@@ -40,6 +40,7 @@ fn capped_state(caps: AllowanceCaps) -> (ApiState, tempfile::TempDir) {
         events: exfer_walletd::sse_client::WalletEvents::new(),
         engine: None,
         allowance: Arc::new(AllowanceLedger::in_memory(caps).unwrap()),
+        lock_watch: None,
     };
     (state, wallet_dir)
 }

@@ -297,6 +297,38 @@ pub async fn run_embedded(
 
     let inflight = Arc::new(InFlightUtxos::new());
 
+    // Startup reconcile: seed the in-flight reservation set from each
+    // managed address's mempool so a bounce mid-burst can't re-collide with
+    // a still-unconfirmed pre-restart lock. Best-effort — NEVER fails boot
+    // (matches the embedded-app walletd contract). When the upstream
+    // predates get_address_mempool, hold htlc_lock for one block instead.
+    if cfg.inflight_reconcile {
+        match crate::inflight::reconcile_from_mempool(inflight.as_ref(), store.as_ref(), node.as_ref())
+            .await
+        {
+            Ok((seeded, true)) => {
+                tracing::info!(seeded, "inflight reconciled from mempool")
+            }
+            Ok((_, false)) => {
+                inflight.hold_locks_until(
+                    std::time::Instant::now() + crate::inflight::LOCK_HOLD_SECS,
+                );
+                tracing::warn!("mempool RPC unavailable; holding htlc_lock one block");
+            }
+            Err(e) => tracing::warn!(%e, "inflight reconcile failed; continuing"),
+        }
+    }
+
+    // Lock-confirmation watchdog — only when --lock-watchdog is set (the
+    // pool sidecar). Tracks each just-broadcast operator HTLC lock and
+    // rebroadcasts it on mempool eviction. Spawned below once `node` is
+    // shared into the ApiState.
+    let lock_watch = if cfg.lock_watchdog {
+        Some(Arc::new(crate::lock_watch::LockWatch::new()))
+    } else {
+        None
+    };
+
     // Cross-chain swap engine — only when --swap-pool is configured. Opens the
     // encrypted journal (recovering any in-flight swaps) and spawns the monitor
     // that advances them to settlement / timeout-refund.
@@ -327,6 +359,18 @@ pub async fn run_embedded(
         None => None,
     };
 
+    // Spawn the lock watchdog (sibling of the swap monitor) before moving
+    // `node`/`inflight` into the ApiState.
+    if let Some(lw) = lock_watch.clone() {
+        let wd_node = node.clone();
+        let wd_inflight = inflight.clone();
+        let wd_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            crate::lock_watch::run_lock_watchdog(lw, wd_node, wd_inflight, wd_shutdown).await
+        });
+        tracing::info!("lock-confirmation watchdog enabled");
+    }
+
     let api = ApiState {
         store,
         node,
@@ -338,6 +382,7 @@ pub async fn run_embedded(
         events: events.clone(),
         engine,
         allowance,
+        lock_watch,
     };
     let app_state = AppState {
         api,

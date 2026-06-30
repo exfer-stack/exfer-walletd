@@ -31,7 +31,7 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::inflight::InFlightUtxos;
 use crate::store::Signer;
-use crate::tx::{build_only, build_sign_broadcast, CoreOutput, FeeChoice};
+use crate::tx::{broadcast_built, build_only, CoreOutput, FeeChoice};
 use crate::upstream::ExferNode;
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +84,11 @@ pub struct HtlcSpendReceipt {
 
 /// Lock `amount` behind an HTLC payable to `receiver_pubkey` against
 /// `hash_lock`, refundable to the signer after `timeout`.
+///
+/// When `lock_watch` is `Some`, the just-broadcast lock is registered for
+/// the confirmation watchdog (rebroadcast on mempool eviction). The
+/// registration is best-effort and happens after a successful broadcast
+/// but before `guard.commit()` — it never alters the lock result.
 #[allow(clippy::too_many_arguments)]
 pub async fn htlc_lock(
     signer: &Signer,
@@ -95,6 +100,7 @@ pub async fn htlc_lock(
     max_fee: u64,
     node: &ExferNode,
     inflight: &InFlightUtxos,
+    lock_watch: Option<&crate::lock_watch::LockWatch>,
 ) -> Result<HtlcLockReceipt> {
     let program = build_htlc_program(&signer.pubkey(), &receiver_pubkey, &hash_lock, timeout);
     let script = serialize_program(&program);
@@ -102,22 +108,42 @@ pub async fn htlc_lock(
         script,
         value: amount,
     }];
-    let core =
-        build_sign_broadcast(signer, outputs, None, fee_choice, max_fee, node, inflight).await?;
+
+    // build_only + broadcast_built (instead of build_sign_broadcast) so we
+    // retain the BuiltTx and can register it with the watchdog after the
+    // broadcast succeeds and before committing the inflight reservation.
+    let (built, guard) =
+        build_only(signer, outputs, None, fee_choice, max_fee, node, inflight).await?;
+    broadcast_built(node, &built).await?;
+
+    // Best-effort watchdog registration. Must never fail the lock (it has
+    // already broadcast): serialization is infallible in practice here, but
+    // we degrade to "not watched" rather than propagate.
+    if let Some(w) = lock_watch {
+        if let Ok(bytes) = built.tx.serialize() {
+            w.register(
+                hex::encode(built.tx_id.as_bytes()),
+                hex::encode(bytes),
+                built.selected.iter().map(|(op, _)| *op).collect(),
+            );
+        }
+    }
+
+    guard.commit();
 
     Ok(HtlcLockReceipt {
-        tx_id: core.tx_id_hex,
+        tx_id: hex::encode(built.tx_id.as_bytes()),
         htlc_output_index: 0,
         amount,
         hash_lock: hex::encode(hash_lock.as_bytes()),
         timeout,
         receiver: hex::encode(receiver_pubkey),
-        size: core.size,
-        fee: core.effective_fee,
-        fee_rate: core.fee_rate,
-        built_at_height: core.built_at_height,
-        change: if core.has_change {
-            Some(core.change_value)
+        size: built.size,
+        fee: built.effective_fee,
+        fee_rate: built.fee_rate,
+        built_at_height: built.built_at_height,
+        change: if built.has_change {
+            Some(built.change_value)
         } else {
             None
         },

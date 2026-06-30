@@ -63,6 +63,7 @@ pub mod idempotency;
 pub mod index;
 pub mod indexer;
 pub mod inflight;
+pub mod lock_watch;
 pub mod payment_uri;
 pub mod server;
 pub mod sse_client;

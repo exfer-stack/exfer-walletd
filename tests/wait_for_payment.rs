@@ -155,6 +155,7 @@ async fn wait_for_payment_returns_on_sse_nudge() {
         allowance: std::sync::Arc::new(
             exfer_walletd::allowance::AllowanceLedger::in_memory(Default::default()).unwrap(),
         ),
+        lock_watch: None,
     };
 
     let req = RpcRequest {

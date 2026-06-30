@@ -1254,6 +1254,7 @@ impl SwapEngine {
                     crate::api::DEFAULT_MAX_FEE,
                     &self.node,
                     &self.inflight,
+                    None,
                 )
                 .await?;
                 self.pool
@@ -1464,6 +1465,7 @@ impl SwapEngine {
             crate::api::DEFAULT_MAX_FEE,
             &self.node,
             &self.inflight,
+            None,
         )
         .await?;
         self.journal.update(&rec.swap_id, now_secs(), |r| {
@@ -2759,6 +2761,7 @@ mod tests {
             swap_id: id.into(),
             direction: Direction::ExferToBnb,
             status: SwapStatus::Quoted,
+            flow: SwapFlow::default(),
             hashlock: "0x".to_string() + &"ab".repeat(32),
             preimage: "0x".to_string() + &"cd".repeat(32),
             amount_in: "1.0".into(),

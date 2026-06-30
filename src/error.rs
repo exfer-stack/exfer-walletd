@@ -16,6 +16,11 @@
 //! | `-32020..-32029`| Upstream node            |
 //! | `-32030..-32039`| Transaction / fee        |
 //! | `-32040..`      | Reserved                 |
+//!
+//! Within those ranges, currently used: `-32020` (upstream RPC),
+//! `-32021` (double-spend reject, see [`Error::DoubleSpendRejected`]),
+//! and the full `-32030..-32038` transaction set plus `-32039`
+//! (in-flight exhausted, see [`Error::InFlightExhausted`]).
 
 use std::io;
 
@@ -89,6 +94,17 @@ pub enum Error {
     #[error("upstream returned unexpected response: {0}")]
     UpstreamUnexpected(String),
 
+    /// The node rejected a broadcast because one of the inputs is
+    /// already spent (a double-spend / input-conflict). Distinct typed
+    /// code so the pool's idempotent-retry guard treats it as
+    /// **non-retryable-blind**: it MUST reconcile via address history /
+    /// mempool before any retry, never blind-retry (a blind retry would
+    /// re-select the same outpoints and conflict again). This is a
+    /// best-effort upgrade of a subset of `-32020` reject phrasings; an
+    /// unrecognised reject still surfaces as `-32020`.
+    #[error("input already spent (node rejected as double-spend): {message}")]
+    DoubleSpendRejected { message: String },
+
     // ---- transaction / fee ----------------------------------------------
     #[error("transaction build failed: {0}")]
     TxBuild(String),
@@ -106,6 +122,26 @@ pub enum Error {
         utxo_count: usize,
         /// Sum of UTXOs that exist on chain but are claimed by other
         /// in-flight transfers from this daemon.
+        in_flight_value: u64,
+        /// Count of in-flight outpoints that fed `in_flight_value`.
+        in_flight_count: usize,
+    },
+
+    /// Funds exist on this address but **this daemon** has them reserved
+    /// in its own pending (in-flight) locks — a *transient* shortfall
+    /// that clears as those locks confirm. Distinct from
+    /// [`Error::InsufficientBalance`] (a *genuine* shortfall: the wallet
+    /// is actually short even counting reserved value) so a caller —
+    /// notably the swap pool's BUY pool-lock — can branch deterministically
+    /// on the error CODE (`-32039`) and re-tick after the next block
+    /// instead of marking the swap failed.
+    #[error("{}", in_flight_exhausted_message(*needed, *available, *in_flight_value, *in_flight_count))]
+    InFlightExhausted {
+        /// `amount + fee` — what the lock/transfer asked for.
+        needed: u64,
+        /// Sum of UTXOs spendable right now (post in-flight filter).
+        available: u64,
+        /// Sum of UTXOs this daemon has reserved in pending locks.
         in_flight_value: u64,
         /// Count of in-flight outpoints that fed `in_flight_value`.
         in_flight_count: usize,
@@ -195,6 +231,41 @@ pub enum Error {
 }
 
 impl Error {
+    /// Classify a coin-selection shortfall as *transient* (this daemon's
+    /// own in-flight reservations are hiding otherwise-spendable funds —
+    /// [`Error::InFlightExhausted`], code `-32039`, retryable) versus
+    /// *genuine* (the wallet is actually short even counting reserved
+    /// value — [`Error::InsufficientBalance`], code `-32031`).
+    ///
+    /// Predicate: transient iff `in_flight_count > 0` AND
+    /// `available + in_flight_value >= needed` (the funds exist, this
+    /// daemon just reserved them). Otherwise genuine.
+    pub fn classify_shortfall(
+        needed: u64,
+        available: u64,
+        utxo_count: usize,
+        in_flight_value: u64,
+        in_flight_count: usize,
+    ) -> Error {
+        let covered_with_inflight = available.saturating_add(in_flight_value);
+        if in_flight_count > 0 && covered_with_inflight >= needed {
+            Error::InFlightExhausted {
+                needed,
+                available,
+                in_flight_value,
+                in_flight_count,
+            }
+        } else {
+            Error::InsufficientBalance {
+                needed,
+                available,
+                utxo_count,
+                in_flight_value,
+                in_flight_count,
+            }
+        }
+    }
+
     /// JSON-RPC 2.0 error code.
     pub fn rpc_code(&self) -> i32 {
         match self {
@@ -214,6 +285,7 @@ impl Error {
             Error::UpstreamUnreachable(_)
             | Error::UpstreamRpc { .. }
             | Error::UpstreamUnexpected(_) => -32020,
+            Error::DoubleSpendRejected { .. } => -32021,
             Error::TxBuild(_) => -32030,
             Error::InsufficientBalance { .. } => -32031,
             Error::FeeTooHigh { .. } => -32032,
@@ -223,6 +295,7 @@ impl Error {
             Error::HtlcOutputAuth(_) => -32036,
             Error::TimeoutNotReached { .. } => -32037,
             Error::AllowanceExceeded { .. } => -32038,
+            Error::InFlightExhausted { .. } => -32039,
             Error::WaitTimeout { .. } => -32040,
             Error::IndexerNotConfigured => -32041,
             Error::TxSerialize(_) | Error::Wallet(_) | Error::Io(_) | Error::Internal(_) => -32603,
@@ -259,6 +332,23 @@ impl Error {
                 "utxo_count":       utxo_count,
                 "in_flight_value":  in_flight_value,
                 "in_flight_count":  in_flight_count,
+            })),
+            Error::InFlightExhausted {
+                needed,
+                available,
+                in_flight_value,
+                in_flight_count,
+            } => Some(json!({
+                "retryable":        true,
+                "retry_after":      "next_block",
+                "needed":           needed,
+                "available":        available,
+                "in_flight_value":  in_flight_value,
+                "in_flight_count":  in_flight_count,
+            })),
+            Error::DoubleSpendRejected { .. } => Some(json!({
+                "input_conflict": true,
+                "retryable":      false,
             })),
             Error::FeeTooHigh { fee, max_fee } => Some(json!({
                 "fee": fee,
@@ -328,6 +418,20 @@ fn insufficient_balance_message(
     s
 }
 
+/// Build the human-readable `InFlightExhausted` message.
+fn in_flight_exhausted_message(
+    needed: u64,
+    available: u64,
+    in_flight_value: u64,
+    in_flight_count: usize,
+) -> String {
+    format!(
+        "funding temporarily exhausted: need {needed} exfers, {available} spendable now; \
+         {in_flight_count} UTXO(s) worth {in_flight_value} reserved by this daemon's pending \
+         locks — retry after next block"
+    )
+}
+
 /// Build the human-readable `AllowanceExceeded` message for both ceilings.
 fn allowance_exceeded_message(
     scope: &str,
@@ -346,5 +450,49 @@ fn allowance_exceeded_message(
             "spend allowance exceeded: per-transaction cap {limit} exfers, \
              this request {requested}"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_shortfall_picks_in_flight_exhausted_when_reserved_covers() {
+        // Funds exist but this daemon reserved them → transient -32039.
+        let e = Error::classify_shortfall(100, 40, 1, 70, 2);
+        assert!(matches!(e, Error::InFlightExhausted { .. }));
+        assert_eq!(e.rpc_code(), -32039);
+        let d = e.rpc_data().unwrap();
+        assert_eq!(d["retryable"], serde_json::json!(true));
+        assert_eq!(d["retry_after"], serde_json::json!("next_block"));
+        assert_eq!(d["in_flight_count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn classify_shortfall_picks_insufficient_when_genuinely_short() {
+        // Even counting reserved value the wallet is short → genuine -32031.
+        let e = Error::classify_shortfall(100, 40, 1, 10, 1);
+        assert!(matches!(e, Error::InsufficientBalance { .. }));
+        assert_eq!(e.rpc_code(), -32031);
+    }
+
+    #[test]
+    fn classify_shortfall_no_in_flight_is_genuine() {
+        // No reservations at all → genuine regardless of arithmetic.
+        let e = Error::classify_shortfall(100, 40, 1, 0, 0);
+        assert!(matches!(e, Error::InsufficientBalance { .. }));
+        assert_eq!(e.rpc_code(), -32031);
+    }
+
+    #[test]
+    fn double_spend_rejected_code_and_data() {
+        let e = Error::DoubleSpendRejected {
+            message: "txn-mempool-conflict".into(),
+        };
+        assert_eq!(e.rpc_code(), -32021);
+        let d = e.rpc_data().unwrap();
+        assert_eq!(d["input_conflict"], serde_json::json!(true));
+        assert_eq!(d["retryable"], serde_json::json!(false));
     }
 }

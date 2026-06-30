@@ -436,13 +436,16 @@ pub(crate) async fn build_only<'a>(
                 }
 
                 if accumulated < needed {
-                    return Err(Error::InsufficientBalance {
+                    // Split transient (this daemon's own reservations are
+                    // hiding spendable funds → -32039 InFlightExhausted,
+                    // retryable) from genuine shortfall (→ -32031).
+                    return Err(Error::classify_shortfall(
                         needed,
-                        available: spendable_total,
-                        utxo_count: spendable_count,
+                        spendable_total,
+                        spendable_count,
                         in_flight_value,
                         in_flight_count,
-                    });
+                    ));
                 }
                 Ok((chosen_outpoints, chosen))
             });

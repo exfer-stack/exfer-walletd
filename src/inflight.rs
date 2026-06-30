@@ -34,6 +34,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use exfer::types::transaction::OutPoint;
+use exfer::types::Hash256;
+
+use crate::error::Result;
+use crate::store::WalletStore;
+use crate::upstream::ExferNode;
 
 /// Auto-eviction interval. Comfortably longer than typical chain block
 /// time so a normal transfer's UTXOs stay claimed until well after the
@@ -41,9 +46,20 @@ use exfer::types::transaction::OutPoint;
 /// a broken upstream doesn't permanently block its own wallets.
 const TTL: Duration = Duration::from_secs(600);
 
+/// How long, after a boot that could not reconcile reservations from the
+/// mempool (the upstream predates `get_address_mempool`), `htlc_lock` is
+/// briefly held off so a restart mid-burst can't re-select an outpoint a
+/// still-unconfirmed pre-restart lock already consumed. Sized to comfortably
+/// exceed one EXFER block (~9s); on a slower-block node, raise it.
+pub const LOCK_HOLD_SECS: Duration = Duration::from_secs(12);
+
 #[derive(Default)]
 pub struct InFlightUtxos {
     pending: Mutex<HashMap<OutPoint, Instant>>,
+    /// When `Some(t)` and `now < t`, `htlc_lock` is held off (returns a
+    /// retryable `InFlightExhausted`). Set only by the boot reconcile
+    /// fallback; never blocks claims/reclaims/transfers.
+    ready_at: Mutex<Option<Instant>>,
 }
 
 impl InFlightUtxos {
@@ -98,6 +114,20 @@ impl InFlightUtxos {
         self.len() == 0
     }
 
+    /// Hold `htlc_lock` off until instant `t` (boot-reconcile fallback).
+    pub fn hold_locks_until(&self, t: Instant) {
+        *self.ready_at.lock().unwrap() = Some(t);
+    }
+
+    /// True iff `htlc_lock` is currently being held off (boot grace
+    /// window not yet elapsed). Claims/reclaims/transfers ignore this.
+    pub fn locks_held(&self) -> bool {
+        match *self.ready_at.lock().unwrap() {
+            Some(t) => Instant::now() < t,
+            None => false,
+        }
+    }
+
     /// Atomic "snapshot pending set, run caller's selection, claim the
     /// chosen outpoints." All three happen under one Mutex acquisition,
     /// so two concurrent transfers from the same wallet can't both
@@ -137,6 +167,56 @@ impl InFlightUtxos {
             value,
         ))
     }
+}
+
+/// Seed the in-flight reservation set from the operator address(es)'
+/// **mempool** at startup. Because `InFlightUtxos` is in-memory, a daemon
+/// bounce mid-burst would otherwise drop every reservation and a fresh
+/// selection could re-collide with a still-unconfirmed pre-restart lock.
+/// This claims each outpoint that an unconfirmed tx is spending out of a
+/// managed address, so the next `htlc_lock` skips them — exactly the
+/// outpoints a naive selection must avoid.
+///
+/// Returns `(outpoints_seeded, mempool_rpc_available)`. When the upstream
+/// predates `get_address_mempool` (`-32601` → `Ok(None)`), availability is
+/// `false` and the caller applies the one-block hold fallback instead.
+///
+/// Pure-additive: this only ever **claims** (reserves); it never spends.
+/// Best-effort and bounded by the managed-address count (1 for the pool
+/// sidecar).
+pub async fn reconcile_from_mempool(
+    inflight: &InFlightUtxos,
+    store: &dyn WalletStore,
+    node: &ExferNode,
+) -> Result<(usize, bool)> {
+    let mut seeded = 0usize;
+    let mut available = true;
+    for entry in store.list()? {
+        match node.get_address_mempool_opt(&entry.address).await? {
+            Some(resp) => {
+                let mut ops: Vec<OutPoint> = Vec::new();
+                for tx in &resp.mempool {
+                    for s in &tx.spent {
+                        // `MempoolSpent.tx_id`/`output_index` identify
+                        // THIS address's own output being consumed by an
+                        // unconfirmed tx — the outpoint a fresh selection
+                        // must not re-pick.
+                        let bytes = crate::tx::decode_hash(&s.tx_id)?;
+                        ops.push(OutPoint {
+                            tx_id: Hash256(bytes),
+                            output_index: s.output_index,
+                        });
+                    }
+                }
+                if !ops.is_empty() {
+                    inflight.claim(&ops);
+                    seeded += ops.len();
+                }
+            }
+            None => available = false,
+        }
+    }
+    Ok((seeded, available))
 }
 
 /// RAII guard that releases claimed outpoints on drop unless `commit`
@@ -196,6 +276,19 @@ mod tests {
         f.release(&[a]);
         assert_eq!(f.len(), 1);
         assert!(f.pending().contains(&b));
+    }
+
+    #[test]
+    fn locks_held_gate_defaults_open_and_respects_deadline() {
+        let f = InFlightUtxos::new();
+        // No hold set → open.
+        assert!(!f.locks_held());
+        // Future deadline → held.
+        f.hold_locks_until(Instant::now() + Duration::from_secs(60));
+        assert!(f.locks_held());
+        // Past deadline → open again.
+        f.hold_locks_until(Instant::now() - Duration::from_secs(1));
+        assert!(!f.locks_held());
     }
 
     #[test]

@@ -259,6 +259,40 @@ pub struct Config {
     /// consulted when that cap is set. Defaults to one day.
     #[arg(long, env = "WALLETD_SPEND_CAP_PERIOD_SECS", default_value_t = 86_400)]
     pub spend_cap_period_secs: u64,
+
+    /// On startup, seed the in-flight UTXO reservation set from each
+    /// managed address's mempool, so a daemon bounce mid-burst can't
+    /// re-select an outpoint a still-unconfirmed pre-restart lock already
+    /// consumed. Best-effort; never fails boot. Default on (cheap for the
+    /// single-address pool sidecar; the embedded apps with many addresses
+    /// can disable it).
+    ///
+    /// As an env var, accepts `1` / `true` / `yes` / `on`.
+    #[arg(
+        long,
+        env = "WALLETD_INFLIGHT_RECONCILE",
+        value_parser = parse_lenient_bool,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub inflight_reconcile: bool,
+
+    /// Run the lock-confirmation watchdog: track each just-broadcast
+    /// operator HTLC lock and rebroadcast it if the node evicts it from
+    /// the mempool. Default off so the embedded mobile/desktop walletds
+    /// add no polling; the pool sidecar deploy turns it on.
+    ///
+    /// As an env var, accepts `1` / `true` / `yes` / `on`.
+    #[arg(
+        long,
+        env = "WALLETD_LOCK_WATCHDOG",
+        value_parser = parse_lenient_bool,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    pub lock_watchdog: bool,
 }
 
 impl Config {
@@ -371,6 +405,8 @@ mod tests {
             spend_cap_per_tx: None,
             spend_cap_per_period: None,
             spend_cap_period_secs: 86_400,
+            inflight_reconcile: true,
+            lock_watchdog: false,
         }
     }
 

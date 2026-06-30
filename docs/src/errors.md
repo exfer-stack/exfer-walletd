@@ -32,6 +32,7 @@ high digit:
 | `-32011` | 200  | Wallet exists         | Address collision on `import` (cosmically rare for derived).             |
 | `-32012` | 200  | Keystore locked       | Wrong passphrase / corrupted seed file.                                  |
 | `-32020` | 200  | Upstream              | Upstream node unreachable, or returned an RPC error; message intact.     |
+| `-32021` | 200  | Double-spend reject   | A broadcast was rejected because an input is already spent (input-conflict). `data` carries `{input_conflict:true, retryable:false}`. The caller MUST reconcile via address history / mempool before any retry — a blind retry re-selects the same outpoints and conflicts again. A best-effort upgrade of a subset of `-32020` reject phrasings. |
 | `-32030` | 200  | Tx build              | Transaction construction failed (param overflow, encoding error, etc.).  |
 | `-32031` | 200  | Insufficient balance  | Walletd can't cover `amount + fee` from spendable UTXOs.                 |
 | `-32032` | 200  | Fee too high          | Computed fee exceeds the `max_fee` cap on `transfer`.                    |
@@ -40,6 +41,7 @@ high digit:
 | `-32035` | 200  | Idempotency conflict  | `transfer.client_token` reused with different params.                    |
 | `-32036` | 200  | HTLC output auth      | On `htlc_claim`/`htlc_reclaim`, the on-chain output doesn't match the locally reconstructed HTLC script (wrong preimage/sender/receiver/hash/timeout, or a lying node). Nothing is broadcast. |
 | `-32037` | 200  | Timeout not reached   | `htlc_reclaim` attempted before the refund timeout (`current_height ≤ timeout`).             |
+| `-32039` | 200  | In-flight exhausted   | Funds exist on the address but THIS daemon has them reserved in its own pending locks — a transient shortfall that clears as those locks confirm. `data` carries `{retryable:true, retry_after:"next_block", needed, available, in_flight_value, in_flight_count}`. Retry after the next block (the swap pool's BUY pool-lock re-ticks on this code). Distinct from `-32031`, which is a genuine shortfall. |
 | `-32040` | 200  | Wait timeout          | `wait_for_tx` budget expired before the tx reached `min_confirmations`. `data` carries `{tx_id, min_confirmations, elapsed_secs}`. Retry is safe. |
 
 ## `-32031` insufficient balance

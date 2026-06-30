@@ -113,6 +113,8 @@ fn build_config(datadir: std::path::PathBuf) -> Config {
         spend_cap_per_tx: None,
         spend_cap_per_period: None,
         spend_cap_period_secs: 86_400,
+        inflight_reconcile: true,
+        lock_watchdog: false,
     }
 }
 

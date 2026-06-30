@@ -71,6 +71,11 @@ pub struct ApiState {
     /// per-period EXFER spend ceilings on `transfer` / `htlc_lock`. Inert
     /// (always allows) when no `--spend-cap-*` flags are set.
     pub allowance: Arc<crate::allowance::AllowanceLedger>,
+    /// Lock-confirmation watchdog. `Some` only when `--lock-watchdog` is
+    /// set (the pool sidecar deploy); rebroadcasts an evicted operator
+    /// HTLC lock so it isn't silently lost. `None` for the embedded
+    /// mobile/desktop walletds (no extra polling).
+    pub lock_watch: Option<Arc<crate::lock_watch::LockWatch>>,
 }
 
 // ============================================================================
@@ -983,6 +988,21 @@ async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
     };
     let max_fee = p.max_fee.unwrap_or(DEFAULT_MAX_FEE);
 
+    // Boot grace gate: if a startup reconcile couldn't seed reservations
+    // from the mempool, `htlc_lock` is briefly held off so a restart
+    // mid-burst can't re-collide with a still-unconfirmed pre-restart
+    // lock. Surfaces as the same retryable -32039 the pool re-ticks on.
+    // Gate ONLY htlc_lock (the collision surface); claims/reclaims/
+    // transfers are unaffected.
+    if state.inflight.locks_held() {
+        return Err(Error::InFlightExhausted {
+            needed: p.amount,
+            available: 0,
+            in_flight_value: 0,
+            in_flight_count: 0,
+        });
+    }
+
     let receiver = crate::tx::decode_hash(&p.receiver)?;
     let hash_lock = exfer::types::Hash256(crate::tx::decode_hash(&p.hash_lock)?);
 
@@ -1006,6 +1026,7 @@ async fn htlc_lock_method(state: &ApiState, params: Value) -> Result<Value> {
         max_fee,
         &state.node,
         &state.inflight,
+        state.lock_watch.as_deref(),
     )
     .await
     {

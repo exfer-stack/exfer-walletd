@@ -84,6 +84,11 @@ pub struct ExferNode {
     http: reqwest::Client,
     cursor: Arc<AtomicUsize>,
     retry: RetryPolicy,
+    /// Extra node RPC URLs that every `send_raw_transaction` ALSO
+    /// best-effort fans the byte-identical signed tx out to, in
+    /// parallel, to work around the chain's lossy push-only P2P tx
+    /// relay (see [`Self::send_raw_transaction`]). Empty = no fan-out.
+    extra_broadcast_urls: Vec<String>,
 }
 
 impl ExferNode {
@@ -122,7 +127,20 @@ impl ExferNode {
             http,
             cursor: Arc::new(AtomicUsize::new(0)),
             retry,
+            extra_broadcast_urls: Vec::new(),
         })
+    }
+
+    /// Configure the multi-node broadcast fan-out: extra node RPC URLs
+    /// that every [`Self::send_raw_transaction`] ALSO submits the
+    /// byte-identical signed tx to, in parallel, best-effort. Pass the
+    /// operator's `--broadcast-node` / `WALLETD_BROADCAST_NODES` list
+    /// (already trimmed, de-duped, and stripped of the primary by
+    /// [`crate::config::Config::broadcast_node_urls`]). An empty list
+    /// leaves behaviour byte-identical to today (no fan-out).
+    pub fn with_broadcast_targets(mut self, urls: Vec<String>) -> Self {
+        self.extra_broadcast_urls = urls;
+        self
     }
 
     /// Inspect the retry policy this client was built with.
@@ -425,7 +443,67 @@ impl ExferNode {
             )
             .await
             .map_err(classify_send_error)?;
-        serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))
+        let parsed: SendRawResponse =
+            serde_json::from_value(v).map_err(|e| Error::UpstreamUnexpected(e.to_string()))?;
+
+        // Multi-node broadcast mitigation. The exfer chain's P2P tx relay
+        // is lossy (push-only `NewTx`, a 50ms per-peer drop, no pull
+        // recovery), so a tx accepted by ONE node can fail to propagate to
+        // the mining nodes and sit unmined for ~25 min. Submitting the
+        // BYTE-IDENTICAL signed tx straight to several nodes' RPCs in
+        // parallel cuts mining latency to ~minute. This only changes WHERE
+        // the already-built tx is sent, never WHAT is sent — no re-sign, no
+        // re-serialize — so there is no fund-safety surface.
+        //
+        // Strictly best-effort: the fan-out runs AFTER the primary result
+        // above is final and can never alter it. Every outcome (ack, RPC
+        // error such as "already in mempool", timeout, unreachable) is
+        // ignored. No-op with zero overhead when no extra nodes configured.
+        self.fan_out_broadcast(tx_hex, &parsed.tx_id).await;
+
+        Ok(parsed)
+    }
+
+    /// Best-effort parallel re-submit of an already-broadcast signed tx to
+    /// the configured [`Self::extra_broadcast_urls`]. Never retries, never
+    /// recurses through [`Self::send_raw_transaction`] (posts via reqwest
+    /// directly), never propagates an outcome to the caller. Bounded by a
+    /// short per-request timeout and a hard overall cap so a hung node
+    /// can't stall the spender. Emits one `debug!` summary line.
+    async fn fan_out_broadcast(&self, tx_hex: &str, tx_id: &str) {
+        if self.extra_broadcast_urls.is_empty() {
+            return;
+        }
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "send_raw_transaction",
+            "params": { "tx_hex": tx_hex },
+        });
+        let n = self.extra_broadcast_urls.len();
+        let fanout = futures::future::join_all(self.extra_broadcast_urls.iter().map(|url| {
+            let http = self.http.clone();
+            let body = body.clone();
+            let url = url.clone();
+            async move {
+                // Short single-shot per-request timeout; we don't care WHY
+                // it fails, only count an HTTP-level ack for the log line.
+                http.post(&url)
+                    .json(&body)
+                    .timeout(Duration::from_secs(4))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }
+        }));
+        // Hard overall cap (> the per-request timeout) so the spender is
+        // never blocked on a stuck node beyond a beat past the primary.
+        let acked = match tokio::time::timeout(Duration::from_secs(5), fanout).await {
+            Ok(results) => results.into_iter().filter(|&ok| ok).count(),
+            Err(_) => 0,
+        };
+        tracing::debug!("fanned out tx {tx_id} to {n} extra nodes, {acked} acked");
     }
 
     /// Like [`Self::get_transaction`] but tolerant of "transaction not

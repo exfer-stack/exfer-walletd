@@ -125,6 +125,31 @@ pub struct Config {
     #[arg(long, env = "EXFER_NODE_RPC", default_value = "http://127.0.0.1:9334")]
     pub node_rpc: String,
 
+    /// Extra Exfer node JSON-RPC URLs to ALSO submit every signed
+    /// transaction to, in parallel and best-effort, right after the
+    /// primary `--node-rpc` submit.
+    ///
+    /// Mitigates the chain's lossy push-only P2P tx relay (a tx handed
+    /// to ONE node can fail to reach the mining nodes and sit unmined
+    /// for ~25 min). Submitting the byte-identical signed tx straight
+    /// to several nodes' RPCs in parallel has been measured to cut
+    /// mining latency from ~25 min to ~69 s. This only changes WHERE an
+    /// already-built tx is sent, never WHAT is sent.
+    ///
+    /// Repeatable as a CLI flag — pass `--broadcast-node <URL>` once per
+    /// node. As the env var `WALLETD_BROADCAST_NODES`, a comma-separated
+    /// list. Entries are trimmed; empties, duplicates, and any entry
+    /// equal to `--node-rpc` are dropped (the primary is already
+    /// submitted to, so we never double-submit). Empty (the default) =
+    /// no fan-out and zero overhead — behaviour identical to today.
+    #[arg(
+        long = "broadcast-node",
+        env = "WALLETD_BROADCAST_NODES",
+        value_delimiter = ',',
+        value_name = "URL"
+    )]
+    pub broadcast_nodes: Vec<String>,
+
     /// Directory holding `.key` wallet files. Defaults to
     /// `<datadir>/wallets`. Override only if you want wallets stored
     /// somewhere outside the datadir (e.g. on a separate encrypted
@@ -349,6 +374,27 @@ impl Config {
         self.resolved_datadir().join("cert.fingerprint")
     }
 
+    /// Effective extra broadcast targets for the multi-node tx fan-out:
+    /// [`Self::broadcast_nodes`] (from `--broadcast-node` flags and/or
+    /// the `WALLETD_BROADCAST_NODES` env list) trimmed, with empties and
+    /// duplicates removed and any entry equal to `node_rpc` dropped — we
+    /// already submit to the primary, so it must never appear here.
+    /// Empty when no fan-out is configured (zero-overhead default).
+    pub fn broadcast_node_urls(&self) -> Vec<String> {
+        let primary = self.node_rpc.trim();
+        let mut out: Vec<String> = Vec::new();
+        for raw in &self.broadcast_nodes {
+            let u = raw.trim();
+            if u.is_empty() || u == primary {
+                continue;
+            }
+            if !out.iter().any(|e| e == u) {
+                out.push(u.to_string());
+            }
+        }
+        out
+    }
+
     /// Assemble the spend [`AllowanceCaps`](crate::allowance::AllowanceCaps)
     /// from the `--spend-cap-*` flags. All-unset yields an inert
     /// (unlimited) ledger.
@@ -387,6 +433,7 @@ mod tests {
             tls_key: None,
             tls_san: Vec::new(),
             node_rpc: "http://127.0.0.1:9334".into(),
+            broadcast_nodes: Vec::new(),
             wallet_dir: None,
             auth_token_read: None,
             auth_token_manage: None,
@@ -432,6 +479,29 @@ mod tests {
         cfg.datadir = Some(PathBuf::from("/x"));
         cfg.wallet_dir = Some(PathBuf::from("/elsewhere"));
         assert_eq!(cfg.resolved_wallet_dir(), PathBuf::from("/elsewhere"));
+    }
+
+    #[test]
+    fn broadcast_node_urls_trims_dedups_and_drops_primary() {
+        let mut cfg = empty_cfg();
+        cfg.node_rpc = "http://primary:9334".into();
+        cfg.broadcast_nodes = vec![
+            "  http://a:9334 ".into(), // trimmed
+            "http://a:9334".into(),    // duplicate of the above
+            "".into(),                 // empty, skipped
+            "   ".into(),              // whitespace-only, skipped
+            "http://primary:9334".into(), // equals node_rpc, dropped
+            "http://b:9334".into(),
+        ];
+        assert_eq!(
+            cfg.broadcast_node_urls(),
+            vec!["http://a:9334".to_string(), "http://b:9334".to_string()]
+        );
+    }
+
+    #[test]
+    fn broadcast_node_urls_empty_by_default() {
+        assert!(empty_cfg().broadcast_node_urls().is_empty());
     }
 
     #[test]

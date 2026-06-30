@@ -1653,12 +1653,145 @@ impl SwapEngine {
         Ok(safe)
     }
 
+    /// Node-first path for [`Self::verify_pool_exfer_lock`]: confirm the pool's
+    /// EXFER lock straight from the authoritative node (the lock tx the pool
+    /// itself reported in its status), so the buy critical path no longer waits
+    /// on the remote indexer's post-confirmation indexing lag — nor depends on
+    /// that extra service being reachable. The node IS the source the indexer
+    /// derives from, and it has the lock tx the moment it's in a block.
+    ///
+    /// Enforces the EXACT same gates as the remote-indexer path
+    /// (confirmed-in-a-block + matching hashlock + pays US + covers the quote +
+    /// safe reclaim margin). Conservative by construction: ANY doubt — a node
+    /// I/O error, an unconfirmed/mempool-only tx, output 0 not a parseable HTLC,
+    /// a missing field, or a failed gate — returns `Ok(None)` so the caller
+    /// falls through to the authoritative remote-indexer path. It can ONLY ever
+    /// return a fully-vetted lock; it never approves anything the indexer path
+    /// would reject (it even re-checks the hashlock the indexer path looks up
+    /// by, so a pool-reported txid for a different hashlock is rejected here).
+    async fn verify_pool_exfer_lock_via_node(
+        &self,
+        rec: &SwapRecord,
+        pool_lock_txid: &str,
+    ) -> Result<Option<PoolExferLock>> {
+        // Identify ourselves exactly as the remote path does.
+        let from = rec.our_exfer_address.clone().unwrap_or_default();
+        let signer = match self.load_signer(&from).await {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let our_pubkey = hex::encode(signer.pubkey());
+        let our_addr = strip0x(&from).to_lowercase();
+
+        // The lock must be CONFIRMED (in a block), never merely in the mempool —
+        // reorg-safety: we only ever trust a mined lock. `get_transaction_opt`
+        // maps "unknown tx" to None; treat any other transport error as None too
+        // so a flaky node never blocks the authoritative remote fallback.
+        let tx_status = match self.node.get_transaction_opt(pool_lock_txid).await {
+            Ok(Some(s)) => s,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        // Confirmed == carries a block height (> 0). An unconfirmed/mempool-only
+        // tx has no block_height → fall through and retry next tick.
+        match tx_status.block_height {
+            Some(h) if h > 0 => {}
+            _ => return Ok(None),
+        }
+
+        // Parse output 0 with the SAME parser the follower/indexer use. The pool
+        // always locks at output 0 — the same hardcoded index the remote path
+        // returns (`output_index: 0`).
+        let tx_bytes = match hex::decode(&tx_status.tx_hex) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let tx = match exfer::types::transaction::Transaction::deserialize(&tx_bytes) {
+            Ok((tx, _consumed)) => tx,
+            Err(_) => return Ok(None),
+        };
+        let output_index: u32 = 0;
+        let output = match tx.outputs.get(output_index as usize) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let parsed = match exfer::covenants::htlc::try_parse_htlc(&output.script) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // --- The SAME funds-safety gates as the remote-indexer path
+        // (mirror of swap.rs verify_pool_exfer_lock ~1680-1735) ---
+
+        // Matching hashlock: the remote path queries BY hashlock, so a matching
+        // hashlock is implicit there. Make it explicit here so the node path can
+        // NEVER approve a lock the remote path would not have returned.
+        if hex::encode(parsed.hash_lock) != strip0x(&rec.hashlock).to_lowercase() {
+            return Ok(None);
+        }
+        // The pool's lock pays US — receiver is our pubkey OR our address.
+        let receiver = hex::encode(parsed.receiver).to_lowercase();
+        if receiver != our_pubkey.to_lowercase() && receiver != our_addr {
+            return Ok(None);
+        }
+        // Reveal-gate (#8), run pre-lock: the lock must cover the quote, else we
+        // do NOT lock any BNB.
+        let want_out: u64 = match rec.amount_out_units.parse() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if output.value < want_out {
+            return Ok(None);
+        }
+        // Safe-reclaim margin: enough time must remain before the lock's timeout.
+        let tip = match self.node.get_block_height().await {
+            Ok(t) => t.height,
+            Err(_) => return Ok(None),
+        };
+        if parsed.timeout_height < tip + MIN_EXFER_LOCK_BLOCKS {
+            return Ok(None);
+        }
+
+        Ok(Some(PoolExferLock {
+            lock_tx_id: pool_lock_txid.to_string(),
+            output_index,
+            sender_pubkey: hex::encode(parsed.sender),
+            timeout_height: parsed.timeout_height,
+        }))
+    }
+
     /// Funds-safety gate (v2 buy): verify the pool's EXFER lock exists on the
     /// EXFER chain, pays US, covers the quote, and leaves a safe reclaim margin —
     /// BEFORE we lock our BNB. Returns the lock's outpoint + params so the caller
     /// can pre-sign a claim against it. Mirrors the buy-claim reveal-gate, run
     /// pre-lock instead of pre-reveal.
     async fn verify_pool_exfer_lock(&self, rec: &SwapRecord) -> Result<PoolExferLock> {
+        // Node-first: the pool's status already reports its EXFER lock tx, and
+        // the node is authoritative (the indexer derives from it) and has the
+        // lock as soon as it's in a block. Verifying straight from the node
+        // removes the remote indexer's post-confirmation lag + the extra service
+        // dependency from the buy critical path, with IDENTICAL gates. On ANY
+        // doubt the node path returns None and we fall through to the
+        // authoritative remote-indexer path below, UNCHANGED.
+        if let Some(pool_lock_txid) = self
+            .pool
+            .get_swap(&rec.swap_id)
+            .await
+            .ok()
+            .and_then(|pj| {
+                pj.get("poolLockTxhash")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|s| !s.is_empty())
+        {
+            if let Ok(Some(pl)) = self
+                .verify_pool_exfer_lock_via_node(rec, &pool_lock_txid)
+                .await
+            {
+                return Ok(pl);
+            }
+        }
+
         let indexer = self
             .indexer
             .as_ref()

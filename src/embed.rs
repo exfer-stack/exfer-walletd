@@ -186,7 +186,12 @@ pub async fn run_embedded(
         cfg.node_rpc.clone(),
         Duration::from_secs(cfg.upstream_timeout_secs),
         retry,
-    )?;
+    )?
+    // Multi-node broadcast mitigation for the chain's lossy push-only tx
+    // relay: also fan every signed tx out to these extra node RPCs in
+    // parallel (best-effort). Empty unless --broadcast-node /
+    // WALLETD_BROADCAST_NODES is set, so embedded apps are unaffected.
+    .with_broadcast_targets(cfg.broadcast_node_urls());
     let store = Arc::new(store);
     let node = Arc::new(node);
 

@@ -1499,9 +1499,31 @@ impl SwapEngine {
             _ => return Ok(()), // already advanced by execute / a prior tick
         };
 
+        // Crash-idempotency FIRST (fix): if a BNB lock for this hashlock already
+        // exists on-chain, we locked on a prior tick — ADVANCE, never abort. This
+        // MUST run before the margin/abort checks below. A lock whose journal
+        // advance was interrupted (tx broadcast, then app killed / RPC error before
+        // the UserLocked write) would otherwise, on a later tick with an expired
+        // margin, be wrongly marked Failed ("buy aborted…") WHILE the BNB is
+        // already locked on-chain — the exact bug that stranded swap cfe68d23:
+        // the user paid, saw "失败", and the pool took the BNB with no pre-signed
+        // claim to deliver against.
+        if let Some(htlc) = rec.htlc_contract.as_deref() {
+            if let Ok(oc) = self.evm.get_htlc_swap(htlc, &rec.hashlock).await {
+                if !matches!(oc.state, crate::evm::HtlcState::None) {
+                    self.journal.update(&rec.swap_id, now_secs(), |r| {
+                        r.status = SwapStatus::UserLocked;
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+
         // Safety bound: without a safe margin to the pool-supplied BSC timeout we
         // must NOT lock our BNB (we couldn't reclaim if the swap then stalls).
-        // Give up — the pool reclaims its own EXFER lock at its timeout.
+        // Give up — the pool reclaims its own EXFER lock at its timeout. Reaching
+        // here means the idempotency check above found NO on-chain lock, so giving
+        // up never strands an already-locked BNB.
         let bsc_timeout = rec
             .bsc_timeout_sec
             .ok_or_else(|| Error::Internal("missing BSC timeout".into()))?;
@@ -1535,19 +1557,6 @@ impl SwapEngine {
                     return Ok(());
                 }
                 _ => {}
-            }
-        }
-
-        // Crash-idempotency: if a BNB lock for this hashlock already exists, we
-        // locked on a prior tick — advance, don't lock again.
-        if let Some(htlc) = rec.htlc_contract.as_deref() {
-            if let Ok(oc) = self.evm.get_htlc_swap(htlc, &rec.hashlock).await {
-                if !matches!(oc.state, crate::evm::HtlcState::None) {
-                    self.journal.update(&rec.swap_id, now_secs(), |r| {
-                        r.status = SwapStatus::UserLocked;
-                    })?;
-                    return Ok(());
-                }
             }
         }
 
@@ -2264,6 +2273,69 @@ impl SwapEngine {
         }
     }
 
+    /// Un-mislabel v2 swaps the CLIENT locally marked `Failed` but which the POOL
+    /// actually progressed. For a committed swap the pool is authoritative; a local
+    /// terminal `Failed` that disagrees is a display lie — e.g. swap cfe68d23,
+    /// where the client aborted a buy ("pool did not lock in time") while its BNB
+    /// was already locked on-chain, so the user PAID yet saw "失败". The monitor
+    /// skips terminal records, so this dedicated pass re-queries the pool for
+    /// RECENT `Failed` v2 rows and reconciles to its view: complete, refund, or —
+    /// if the pool still has the swap in flight (our BNB was taken) — un-fail back
+    /// to `UserLocked` so the monitor drives it to its real outcome. Best-effort:
+    /// a pool lookup error or a genuinely-failed pool row leaves the record as-is.
+    pub async fn reconcile_failed_v2(&self) {
+        let now = now_secs();
+        const WINDOW_SECS: u64 = 14 * 24 * 3600; // re-examine failures for 14 days
+        for rec in self.journal.list() {
+            if rec.flow != SwapFlow::V2
+                || rec.status != SwapStatus::Failed
+                || now.saturating_sub(rec.updated_at) > WINDOW_SECS
+            {
+                continue;
+            }
+            let pj = match self.pool.get_swap(&rec.swap_id).await {
+                Ok(v) => v,
+                Err(_) => continue, // pool unreachable → leave untouched, retry later
+            };
+            match pj.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+                "completed" => {
+                    let claim = pj
+                        .get("userClaimTxhash")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let _ = self.journal.update(&rec.swap_id, now, |r| {
+                        r.status = SwapStatus::Completed;
+                        r.error = None;
+                        if r.claim_tx.is_none() {
+                            r.claim_tx = claim;
+                        }
+                    });
+                    tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool COMPLETED — corrected");
+                }
+                "refunded" => {
+                    let _ = self.journal.update(&rec.swap_id, now, |r| {
+                        r.status = SwapStatus::Refunded;
+                        r.error = None;
+                    });
+                    tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool REFUNDED — corrected");
+                }
+                // Pool has the swap LIVE (for a BUY: our BNB was taken / is being
+                // settled). Un-fail to UserLocked so advance_v2 reconciles it to the
+                // true terminal outcome instead of lying "失败".
+                "user_locked" | "pool_locked" | "preimage_seen" => {
+                    let _ = self.journal.update(&rec.swap_id, now, |r| {
+                        r.status = SwapStatus::UserLocked;
+                        r.error = Some("recovered: pool has this swap in flight — re-settling".into());
+                    });
+                    tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool still settling — un-failed to re-settle");
+                }
+                // "failed" | "expired" | "quoted" | "" (unknown) → genuinely not
+                // progressed; leave the record Failed.
+                _ => {}
+            }
+        }
+    }
+
     /// Authoritative "did the claim actually land on-chain?" — Some(true)=claimed,
     /// Some(false)=the lock exists but isn't claimed (re-claimable / refundable),
     /// None=unknown (lookup failed; don't touch the record).
@@ -2679,6 +2751,9 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
     const RECONCILE_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
     tracing::info!("swap monitor started");
     engine.reconcile_completed().await;
+    // Correct any v2 swap the client locally mis-marked Failed while the pool
+    // actually settled/progressed it (see reconcile_failed_v2).
+    engine.reconcile_failed_v2().await;
     // Chain-driven recovery at startup: reclaim any stranded EXFER HTLC lock the
     // user holds the key for, even if its swap record was lost (reinstall, new
     // device). This is what makes "just reopen the app" recover funds.
@@ -2694,6 +2769,7 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
         }
         if last_reconcile.elapsed() >= RECONCILE_EVERY {
             engine.reconcile_completed().await;
+            engine.reconcile_failed_v2().await;
             engine.sweep_stranded_locks().await;
             engine.sweep_stranded_bnb_locks().await;
             last_reconcile = std::time::Instant::now();

@@ -70,7 +70,9 @@ pub async fn swap_get_quote(state: &ApiState, params: Value) -> Result<Value> {
             )))
         }
     };
-    let rec = engine(state)?.get_quote(dir, p.amount_in, p.from, flow).await?;
+    let rec = engine(state)?
+        .get_quote(dir, p.amount_in, p.from, flow)
+        .await?;
     to_value(rec)
 }
 

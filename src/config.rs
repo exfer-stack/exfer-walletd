@@ -486,10 +486,10 @@ mod tests {
         let mut cfg = empty_cfg();
         cfg.node_rpc = "http://primary:9334".into();
         cfg.broadcast_nodes = vec![
-            "  http://a:9334 ".into(), // trimmed
-            "http://a:9334".into(),    // duplicate of the above
-            "".into(),                 // empty, skipped
-            "   ".into(),              // whitespace-only, skipped
+            "  http://a:9334 ".into(),    // trimmed
+            "http://a:9334".into(),       // duplicate of the above
+            "".into(),                    // empty, skipped
+            "   ".into(),                 // whitespace-only, skipped
             "http://primary:9334".into(), // equals node_rpc, dropped
             "http://b:9334".into(),
         ];

@@ -529,8 +529,10 @@ struct QuoteResp {
     /// client's). Optional for forward-compat; required-present for v2.
     #[serde(default)]
     hashlock: Option<String>,
-    /// Protocol flow the pool actually ran ("v1" | "v2").
+    /// Protocol flow the pool actually ran ("v1" | "v2"). Deserialized for
+    /// wire-protocol completeness / forward-compat; not read today.
     #[serde(default)]
+    #[allow(dead_code)]
     flow: Option<String>,
     instructions: Instructions,
 }
@@ -1531,8 +1533,9 @@ impl SwapEngine {
             self.journal.update(&rec.swap_id, now_secs(), |r| {
                 r.status = SwapStatus::Failed;
                 if r.error.is_none() {
-                    r.error =
-                        Some("buy aborted: pool did not lock in time to safely lock our BNB".into());
+                    r.error = Some(
+                        "buy aborted: pool did not lock in time to safely lock our BNB".into(),
+                    );
                 }
             })?;
             return Ok(());
@@ -1615,7 +1618,14 @@ impl SwapEngine {
         let lock_tx = {
             let _g = self.bsc_lock.lock().await;
             self.evm
-                .htlc_lock(&secret, &htlc, &rec.hashlock, &recipient, amount, bsc_timeout)
+                .htlc_lock(
+                    &secret,
+                    &htlc,
+                    &rec.hashlock,
+                    &recipient,
+                    amount,
+                    bsc_timeout,
+                )
                 .await?
         };
 
@@ -1921,11 +1931,21 @@ impl SwapEngine {
                 })?;
             }
             "refunded" => {
-                // The pool reclaimed its own leg. The user's lock (if it ever
-                // confirmed) is recovered independently by the timeout sweep; this
-                // only reflects the outcome in the local status.
+                // The pool reclaimed only ITS OWN leg. For a BUY our BNB may still
+                // be locked on-chain — do NOT report "refunded" until it is verified
+                // back. Drop to Refunding so the monitor's confirmation-gated reclaim
+                // (`refund`) actually recovers it and only THEN marks Refunded.
+                // Mirroring the pool's "refunded" straight to terminal here lied: it
+                // showed 已退款 over a still-locked BNB AND removed the swap from the
+                // monitor's pending set, so the reclaim never ran (root cause of the
+                // 2026-07 pool BSC-RPC outage stuck refunds).
+                let next = if rec.direction == Direction::BnbToExfer && rec.user_lock_tx.is_some() {
+                    SwapStatus::Refunding
+                } else {
+                    SwapStatus::Refunded
+                };
                 self.journal.update(&rec.swap_id, now_secs(), |r| {
-                    r.status = SwapStatus::Refunded;
+                    r.status = next;
                 })?;
             }
             "failed" => {
@@ -1934,8 +1954,17 @@ impl SwapEngine {
                     .and_then(|v| v.as_str())
                     .unwrap_or("pool marked the swap failed")
                     .to_string();
+                // A BUY whose BNB we already locked must be reclaimed, not shown as a
+                // bare "失败" over locked funds — drop to Refunding (confirmation-gated
+                // reclaim). Only a lock-less swap is a plain terminal Failure.
+                let buy_locked =
+                    rec.direction == Direction::BnbToExfer && rec.user_lock_tx.is_some();
                 self.journal.update(&rec.swap_id, now_secs(), |r| {
-                    r.status = SwapStatus::Failed;
+                    r.status = if buy_locked {
+                        SwapStatus::Refunding
+                    } else {
+                        SwapStatus::Failed
+                    };
                     if r.error.is_none() {
                         r.error = Some(note);
                     }
@@ -2313,11 +2342,20 @@ impl SwapEngine {
                     tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool COMPLETED — corrected");
                 }
                 "refunded" => {
+                    // BUY: the pool only reclaimed its EXFER; our BNB may still be
+                    // locked. Un-fail to Refunding so the confirmation-gated reclaim
+                    // recovers it (and only then marks Refunded) — never a bare label.
+                    let next =
+                        if rec.direction == Direction::BnbToExfer && rec.user_lock_tx.is_some() {
+                            SwapStatus::Refunding
+                        } else {
+                            SwapStatus::Refunded
+                        };
                     let _ = self.journal.update(&rec.swap_id, now, |r| {
-                        r.status = SwapStatus::Refunded;
+                        r.status = next;
                         r.error = None;
                     });
-                    tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool REFUNDED — corrected");
+                    tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool REFUNDED — driving BNB reclaim");
                 }
                 // Pool has the swap LIVE (for a BUY: our BNB was taken / is being
                 // settled). Un-fail to UserLocked so advance_v2 reconciles it to the
@@ -2325,7 +2363,8 @@ impl SwapEngine {
                 "user_locked" | "pool_locked" | "preimage_seen" => {
                     let _ = self.journal.update(&rec.swap_id, now, |r| {
                         r.status = SwapStatus::UserLocked;
-                        r.error = Some("recovered: pool has this swap in flight — re-settling".into());
+                        r.error =
+                            Some("recovered: pool has this swap in flight — re-settling".into());
                     });
                     tracing::warn!(swap = %rec.swap_id, "reconcile: local Failed but pool still settling — un-failed to re-settle");
                 }
@@ -2440,14 +2479,54 @@ impl SwapEngine {
                 })?;
             }
             Direction::BnbToExfer => {
-                let secret = self.store.evm_secret()?;
                 let htlc = rec.htlc_contract.clone().unwrap_or_default();
-                let _guard = self.bsc_lock.lock().await;
-                let tx = self.evm.htlc_refund(&secret, &htlc, &rec.hashlock).await?;
-                self.journal.update(swap_id, now_secs(), |r| {
-                    r.status = SwapStatus::Refunded;
-                    r.refund_tx = Some(tx);
-                })?;
+                // Confirmation-gate: mark Refunded ONLY when the BNB is verified back
+                // on-chain. Reads the swap's KNOWN hashlock (no eth_getLogs), so it
+                // works on public RPCs that reject getLogs (the default publicnode).
+                let oc = self.evm.get_htlc_swap(&htlc, &rec.hashlock).await?;
+                match oc.state {
+                    // Truthfully back (a prior reclaim mined, or the contract cleared
+                    // it): the ONLY path to "已退款".
+                    crate::evm::HtlcState::Refunded | crate::evm::HtlcState::None => {
+                        self.journal.update(swap_id, now_secs(), |r| {
+                            r.status = SwapStatus::Refunded;
+                        })?;
+                    }
+                    // The pool claimed our BNB after all → it owes the EXFER, not a
+                    // refund. Hand back to settlement reconcile; never mark Refunded.
+                    crate::evm::HtlcState::Claimed => {
+                        self.journal.update(swap_id, now_secs(), |r| {
+                            r.status = SwapStatus::UserLocked;
+                            r.error = Some(
+                                "recovered: pool claimed your BNB — re-settling delivery".into(),
+                            );
+                        })?;
+                    }
+                    // Still locked. Broadcast the reclaim (unless a prior one is still
+                    // pending), but stay Refunding until the chain confirms it.
+                    crate::evm::HtlcState::Locked => {
+                        let pending = if let Some(tx) = rec.refund_tx.as_deref() {
+                            matches!(self.evm.receipt_status(tx).await, Ok(None))
+                        } else {
+                            false
+                        };
+                        if pending {
+                            self.journal.update(swap_id, now_secs(), |r| {
+                                r.status = SwapStatus::Refunding;
+                            })?;
+                        } else {
+                            let secret = self.store.evm_secret()?;
+                            let tx = {
+                                let _guard = self.bsc_lock.lock().await;
+                                self.evm.htlc_refund(&secret, &htlc, &rec.hashlock).await?
+                            };
+                            self.journal.update(swap_id, now_secs(), |r| {
+                                r.status = SwapStatus::Refunding;
+                                r.refund_tx = Some(tx);
+                            })?;
+                        }
+                    }
+                }
             }
         }
         Ok(self.journal.get(swap_id).unwrap_or(rec))
@@ -2735,6 +2814,46 @@ impl SwapEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = tip + 1;
     }
+
+    /// Repair pass (getLogs-FREE): a prior build could mark a BUY terminal
+    /// `Refunded`/`Failed` while the user's BNB was still locked on-chain — it
+    /// mirrored the pool's "refunded"/"failed" without verifying our OWN reclaim,
+    /// and the getLogs-based BSC sweep can't run on the default public RPC that
+    /// rejects `eth_getLogs`. A terminal record is skipped by the monitor's
+    /// pending() set, so the reclaim never runs and the app shows 已退款 over
+    /// locked funds. Here we re-open any such record — matched by its KNOWN
+    /// hashlock, using only `eth_call` — back to `Refunding`, so the monitor's
+    /// confirmation-gated `refund` recovers the BNB for real. Idempotent: a record
+    /// whose BNB is already back stays terminal.
+    pub async fn repair_stranded_bnb_refunds(&self) {
+        let now = match self.evm.latest_block_timestamp().await {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        for rec in self.journal.list() {
+            if rec.direction != Direction::BnbToExfer || rec.user_lock_tx.is_none() {
+                continue;
+            }
+            if !matches!(rec.status, SwapStatus::Refunded | SwapStatus::Failed) {
+                continue;
+            }
+            let Some(htlc) = rec.htlc_contract.as_deref() else {
+                continue;
+            };
+            let Ok(oc) = self.evm.get_htlc_swap(htlc, &rec.hashlock).await else {
+                continue;
+            };
+            if oc.state == crate::evm::HtlcState::Locked && now >= oc.timeout_sec {
+                tracing::warn!(
+                    swap = %rec.swap_id,
+                    "repair: BUY marked terminal but BNB still locked on-chain past timeout — re-opening to reclaim"
+                );
+                let _ = self.journal.update(&rec.swap_id, now_secs(), |r| {
+                    r.status = SwapStatus::Refunding;
+                });
+            }
+        }
+    }
 }
 
 /// Background monitor: each tick, advance every pending swap toward settlement,
@@ -2761,6 +2880,9 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
     // The BSC twin: recover stranded BNB locks from a buy whose claim was
     // interrupted, even with no local record (reinstall / new device).
     engine.sweep_stranded_bnb_locks().await;
+    // Re-open any BUY a prior build wrongly marked terminal while its BNB is still
+    // locked on-chain, so the confirmation-gated reclaim actually recovers it.
+    engine.repair_stranded_bnb_refunds().await;
     let mut last_reconcile = std::time::Instant::now();
     loop {
         tokio::select! {
@@ -2772,6 +2894,7 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
             engine.reconcile_failed_v2().await;
             engine.sweep_stranded_locks().await;
             engine.sweep_stranded_bnb_locks().await;
+            engine.repair_stranded_bnb_refunds().await;
             last_reconcile = std::time::Instant::now();
         }
         for rec in engine.journal().pending() {

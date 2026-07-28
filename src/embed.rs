@@ -308,16 +308,19 @@ pub async fn run_embedded(
     // (matches the embedded-app walletd contract). When the upstream
     // predates get_address_mempool, hold htlc_lock for one block instead.
     if cfg.inflight_reconcile {
-        match crate::inflight::reconcile_from_mempool(inflight.as_ref(), store.as_ref(), node.as_ref())
-            .await
+        match crate::inflight::reconcile_from_mempool(
+            inflight.as_ref(),
+            store.as_ref(),
+            node.as_ref(),
+        )
+        .await
         {
             Ok((seeded, true)) => {
                 tracing::info!(seeded, "inflight reconciled from mempool")
             }
             Ok((_, false)) => {
-                inflight.hold_locks_until(
-                    std::time::Instant::now() + crate::inflight::LOCK_HOLD_SECS,
-                );
+                inflight
+                    .hold_locks_until(std::time::Instant::now() + crate::inflight::LOCK_HOLD_SECS);
                 tracing::warn!("mempool RPC unavailable; holding htlc_lock one block");
             }
             Err(e) => tracing::warn!(%e, "inflight reconcile failed; continuing"),

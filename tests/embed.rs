@@ -95,6 +95,7 @@ fn build_config(datadir: std::path::PathBuf) -> Config {
         tls_key: None,
         tls_san: vec![],
         node_rpc: "http://127.0.0.1:1".to_string(), // intentionally unreachable; not exercised
+        broadcast_nodes: Vec::new(),
         wallet_dir: None,
         auth_token_read: Some("read-token-test-only".to_string()),
         auth_token_manage: Some("manage-token-test-only".to_string()),

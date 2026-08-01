@@ -537,6 +537,14 @@ struct QuoteResp {
     instructions: Instructions,
 }
 
+/// A stranded BUY BNB lock the pool reports for our address — reclaimable by us
+/// (the sender) by hashlock, with no eth_getLogs enumeration.
+#[derive(Debug, Clone)]
+struct StrandedBnbLock {
+    hashlock: String,
+    htlc_contract: String,
+}
+
 impl PoolClient {
     pub fn new(base_url: impl Into<String>, ca_pem: Option<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
@@ -652,6 +660,35 @@ impl PoolClient {
             .json()
             .await
             .map_err(|e| Error::UpstreamUnexpected(format!("pool {path} decode: {e}")))
+    }
+
+    /// Ask the pool for BUY BNB locks still stranded on-chain for `bsc_address`
+    /// (state Locked, past timeout). Lets a wallet with NO local swap record — a
+    /// reinstall / new device — reclaim by hashlock without eth_getLogs.
+    async fn stranded_locks(&self, bsc_address: &str) -> Result<Vec<StrandedBnbLock>> {
+        let v = self
+            .http
+            .post(format!("{}/api/stranded-locks", self.base_url))
+            .json(&serde_json::json!({ "bsc_address": bsc_address }))
+            .send()
+            .await
+            .map_err(|e| Error::UpstreamUnreachable(format!("pool stranded-locks: {e}")))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| Error::UpstreamUnexpected(format!("pool stranded-locks decode: {e}")))?;
+        Ok(v.get("locks")
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| {
+                        Some(StrandedBnbLock {
+                            hashlock: l.get("hashlock")?.as_str()?.to_string(),
+                            htlc_contract: l.get("htlcContract")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn notify_exfer_lock(&self, id: &str, tx_id: &str) -> Result<()> {
@@ -2854,6 +2891,80 @@ impl SwapEngine {
             }
         }
     }
+
+    /// Record-LESS BNB reclaim via the pool's stranded-lock list.
+    /// `repair_stranded_bnb_refunds` only helps a wallet that still has the swap
+    /// record; a reinstall / new device / cleared data has none. The pool knows
+    /// every hashlock it ever quoted, so it hands us the exact locks to reclaim for
+    /// OUR address — by hashlock, no eth_getLogs (which the default public BSC RPC
+    /// rejects). We just (re)broadcast the sender-only refund; the chain flipping to
+    /// Refunded is the confirmation. Shares the `swept_bnb` dedup with the getLogs
+    /// sweep so the same lock isn't re-broadcast twice a session.
+    pub async fn recover_stranded_bnb_via_pool(&self) {
+        let secret = match self.store.evm_secret() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let our = match crate::evm::EvmClient::address_of(&secret) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let locks = match self.pool.stranded_locks(&format!("{our:#x}")).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(error = %e, "pool stranded-locks lookup failed; skipping");
+                return;
+            }
+        };
+        if locks.is_empty() {
+            return;
+        }
+        let now = self
+            .evm
+            .latest_block_timestamp()
+            .await
+            .unwrap_or_else(|_| now_secs());
+        for lock in locks {
+            let oc = match self
+                .evm
+                .get_htlc_swap(&lock.htlc_contract, &lock.hashlock)
+                .await
+            {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            if oc.state != crate::evm::HtlcState::Locked || now < oc.timeout_sec {
+                continue;
+            }
+            let key = lock.hashlock.to_lowercase();
+            {
+                let mut swept = self.swept_bnb.lock().unwrap_or_else(|e| e.into_inner());
+                if !swept.insert(key.clone()) {
+                    continue;
+                }
+            }
+            let tx = {
+                let _g = self.bsc_lock.lock().await;
+                self.evm
+                    .htlc_refund(&secret, &lock.htlc_contract, &lock.hashlock)
+                    .await
+            };
+            match tx {
+                Ok(txhash) => tracing::info!(
+                    hashlock = %lock.hashlock,
+                    refund_tx = %txhash,
+                    "pool-guided reclaim of a stranded BNB lock back to the user"
+                ),
+                Err(e) => {
+                    self.swept_bnb
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                    tracing::debug!(hashlock = %lock.hashlock, error = %e, "pool-guided reclaim broadcast failed; retry next pass");
+                }
+            }
+        }
+    }
 }
 
 /// Background monitor: each tick, advance every pending swap toward settlement,
@@ -2883,6 +2994,10 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
     // Re-open any BUY a prior build wrongly marked terminal while its BNB is still
     // locked on-chain, so the confirmation-gated reclaim actually recovers it.
     engine.repair_stranded_bnb_refunds().await;
+    // Record-less recovery: ask the pool for stranded BNB locks on our address and
+    // reclaim them by hashlock — recovers buys stranded before a reinstall / new
+    // device, where no local record exists to drive the repair above.
+    engine.recover_stranded_bnb_via_pool().await;
     let mut last_reconcile = std::time::Instant::now();
     loop {
         tokio::select! {
@@ -2895,6 +3010,7 @@ pub async fn run_monitor(engine: Arc<SwapEngine>, shutdown: tokio_util::sync::Ca
             engine.sweep_stranded_locks().await;
             engine.sweep_stranded_bnb_locks().await;
             engine.repair_stranded_bnb_refunds().await;
+            engine.recover_stranded_bnb_via_pool().await;
             last_reconcile = std::time::Instant::now();
         }
         for rec in engine.journal().pending() {
